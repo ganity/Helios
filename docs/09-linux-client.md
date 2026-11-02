@@ -4,6 +4,14 @@
 
 ## 日常使用
 
+### 首次配置节点
+
+从 VPS 的实际服务配置中确认 TLS 证书路径、`auth.id` 和 `auth.token_file`。使用项目安装脚本时默认是 `/etc/helios/cert.pem`、`desktop-main` 和 `/etc/helios/token.hex`；自行部署可能不同。通过 SSH/SFTP 安全传输证书和 token 文件到客户端电脑，**不要下载或分享服务端私钥 `key.pem`**，也不要把 token 发到日志或截图里。
+
+把文件放在当前用户可读、长期保留的位置。节点的“受信证书文件”和“凭据文件”分别填写这两个**本机文件的完整路径**，不要填写 VPS 路径、证书正文或 token 正文。例如 Linux 为 `/home/你的用户名/.helios/cert.pem` 和 `/home/你的用户名/.helios/token.hex`；Windows 可使用 `C:\Users\你的用户名\.helios\cert.pem` 和相应的 `token.hex` 路径。token 应仅允许当前用户读取；Linux/macOS 可执行 `chmod 600 token.hex`。
+
+服务器地址填写实际 IP 和端口；“证书对应域名 / IP”必须与证书中的身份匹配，不能随意改成其他 IP。凭据标识填写服务端的 `auth.id`。完成后点击“测试延迟”，成功后“应用配置”，最后开启系统代理。输入框支持 Ctrl+C / Ctrl+V，macOS 使用 Command+C / Command+V。旧安装包缺少剪贴板功能，需要升级到包含此修复的构建。
+
 界面顶部可以随时切换 **中文 / English**，选择会保存在 `desktop.json`；旧配置无需迁移。
 首页集中显示连接状态、“系统代理”“虚拟网卡”开关、节点选择、延迟、速度和代理模式；详细规则、DNS、日志和程序路径收在高级设置中。
 首页和节点页选择节点的行为一致：本窗口管理的后台正在运行时自动应用切换，离线时保存供下次连接使用。

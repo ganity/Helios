@@ -1440,14 +1440,17 @@ impl HeliosApp {
                 .id_salt(("node-editor", self.profile.active_node))
                 .open(std::mem::take(&mut self.open_node_editor).then_some(true))
                 .show(ui, |ui| {
+                    ui.label(RichText::new(t("首次使用：从服务端安全复制证书 cert.pem 和凭据 token.hex 到本机，再填写两个文件的完整路径。不要复制服务端私钥 key.pem。所有输入框支持系统复制 / 粘贴快捷键。")).color(MUTED));
                     let active = self.profile.active_node;
                     let node = &mut self.profile.nodes[active];
                     field(ui, t("节点名称"), &mut node.name);
                     field(ui, t("服务器地址"), &mut node.server);
                     field(ui, t("证书对应域名 / IP"), &mut node.server_name);
                     path_field(ui, t("受信证书文件"), &mut node.ca_certificate);
+                    ui.label(RichText::new(t("填写本机 .pem 文件的完整路径，不是证书内容；证书对应域名 / IP 必须与证书匹配。")).small().color(MUTED));
                     field(ui, t("凭据标识"), &mut node.credential_id);
                     path_field(ui, t("凭据文件"), &mut node.token_file);
+                    ui.label(RichText::new(t("填写本机 token.hex 的完整路径，不是 token 内容；凭据标识须与服务端 auth.id 一致。完成后测试延迟，再点击应用配置。")).small().color(MUTED));
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(t("传输方式")).size(10.0).color(MUTED));
                         ui.selectable_value(

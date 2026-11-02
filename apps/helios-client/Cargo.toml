@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 helios-client-model = { path = "../../crates/helios-client-model" }
 helios-client-control = { path = "../../crates/helios-client-control" }
 helios-config = { path = "../../crates/helios-config" }

@@ -154,6 +154,18 @@ const TEXT: &[(&str, &str)] = &[
     ("添加节点", "Add node"),
     ("删除", "Remove"),
     ("编辑节点配置", "Edit node"),
+    (
+        "首次使用：从服务端安全复制证书 cert.pem 和凭据 token.hex 到本机，再填写两个文件的完整路径。不要复制服务端私钥 key.pem。所有输入框支持系统复制 / 粘贴快捷键。",
+        "First use: securely copy cert.pem and token.hex from your server to this computer, then enter their full local paths. Never copy the server private key key.pem. All fields support system copy/paste shortcuts.",
+    ),
+    (
+        "填写本机 .pem 文件的完整路径，不是证书内容；证书对应域名 / IP 必须与证书匹配。",
+        "Enter the full local .pem file path, not its contents. The TLS server name / IP must match the certificate.",
+    ),
+    (
+        "填写本机 token.hex 的完整路径，不是 token 内容；凭据标识须与服务端 auth.id 一致。完成后测试延迟，再点击应用配置。",
+        "Enter the full local token.hex file path, not the token itself. Credential ID must match the server auth.id. Test latency, then apply configuration.",
+    ),
     ("节点名称", "Node name"),
     ("服务器地址", "Server address"),
     ("证书对应域名 / IP", "TLS server name"),
