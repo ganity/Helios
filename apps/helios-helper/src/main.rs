@@ -605,8 +605,11 @@ mod tests {
 
     #[test]
     fn example_configuration_stays_valid() {
-        let value: HelperConfig =
+        let mut value: HelperConfig =
             toml::from_str(include_str!("../../../config/helper.example.toml")).unwrap();
+        let paths = config();
+        value.status_file = paths.status_file;
+        value.stop_file = paths.stop_file;
         value.validate().unwrap();
     }
 
