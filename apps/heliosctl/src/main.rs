@@ -1,9 +1,6 @@
-use std::{
-    env,
-    error::Error,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+#[cfg(unix)]
+use std::path::Path;
+use std::{env, error::Error, net::SocketAddr, path::PathBuf};
 
 use helios_config::load_token;
 use helios_control::{

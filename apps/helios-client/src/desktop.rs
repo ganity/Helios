@@ -2487,6 +2487,7 @@ fn path_field(ui: &mut egui::Ui, label: &str, value: &mut PathBuf) {
     *value = PathBuf::from(text);
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
 fn capability(ui: &mut egui::Ui, label: &str, enabled: bool, note: &str) {
     ui.horizontal(|ui| {
         dot(ui, if enabled { GOOD } else { MUTED });

@@ -591,6 +591,17 @@ async fn main() -> Result<(), AnyError> {
 
     let (shutdown, _) = watch::channel(false);
     let shutdown_metrics = metrics.clone();
+    #[cfg(unix)]
+    let unix_control_listener = run_unix_control_listener(
+        control_socket,
+        metrics.clone(),
+        rules.clone(),
+        control_token,
+        shutdown.clone(),
+        shutdown.subscribe(),
+    );
+    #[cfg(not(unix))]
+    let unix_control_listener = std::future::ready(Ok::<(), AnyError>(()));
     let listeners = async {
         tokio::try_join!(
             run_socks_listener(
@@ -614,15 +625,7 @@ async fn main() -> Result<(), AnyError> {
                 shutdown.clone(),
                 shutdown.subscribe()
             ),
-            #[cfg(unix)]
-            run_unix_control_listener(
-                control_socket,
-                metrics.clone(),
-                rules.clone(),
-                control_token,
-                shutdown.clone(),
-                shutdown.subscribe()
-            ),
+            unix_control_listener,
             run_named_pipe_listener(
                 args.control_pipe.clone(),
                 metrics.clone(),
