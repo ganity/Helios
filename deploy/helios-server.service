@@ -1,0 +1,36 @@
+[Unit]
+Description=Helios encrypted proxy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=helios
+Group=helios
+ExecStart=/usr/local/bin/helios-server /etc/helios/server.toml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=5s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+schema_version = 1
+listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:9080"
+# macOS/Linux desktop builds use a private Unix socket instead of control_listen.
+# control_socket = "/Users/you/.helios/control.sock"
+# Windows desktop builds use a current-user-only Named Pipe.
+# control_pipe = "\\.\pipe\helios-control"
+
+[dns]
+listen = "127.0.0.1:1053"
+fake_ip_capacity = 4096
+fake_ip_ttl_seconds = 60
+
+[node]
+server = "203.0.113.10:443"
+server_name = "vpn.example.com"
+ca_certificate = "ca.pem"
+credential_id = "desktop-main"
+token_file = "token.hex"
+preferred_transport = "quic"
+
+[timeouts]
+socks_handshake_seconds = 5
+http_handshake_seconds = 5
+connect_milliseconds = 10000
+health_probe_seconds = 30
+udp_idle_seconds = 60
+
+[[rules]]
+type = "domain-suffix"
+value = "example.cn"
+action = "direct"
+
+[[rules]]
+type = "ip-cidr"
+value = "192.168.0.0/16"
+action = "direct"
+
+[[rules]]
+type = "final"
+action = "proxy"

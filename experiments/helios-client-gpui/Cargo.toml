@@ -1,0 +1,25 @@
+[package]
+name = "helios-client-gpui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "33d111eac45ef581324592352d90efc91c5ec98d" }
+helios-client-model = { path = "../../crates/helios-client-model" }
+helios-client-control = { path = "../../crates/helios-client-control" }
+helios-config = { path = "../../crates/helios-config" }
+tokio = { version = "=1.48.0", features = ["io-util", "net", "rt", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33d111eac45ef581324592352d90efc91c5ec98d", features = ["font-kit"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33d111eac45ef581324592352d90efc91c5ec98d" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33d111eac45ef581324592352d90efc91c5ec98d", features = ["wayland", "x11"] }

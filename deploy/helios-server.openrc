@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+name="helios-server"
+description="Helios encrypted proxy server"
+
+command="/usr/local/bin/helios-server"
+command_args="run --config /etc/helios/server.toml"
+command_user="helios:helios"
+command_background="yes"
+pidfile="/run/helios-server.pid"
+respawn_delay=3
+respawn_max=0
+
+depend() {
+	need net
+}

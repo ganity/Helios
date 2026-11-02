@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "apps/helios-client",
+    "apps/helios-daemon",
+    "apps/helios-helper",
+    "apps/helios-server",
+    "apps/heliosctl",
+    "crates/helios-control",
+    "crates/helios-client-control",
+    "crates/helios-client-model",
+    "crates/helios-dns",
+    "crates/helios-config",
+    "crates/helios-protocol",
+    "crates/helios-proxy",
+    "crates/helios-routing",
+    "crates/helios-system-proxy",
+    "crates/helios-transport",
+]
+exclude = ["experiments/helios-client-gpui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+thiserror = "2.0.17"
+tokio = "1.48.0"
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+hmac = "0.12.1"
+sha2 = "0.10.9"
+getrandom = "0.4.3"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+subtle = "2.6.1"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"
+serde_json = "1.0.145"
+windows-sys = "0.61.2"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+tproxy-config = { path = "vendor/tproxy-config", default-features = false }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[patch.crates-io]
+tproxy-config = { path = "vendor/tproxy-config" }

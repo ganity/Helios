@@ -1,0 +1,33 @@
+[package]
+name = "helios-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+helios-client-model = { path = "../../crates/helios-client-model" }
+helios-client-control = { path = "../../crates/helios-client-control" }
+helios-config = { path = "../../crates/helios-config" }
+helios-control = { path = "../../crates/helios-control" }
+helios-protocol = { path = "../../crates/helios-protocol" }
+helios-routing = { path = "../../crates/helios-routing" }
+helios-system-proxy = { path = "../../crates/helios-system-proxy" }
+helios-transport = { path = "../../crates/helios-transport" }
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.21.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.7", features = ["blocking"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }

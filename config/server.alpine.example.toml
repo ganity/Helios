@@ -1,0 +1,15 @@
+schema_version = 1
+listen = "0.0.0.0:24443"
+
+[tls]
+certificate = "cert.pem"
+private_key = "key.pem"
+
+[auth]
+id = "desktop-main"
+token_file = "token.hex"
+
+[limits]
+handshake_timeout_seconds = 10
+max_sessions = 8
+max_flows_per_session = 64

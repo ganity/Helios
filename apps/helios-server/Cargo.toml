@@ -1,0 +1,18 @@
+[package]
+name = "helios-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helios-config = { path = "../../crates/helios-config" }
+helios-protocol = { path = "../../crates/helios-protocol" }
+helios-transport = { path = "../../crates/helios-transport" }
+getrandom.workspace = true
+quinn.workspace = true
+bytes = "1.10.1"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,641 @@
+use std::{
+    error::Error,
+    fs,
+    io::Write,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
+use serde::Deserialize;
+use tproxy_config::IpCidr;
+use tproxy_config::tproxy_remove;
+use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken, general_run_async};
+
+type AnyError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperConfig {
+    schema_version: u8,
+    socks_listen: SocketAddr,
+    server_ip: IpAddr,
+    #[serde(default)]
+    tun_name: Option<String>,
+    #[serde(default = "default_mtu")]
+    mtu: u16,
+    #[serde(default)]
+    ipv6_enabled: bool,
+    #[serde(default)]
+    bypass: Vec<String>,
+    status_file: PathBuf,
+    stop_file: PathBuf,
+}
+
+impl HelperConfig {
+    fn load(path: impl AsRef<Path>) -> Result<Self, AnyError> {
+        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), AnyError> {
+        if self.schema_version != 1 {
+            return Err("unsupported helper schema_version".into());
+        }
+        if !self.socks_listen.ip().is_loopback() || self.socks_listen.port() == 0 {
+            return Err("socks_listen must be a loopback address with a nonzero port".into());
+        }
+        if self.server_ip.is_loopback() || self.server_ip.is_unspecified() {
+            return Err("server_ip must be the public Helios server IP".into());
+        }
+        if !(576..=9000).contains(&self.mtu) {
+            return Err("mtu must be between 576 and 9000".into());
+        }
+        for value in &self.bypass {
+            IpCidr::from_str(value)?;
+        }
+        if !self.status_file.is_absolute() || !self.stop_file.is_absolute() {
+            return Err("status_file and stop_file must be absolute paths".into());
+        }
+        if self.status_file == self.stop_file {
+            return Err("status_file and stop_file must be different".into());
+        }
+        Ok(())
+    }
+
+    fn tun_args(&self) -> Result<Args, AnyError> {
+        let mut args = Args {
+            proxy: ArgProxy::try_from(format!("socks5://{}", self.socks_listen).as_str())?,
+            tun: self.tun_name.clone(),
+            ipv6_enabled: self.ipv6_enabled,
+            setup: true,
+            dns: ArgDns::Virtual,
+            mtu: self.mtu,
+            tcp_mss: Some(self.mtu.saturating_sub(40)),
+            udp_timeout: 60,
+            exit_on_fatal_error: true,
+            ..Args::default()
+        };
+        args.bypass
+            .push(IpCidr::from_str(&host_cidr(self.server_ip))?);
+        for value in &self.bypass {
+            args.bypass.push(IpCidr::from_str(value)?);
+        }
+        Ok(args)
+    }
+}
+
+fn default_mtu() -> u16 {
+    1280
+}
+
+fn host_cidr(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}/32"),
+        IpAddr::V6(ip) => format!("{ip}/128"),
+    }
+}
+
+fn finish_helper_run(path: &Path, result: Result<(), AnyError>) -> Result<(), AnyError> {
+    result?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn create_status_file(path: &Path) -> Result<fs::File, AnyError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(std::process::id().to_string().as_bytes())?;
+    Ok(file)
+}
+
+async fn wait_for_stop(path: &Path, status: &fs::File) -> Result<(), AnyError> {
+    loop {
+        if path.exists() {
+            fs::remove_file(path)?;
+            return Ok(());
+        }
+        status.set_modified(std::time::SystemTime::now())?;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), AnyError> {
+    let values: Vec<_> = std::env::args_os().skip(1).collect();
+    let (recover, path) = parse_command(&values)?;
+    let config = HelperConfig::load(path)?;
+    #[cfg(unix)]
+    let _instance_lock = lock_helper_instance()?;
+    configure_route_state()?;
+    if recover {
+        return recover_helper(&config).await;
+    }
+    if status_is_fresh(&config.status_file) {
+        return Err("another helios-helper instance is already running".into());
+    }
+    if config.status_file.exists() {
+        return Err("stale helper state detected; refusing to modify routes without a trusted recovery record".into());
+    }
+    let args = config.tun_args()?;
+    if let Some(parent) = config.status_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(&config.stop_file);
+    let status_file = create_status_file(&config.status_file)?;
+    let shutdown = CancellationToken::new();
+    let run = general_run_async(
+        args,
+        config.mtu,
+        cfg!(target_os = "macos"),
+        shutdown.clone(),
+    );
+    tokio::pin!(run);
+
+    let result: Result<(), AnyError> = tokio::select! {
+        result = &mut run => {
+            result.map(|_| ()).map_err(Into::into)
+        }
+        signal = shutdown_signal() => {
+            shutdown.cancel();
+            let result = run.await;
+            signal?;
+            result.map(|_| ()).map_err(Into::into)
+        }
+        stop = wait_for_stop(&config.stop_file, &status_file) => {
+            shutdown.cancel();
+            let result = run.await;
+            stop.and(result.map(|_| ()).map_err(Into::into))
+        }
+    };
+    drop(status_file);
+    finish_helper_run(&config.status_file, result)
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+#[cfg(unix)]
+fn lock_helper_instance() -> Result<fs::File, AnyError> {
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(target_os = "macos")]
+    let path = Path::new("/private/var/run/helios-helper.lock");
+    #[cfg(not(target_os = "macos"))]
+    let path = Path::new("/run/helios-helper.lock");
+    let parent = fs::symlink_metadata(path.parent().unwrap())?;
+    if !parent.is_dir() || parent.uid() != 0 || parent.mode() & 0o022 != 0 {
+        return Err("helper lock directory must be a root-owned, non-writable directory".into());
+    }
+    let file = lock_instance_file(path)?;
+    let metadata = file.metadata()?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err("helper lock must be owned by root and not writable by other users".into());
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lock_instance_file(path: &Path) -> Result<fs::File, AnyError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("helper lock is not a regular file".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    file.try_lock()
+        .map_err(|error| format!("another helper operation holds the instance lock: {error}"))?;
+    // Never unlink the lock: all processes must lock the same inode.
+    Ok(file)
+}
+
+fn status_is_fresh(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|age| age < std::time::Duration::from_secs(2))
+}
+
+async fn recover_helper(config: &HelperConfig) -> Result<(), AnyError> {
+    if status_is_fresh(&config.status_file) {
+        return Err(
+            "helios-helper heartbeat is active; stop the helper before recovering routes".into(),
+        );
+    }
+    recover_routes().await?;
+    let _ = fs::remove_file(&config.status_file);
+    let _ = fs::remove_file(&config.stop_file);
+    Ok(())
+}
+
+async fn recover_routes() -> Result<(), AnyError> {
+    tproxy_remove(None).await?;
+    Ok(())
+}
+
+fn parse_command(values: &[std::ffi::OsString]) -> Result<(bool, PathBuf), AnyError> {
+    match values {
+        [path] => Ok((false, PathBuf::from(path))),
+        [flag, path] if flag == "--recover" => Ok((true, PathBuf::from(path))),
+        _ => Err("usage: helios-helper [--recover] CONFIG.toml (run with platform administrator privileges)".into()),
+    }
+}
+
+#[cfg(windows)]
+fn route_state_file() -> Result<PathBuf, AnyError> {
+    Ok(
+        PathBuf::from(std::env::var_os("ProgramData").ok_or("ProgramData is not set")?)
+            .join("Helios")
+            .join("tun-route-lease.json"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn route_state_file() -> Result<PathBuf, AnyError> {
+    Ok(PathBuf::from(
+        "/Library/Application Support/Helios/tun-route-lease.json",
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn configure_route_state() -> Result<(), AnyError> {
+    tproxy_config::set_state_file_path(route_state_file()?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_route_state() -> Result<(), AnyError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let directory = Path::new("/var/lib/helios");
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err("Linux route journal directory must be a root-owned, private directory".into());
+    }
+    let path = directory.join("tun-route-lease.json");
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (!metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0)
+    {
+        return Err("Linux route journal must be a root-owned, private regular file".into());
+    }
+    tproxy_config::set_state_file_path(path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_run_preserves_status_and_success_cleans_it() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-helper-finish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(create_status_file(&path).unwrap());
+        let original = fs::read(&path).unwrap();
+        assert!(finish_helper_run(&path, Err("route cleanup failed".into())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        finish_helper_run(&path, Ok(())).unwrap();
+        assert!(!path.exists());
+        assert!(finish_helper_run(&path, Ok(())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn heartbeat_never_follows_replaced_status_symlink() {
+        let directory = std::env::temp_dir().join(format!(
+            "helios-helper-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("status");
+        let target = directory.join("target");
+        let stop = directory.join("stop");
+        fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(create_status_file(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        let status = create_status_file(&path).unwrap();
+        assert!(create_status_file(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let before = fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                wait_for_stop(&stop, &status)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), before);
+        fs::write(&stop, b"stop").unwrap();
+        wait_for_stop(&stop, &status).await.unwrap();
+        assert!(!stop.exists());
+        drop(status);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_excludes_other_processes_and_releases_on_drop() {
+        const LOCK_PATH: &str = "HELIOS_HELPER_LOCK_TEST_PATH";
+        if let Some(path) = std::env::var_os(LOCK_PATH) {
+            assert!(lock_instance_file(Path::new(&path)).is_err());
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "helios-helper-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = lock_instance_file(&path).unwrap();
+        assert!(lock_instance_file(&path).is_err());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::instance_lock_excludes_other_processes_and_releases_on_drop",
+            ])
+            .env(LOCK_PATH, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        drop(first);
+        let second = lock_instance_file(&path).unwrap();
+        drop(second);
+        fs::remove_file(&path).unwrap();
+        let target = path.with_extension("target");
+        fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(lock_instance_file(&path).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        fs::remove_file(path).unwrap();
+        fs::remove_file(target).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_active_heartbeat_without_removing_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "helios-helper-active-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut config = config();
+        config.status_file = directory.join("status");
+        config.stop_file = directory.join("stop");
+        fs::write(&config.status_file, b"active").unwrap();
+        fs::write(&config.stop_file, b"stop").unwrap();
+        let error = recover_helper(&config).await.unwrap_err();
+        assert!(error.to_string().contains("heartbeat is active"));
+        assert_eq!(fs::read(&config.status_file).unwrap(), b"active");
+        assert_eq!(fs::read(&config.stop_file).unwrap(), b"stop");
+        fs::remove_file(config.status_file).unwrap();
+        fs::remove_file(config.stop_file).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_handles_sigterm_and_sigint_in_child() {
+        use std::{
+            future::Future,
+            process::Command,
+            task::Poll,
+            time::{Duration, Instant},
+        };
+
+        const READY: &str = "HELIOS_HELPER_SIGNAL_TEST_READY";
+        if let Some(path) = std::env::var_os(READY) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let shutdown = shutdown_signal();
+                    tokio::pin!(shutdown);
+                    std::future::poll_fn(|cx| {
+                        assert!(shutdown.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    fs::write(path, b"ready").unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), shutdown)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                });
+            return;
+        }
+
+        for signal in ["-TERM", "-INT"] {
+            let path = std::env::temp_dir().join(format!(
+                "helios-helper-signal-{}-{signal}",
+                std::process::id()
+            ));
+            assert!(!path.exists());
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::shutdown_signal_handles_sigterm_and_sigint_in_child",
+                ])
+                .env(READY, &path)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !path.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none()
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !path.exists() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not install signal handlers");
+            }
+            let sent = Command::new("kill")
+                .args([signal, &child.id().to_string()])
+                .status()
+                .unwrap();
+            let status = child.wait().unwrap();
+            fs::remove_file(path).unwrap();
+            assert!(sent.success());
+            assert!(status.success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_recovery_cannot_report_success_without_a_route_lease() {
+        assert!(recover_routes().await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_recovery_preserves_stale_status_and_stop_request() {
+        let directory = std::env::temp_dir().join(format!(
+            "helios-helper-stale-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut config = config();
+        config.status_file = directory.join("status");
+        config.stop_file = directory.join("stop");
+        fs::write(&config.status_file, b"stale").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&config.status_file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        fs::write(&config.stop_file, b"stop").unwrap();
+        assert!(!status_is_fresh(&config.status_file));
+        assert!(recover_helper(&config).await.is_err());
+        assert_eq!(fs::read(&config.status_file).unwrap(), b"stale");
+        assert_eq!(fs::read(&config.stop_file).unwrap(), b"stop");
+        fs::remove_file(config.status_file).unwrap();
+        fs::remove_file(config.stop_file).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    fn config() -> HelperConfig {
+        HelperConfig {
+            schema_version: 1,
+            socks_listen: "127.0.0.1:1080".parse().unwrap(),
+            server_ip: "203.0.113.8".parse().unwrap(),
+            tun_name: None,
+            mtu: 1280,
+            ipv6_enabled: false,
+            bypass: vec!["192.168.0.0/16".into()],
+            status_file: std::env::temp_dir().join("helios-helper-test.status"),
+            stop_file: std::env::temp_dir().join("helios-helper-test.stop"),
+        }
+    }
+
+    #[test]
+    fn builds_loop_safe_tun_arguments() {
+        let args = config().tun_args().unwrap();
+        assert_eq!(args.proxy.addr, "127.0.0.1:1080".parse().unwrap());
+        assert_eq!(args.dns, ArgDns::Virtual);
+        assert_eq!(args.mtu, 1280);
+        assert_eq!(args.tcp_mss, Some(1240));
+        assert_eq!(args.bypass.len(), 2);
+    }
+
+    #[test]
+    fn rejects_unsafe_or_invalid_configuration() {
+        let mut value = config();
+        value.socks_listen = "0.0.0.0:1080".parse().unwrap();
+        assert!(value.validate().is_err());
+
+        let mut value = config();
+        value.socks_listen = "127.0.0.1:0".parse().unwrap();
+        assert!(value.validate().is_err());
+
+        let mut value = config();
+        value.server_ip = "127.0.0.1".parse().unwrap();
+        assert!(value.validate().is_err());
+
+        let mut value = config();
+        value.mtu = 500;
+        assert!(value.validate().is_err());
+
+        let mut value = config();
+        value.bypass.push("not-a-cidr".into());
+        assert!(value.validate().is_err());
+
+        let mut value = config();
+        value.stop_file = value.status_file.clone();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn example_configuration_stays_valid() {
+        let value: HelperConfig =
+            toml::from_str(include_str!("../../../config/helper.example.toml")).unwrap();
+        value.validate().unwrap();
+    }
+
+    #[test]
+    fn status_heartbeat_only_accepts_recent_files() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-helper-heartbeat-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        assert!(!status_is_fresh(&path));
+        fs::write(&path, b"test").unwrap();
+        assert!(status_is_fresh(&path));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parses_start_and_recovery_commands_strictly() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            parse_command(&[OsString::from("helper.toml")]).unwrap(),
+            (false, PathBuf::from("helper.toml"))
+        );
+        assert_eq!(
+            parse_command(&[OsString::from("--recover"), OsString::from("helper.toml")]).unwrap(),
+            (true, PathBuf::from("helper.toml"))
+        );
+        assert!(parse_command(&[]).is_err());
+        assert!(parse_command(&[OsString::from("--bad"), OsString::from("helper.toml")]).is_err());
+    }
+}
