@@ -113,6 +113,7 @@ pub enum DaemonPresence {
 
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
+    #[cfg(not(windows))]
     address: SocketAddr,
     #[cfg(unix)]
     local_socket: Option<PathBuf>,
@@ -121,9 +122,12 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn new(address: SocketAddr, local_socket: Option<PathBuf>, token_file: PathBuf) -> Self {
+        #[cfg(windows)]
+        let _ = address;
         #[cfg(not(unix))]
         let _ = local_socket;
         Self {
+            #[cfg(not(windows))]
             address,
             #[cfg(unix)]
             local_socket,
@@ -269,10 +273,10 @@ impl DaemonClient {
     async fn connect(&self) -> Result<ControlStream, IoError> {
         #[cfg(windows)]
         {
-            return Ok(Box::new(
+            Ok(Box::new(
                 tokio::net::windows::named_pipe::ClientOptions::new()
                     .open(r"\.\pipe\helios-control")?,
-            ));
+            ))
         }
         #[cfg(not(windows))]
         {
