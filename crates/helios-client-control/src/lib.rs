@@ -114,14 +114,18 @@ pub enum DaemonPresence {
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
     address: SocketAddr,
+    #[cfg(unix)]
     local_socket: Option<PathBuf>,
     token_file: PathBuf,
 }
 
 impl DaemonClient {
     pub fn new(address: SocketAddr, local_socket: Option<PathBuf>, token_file: PathBuf) -> Self {
+        #[cfg(not(unix))]
+        let _ = local_socket;
         Self {
             address,
+            #[cfg(unix)]
             local_socket,
             token_file,
         }
@@ -270,13 +274,16 @@ impl DaemonClient {
                     .open(r"\.\pipe\helios-control")?,
             ));
         }
-        #[cfg(unix)]
-        if let Some(path) = &self.local_socket {
-            return Ok(Box::new(tokio::net::UnixStream::connect(path).await?));
+        #[cfg(not(windows))]
+        {
+            #[cfg(unix)]
+            if let Some(path) = &self.local_socket {
+                return Ok(Box::new(tokio::net::UnixStream::connect(path).await?));
+            }
+            Ok(Box::new(
+                tokio::net::TcpStream::connect(self.address).await?,
+            ))
         }
-        Ok(Box::new(
-            tokio::net::TcpStream::connect(self.address).await?,
-        ))
     }
 }
 
