@@ -42,35 +42,19 @@ jobs:
             dbus-run-session -- cargo test -p helios-daemon managed_guard_restores_lease_on_exit_and_on_startup_recovery -- --ignored
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace --release
-      - name: Validate Linux client package
+      - name: Build Debian installer
+        run: sh deploy/package-linux-deb.sh target/release target/installers
+      - name: Validate Debian installer
         run: |
-          sh -n deploy/install-linux-client.sh
-          sh -n deploy/package-linux-client.sh
-          sh deploy/package-linux-client.sh target/release target/linux-package
-          task_unpack_dir=$(mktemp -d "$RUNNER_TEMP/helios-package.XXXXXX")
-          tar -xzf "target/linux-package/helios-linux-$(uname -m).tar.gz" -C "$task_unpack_dir"
-          cd "$task_unpack_dir"
-          sha256sum -c SHA256SUMS
-          sh install-linux-client.sh . "$task_unpack_dir/install with spaces"
-          desktop-file-validate "$task_unpack_dir/install with spaces/share/applications/helios-client.desktop"
-          "$task_unpack_dir/install with spaces/bin/helios-daemon" version
-      - name: Upload Linux workspace binaries
+          dpkg-deb --info target/installers/helios_*.deb
+          dpkg-deb --contents target/installers/helios_*.deb
+          dpkg-deb --field target/installers/helios_*.deb Depends | grep -q 'libwayland-client0'
+      - name: Upload Linux installer
         uses: actions/upload-artifact@v4
         with:
-          name: helios-linux
+          name: helios-linux-deb
           if-no-files-found: error
-          path: |
-            target/release/helios-client
-            target/release/helios-daemon
-            target/release/helios-helper
-            target/release/helios-server
-            target/release/heliosctl
-      - name: Upload Linux client package
-        uses: actions/upload-artifact@v4
-        with:
-          name: helios-linux-client-package
-          if-no-files-found: error
-          path: target/linux-package/helios-linux-*.tar.gz
+          path: target/installers/helios_*.deb
 
   windows:
     runs-on: windows-latest
@@ -89,17 +73,18 @@ jobs:
       - run: cargo clippy -p helios-daemon -p helios-client -p helios-helper -p heliosctl --all-targets -- -D warnings
       - name: Build workspace release binaries
         run: cargo build --workspace --release --locked
-      - name: Upload Windows binaries
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          New-Item -ItemType Directory -Force target/installer | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp /Otarget\installer deploy\helios-windows.iss
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: helios-windows
+          name: helios-windows-installer
           if-no-files-found: error
-          path: |
-            target/release/helios-client.exe
-            target/release/helios-daemon.exe
-            target/release/helios-helper.exe
-            target/release/helios-server.exe
-            target/release/heliosctl.exe
+          path: target/installer/Helios-Setup-x64.exe
 
   macos:
     runs-on: macos-latest
@@ -118,14 +103,11 @@ jobs:
       - run: cargo clippy -p helios-daemon -p helios-client -p helios-helper -p heliosctl --all-targets -- -D warnings
       - name: Build workspace release binaries
         run: cargo build --workspace --release --locked
-      - name: Upload macOS binaries
+      - name: Build macOS DMG installer
+        run: sh deploy/package-macos-app.sh target/release target/installers "$(cargo pkgid -p helios-client | sed 's/.*@//')"
+      - name: Upload macOS installer
         uses: actions/upload-artifact@v4
         with:
-          name: helios-macos
+          name: helios-macos-dmg
           if-no-files-found: error
-          path: |
-            target/release/helios-client
-            target/release/helios-daemon
-            target/release/helios-helper
-            target/release/helios-server
-            target/release/heliosctl
+          path: target/installers/Helios-macos-*.dmg
