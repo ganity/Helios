@@ -10,6 +10,33 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
 use crate::FrameIo;
 
+/// Connects to a node with conservative segments for paths that black-hole large packets.
+pub async fn connect_node_tcp(
+    address: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // shortcut: TCP_MAXSEG is unavailable here on Windows; that path still relies on OS PMTU discovery.
+    #[cfg(unix)]
+    socket2::SockRef::from(&socket).set_tcp_mss(1000)?;
+    socket.set_nodelay(true)?;
+    let stream = socket.connect(address).await?;
+    configure_tcp(&stream)?;
+    Ok(stream)
+}
+
+pub fn configure_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    socket2::SockRef::from(stream).set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(10)),
+    )
+}
+
 /// Keeps TCP alive after TLS close_notify so half-close-hostile relays can drain replies.
 pub struct TlsTransport<S>(S);
 
@@ -111,6 +138,32 @@ mod tests {
     use super::*;
     use crate::{accept_tcp, authenticate_client, authenticate_server, open_tcp};
 
+    #[tokio::test]
+    async fn node_tcp_connection_limits_segments_and_transfers_large_payloads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(
+            connect_node_tcp(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut client = client.unwrap();
+        let (mut server, _) = accepted.unwrap();
+        assert!(client.nodelay().unwrap());
+        assert!(socket2::SockRef::from(&client).keepalive().unwrap());
+        #[cfg(unix)]
+        assert!(socket2::SockRef::from(&client).tcp_mss().unwrap() <= 1000);
+        let payload = vec![42; 65536];
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            client.write_all(&payload).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(received, expected);
+    }
     const ALPN: &[u8] = b"helios/1";
 
     fn tls_pair() -> (TlsClient, TlsServer) {

@@ -71,3 +71,108 @@ curl --noproxy '' --proxy http://127.0.0.1:8080 https://example.com
 本轮不修改用户的系统代理或路由。运行环境没有真实图形会话，原生桌面、系统代理和
 TUN 的真机验收仍需分别进行；本次 TLS 修复不代表 TUN 已通过验收。
 公网 QUIC、UDP、长期运行和跨网络切换亦未由本轮测试证明。
+
+### 2026-11-03 VPS 更新验证
+
+- 使用 `.vps真机.md` 中的 root 账号及 SSH 端口 41237 登录成功。
+- 已部署提交 `ab1c3de` 的 musl release 服务端，OpenRC `helios-server` 重启成功。
+- 保留原证书和凭据，将 `max_sessions` 从 8 调整为 32。
+- 旧程序和配置分别备份为 `/usr/local/bin/helios-server.before-ab1c3de`
+  和 `/etc/helios/server.toml.before-ab1c3de`。
+- 部署文件 SHA-256：`89427146e6256052892690620e639ee56f97838d13ad20a57457632b12d124b3`。
+- 本地 daemon 经 VPS TLS：Google 返回 200，耗时 1.79 秒；GitHub robots.txt
+  12 并发共 48 次全部返回 200；OVH 10 MiB 下载耗时 5.00 秒，约 2.10 MB/s。
+- 上述为短时公网冒烟测试，未证明长期稳定性或 macOS 图形客户端表现。
+
+### 复杂网页复现（同日后续）
+
+使用全新 Chrome headless 配置、禁用缓存，访问 `https://doodles.google/`，
+每 5 秒向下滚动，观察 30 秒：
+
+- Helios TLS：31 个请求，7 个完成，22 个隧道连接失败，2 个未完成；
+  18 张图片仅 1 张加载成功，DOMContentLoaded 约 24.38 秒。
+- 本机 7890 代理：57 个请求，53 个完成，18 张图片全部加载成功；
+  DOMContentLoaded 约 3.69 秒，load 约 23.18 秒。失败项为统计或验证码请求取消。
+- Helios 单独请求 gstatic 资源可复现 10 秒后返回 HTTP 502；debug 日志为
+  `remote transport failed: deadline has elapsed`。
+- VPS 直接请求 Doodles 首页约 0.17 秒；当时 SSH 可用。之后本机连接
+  VPS 24443、41237 出现 `No route to host` 或超时，经 7890 连接 SSH 也超时。
+  尚不能确定失联原因，不能将全部失败归因于应用会话上限。
+
+上述结果推翻了“小文件并发通过即可代表复杂网页可用”的判断。
+需恢复 VPS 网络访问后继续检查会话占用和握手阶段；尚未修复复杂网页问题。
+
+### VPS 恢复后的 TCP 分段兼容修复
+
+- 恢复后第一轮 Doodles 成功，但第二轮再次出现 10 秒隧道超时，30 秒内
+  18 张图片全部未加载。SSH 同时卡在密钥交换；TCP 状态显示大量重传、
+  拥塞窗口降至 1。采样时服务端连接数未达 32，不能用会话额度解释全部故障。
+- 临时中转仅将节点 TCP MSS 限制为 1000 后，两轮均加载全部 18 张图片，
+  没有隧道错误；使用相同分段措施的 SSH 也恢复可用。这支持大包传输／PMTU
+  路径异常的判断，但尚无链路抓包证据确定具体是哪一层丢包。
+- 正式代码通过 `helios_transport::connect_node_tcp` 统一代理流量、TLS UDP
+  关联、健康探测和桌面节点测试。Unix 在连接前设置 MSS 1000，并启用
+  TCP_NODELAY；Windows 当前仅启用 TCP_NODELAY，尚无对应分段兼容措施。
+  此措施降低单包载荷以换取兼容性，不改变 TLS、安全校验或协议帧。
+- 移除临时中转、使用原节点地址直接连接后，连续三轮 Doodles 均加载全部
+  18 张图片，无隧道错误；load 分别为 13.48、12.41、14.20 秒。统计／验证码
+  `ERR_ABORTED` 与隧道失败分开计算。10 MiB 下载 4.39 秒，约 2.39 MB/s。
+- 相关 transport、client-control、daemon 测试通过（48 项，另有 1 项需隔离
+  桌面环境的既有测试跳过）；TLS 和 QUIC 各 100 次、24 并发本地请求通过，
+  服务端额度为 8。增加了验证实际 MSS、TCP_NODELAY 和 64 KiB 传输的测试。
+- 本机缺少 macOS C 交叉编译器和 Windows MinGW 编译器，跨平台 check
+  在 ring 构建阶段受阻。macOS 真机效果、Windows 同类线路兼容和长期稳定性
+  仍需验证。本次修复位于客户端；VPS 程序无需更换。
+
+### 借鉴成熟内核的连接基础优化
+
+此次为独立 Rust 实现，未复制 Mihomo 的 GPL 源码，未修改私有协议。
+
+- 服务端目标域名：最多缓存 256 个域名，合并同域名的并发成功查询，失败不缓存；
+  使用系统解析器，无法获取权威 TTL，故采用 30 秒固定缓存上限，过期后重新解析，
+  不返回过期地址。不在客户端解析海外域名。
+- 服务端目标拨号：IPv4/IPv6 交错排列，每隔 250 ms 启动下一地址，失败时可提前
+  尝试；第一个连接成功后取消剩余尝试，仍受协议请求的整体目标连接期限约束。
+- 节点 TCP、服务端接受的 TLS TCP 和服务端目标 TCP：启用 TCP_NODELAY 与
+  TCP keepalive（空闲 60 秒、探测间隔 10 秒）。保活不等于应用层健康或 MTU 修复。
+- 认证后首帧等待受握手期限约束；客户端等待建流回应最长为请求目标连接期限
+  加 1 秒。保留现有 TLS 半关闭实现及对应测试，不添加会中断长下载的硬性流期限。
+- debug 日志分别记录节点 TCP、TLS、认证以及服务端 DNS 和目标 TCP 阶段，
+  不记录 token、认证内容、URL 查询串。可设置
+  `RUST_LOG=helios_daemon=debug,helios_transport=debug` 检查。
+
+新增的浏览器测试使用全新 Chrome 配置、禁用缓存，30 秒内断言所有图片加载，
+排除 `ERR_ABORTED`，其他网络错误使测试失败。以下命令同时覆盖新客户端和服务端：
+
+```sh
+SMOKE_TRANSPORT=tls SOAK_PARALLEL=24 SOAK_REQUESTS=100 SMOKE_MAX_SESSIONS=8 \
+  IDLE_SECONDS=3 BROWSER_SMOKE_URL=local bash scripts/local-transport-smoke.sh
+SMOKE_TRANSPORT=quic SOAK_PARALLEL=24 SOAK_REQUESTS=100 SMOKE_MAX_SESSIONS=8 \
+  IDLE_SECONDS=3 BROWSER_SMOKE_URL=local bash scripts/local-transport-smoke.sh
+# VPS 代理需先启动；此命令使用当前运行的程序，不会自动更换服务端。
+node scripts/browser-smoke.mjs 8080 https://doodles.google/
+```
+
+本地图片页面发出 48 个独立图片请求；Chrome 显式关闭 loopback 代理绕过，确保
+这些请求经过 Helios。浏览器脚本当前依赖 Linux `/usr/bin/google-chrome` 和
+支持内置 WebSocket 的 Node。测试脚本为临时服务生成证书与 token，退出时清理。
+
+新版 57 项基础测试通过（另有 1 项需隔离桌面环境的既有测试跳过），Clippy 和
+release 编译通过。TLS/QUIC 各 100 次、24 并发转发通过，且各自浏览器验收均为
+48/48 图片成功、无网络错误。旧 VPS 服务端的 Doodles 复验得到
+18/18 图片、无资源网络错误；此结果不能证明新版服务端的公网性能。新服务端在
+本机直连 Google 资源存在超时，故不将其作为速度结论。此次尚未部署 VPS 或推送。
+
+仍待后续测量：节点级 MSS 策略（当前保留上轮 Unix 固定 1000 的兼容行为）、
+Windows 分段兼容、TLS 恢复／预连接及长期运行。没有依据本轮结果引入 TCP 多路复用。
+
+### Mihomo 固定版本深入对照后的第二轮调整
+
+详见 [源码分析](12-mihomo-comparison.md)。新增 TLS 认证与建流流水发送，服务端仍先
+认证；补齐建流写入背压超时和 DNS 失败的 1 秒共享窗口。真实 TLS 测试确认现有
+配置已经支持会话恢复，不额外实现 ticket 或启用 0-RTT。
+
+TLS/QUIC 本地各 100 次、24 并发及各自 48 张图片验收通过。新版 daemon 直接连接
+既有 VPS，Doodles 30 秒内 18/18 图片成功，54 个完成事件，10,718,450 字节，
+无非取消类资源错误。没有做同线路 Mihomo A/B，不据此报告相对加速百分比。
+VPS 仍是旧服务端，服务端 DNS 优化尚未部署；本轮仅更新本地 daemon 并保留运行。

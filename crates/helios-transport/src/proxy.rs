@@ -1,8 +1,6 @@
 use std::{io::ErrorKind, time::Duration};
 
-use helios_protocol::{
-    Address, ConnectErrorCode, ConnectTcp, DecodeError, EncodeError, Frame, FrameType,
-};
+use helios_protocol::{ConnectErrorCode, ConnectTcp, DecodeError, EncodeError, Frame, FrameType};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -14,6 +12,8 @@ use crate::{FrameIo, FrameIoError};
 
 #[derive(Debug, Error)]
 pub enum ConnectError {
+    #[error("target connect response timed out")]
+    ResponseTimeout,
     #[error("operating system random source failed: {0}")]
     Random(#[from] getrandom::Error),
     #[error(transparent)]
@@ -40,16 +40,43 @@ pub async fn open_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut request = request.clone();
-    if io.padding_negotiated() && request.padding.is_empty() {
-        request.padding = crate::padding::random_padding(request.encode()?.len())?;
-    }
-    io.write_frame(&Frame::new(
-        FrameType::ConnectTcp,
-        request_id,
-        request.encode()?,
-    )?)
-    .await?;
+    timeout(
+        Duration::from_millis(u64::from(request.timeout_ms) + 1000),
+        async {
+            let mut request = request.clone();
+            if io.padding_negotiated() && request.padding.is_empty() {
+                request.padding = crate::padding::random_padding(request.encode()?.len())?;
+            }
+            io.write_frame(&Frame::new(
+                FrameType::ConnectTcp,
+                request_id,
+                request.encode()?,
+            )?)
+            .await?;
+            read_connect_response(io, request_id).await
+        },
+    )
+    .await
+    .map_err(|_| ConnectError::ResponseTimeout)?
+}
+
+/// Completes a ConnectTcp already queued by authenticate_client_with_connect.
+pub async fn finish_tcp_connect<S>(io: FrameIo<S>, request: &ConnectTcp) -> Result<S, ConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    timeout(
+        Duration::from_millis(u64::from(request.timeout_ms) + 1000),
+        read_connect_response(io, 3),
+    )
+    .await
+    .map_err(|_| ConnectError::ResponseTimeout)?
+}
+
+async fn read_connect_response<S>(mut io: FrameIo<S>, request_id: u32) -> Result<S, ConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let response = io.read_frame().await?;
     if response.request_id != request_id {
         return Err(ConnectError::RequestIdMismatch);
@@ -82,14 +109,8 @@ where
         return Err(ConnectError::UnexpectedFrame(frame.frame_type));
     }
     let request = ConnectTcp::decode(&frame.payload)?;
-    let connect = async {
-        match &request.target.address {
-            Address::Ip(ip) => TcpStream::connect((*ip, request.target.port)).await,
-            Address::Domain(domain) => {
-                TcpStream::connect((domain.as_str(), request.target.port)).await
-            }
-        }
-    };
+    let started = std::time::Instant::now();
+    let connect = crate::dial::connect_target(&request.target);
     let target = match timeout(Duration::from_millis(request.timeout_ms.into()), connect).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -105,6 +126,11 @@ where
             )));
         }
     };
+
+    tracing::debug!(
+        event = "target_connected",
+        elapsed_ms = started.elapsed().as_millis() as u64
+    );
 
     io.write_frame(&Frame::new(
         FrameType::ConnectOk,
@@ -154,6 +180,73 @@ mod tests {
     use crate::{authenticate_client, authenticate_server};
 
     use super::*;
+
+    #[tokio::test]
+    async fn pipelined_client_works_with_existing_server_and_padding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = duplex(16384);
+        let peer = tokio::spawn(async move {
+            let mut io = FrameIo::new(server);
+            authenticate_server(&mut io, CAP_TCP_CONNECT, |_| Some([7; 32]))
+                .await
+                .unwrap();
+            assert!(io.padding_negotiated());
+            let (mut stream, _target) = accept_tcp(io).await.unwrap();
+            stream.write_all(b"verified").await.unwrap();
+        });
+        let request = ConnectTcp::new(
+            Target::new(Address::Ip(address.ip()), address.port()).unwrap(),
+            1000,
+            vec![],
+        )
+        .unwrap();
+        let mut io = FrameIo::new(client);
+        crate::authenticate_client_with_connect(&mut io, "test", &[7; 32], &request)
+            .await
+            .unwrap();
+        let mut stream = finish_tcp_connect(io, &request).await.unwrap();
+        let mut bytes = [0; 8];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"verified");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_request_write_also_has_a_deadline() {
+        let (client, _unread_peer) = duplex(1);
+        let request = ConnectTcp::new(
+            Target::new(Address::Ip("127.0.0.1".parse().unwrap()), 443).unwrap(),
+            1000,
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            open_tcp(FrameIo::new(client), 3, &request).await,
+            Err(ConnectError::ResponseTimeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_connect_response_does_not_hold_flow_forever() {
+        let (client, server) = duplex(4096);
+        let request = ConnectTcp::new(
+            Target::new(Address::Ip("127.0.0.1".parse().unwrap()), 443).unwrap(),
+            1000,
+            vec![],
+        )
+        .unwrap();
+        let peer = tokio::spawn(async move {
+            let mut io = FrameIo::new(server);
+            io.read_frame().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(matches!(
+            open_tcp(FrameIo::new(client), 3, &request).await,
+            Err(ConnectError::ResponseTimeout)
+        ));
+        peer.abort();
+    }
 
     #[tokio::test]
     async fn connect_padding_requires_negotiation_and_preserves_explicit_padding() {

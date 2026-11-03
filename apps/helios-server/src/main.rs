@@ -246,6 +246,7 @@ async fn serve_tls_flow(
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), AnyError> {
     let mut io = timeout(Duration::from_secs(handshake_timeout_seconds), async {
+        helios_transport::configure_tcp(&stream)?;
         let mut io = tls.accept(stream).await?;
         authenticate_server(&mut io, CAP_TCP_CONNECT | CAP_UDP_OVER_STREAM, |id| {
             (id == credential.id.as_ref()).then_some(credential.token)
@@ -254,7 +255,11 @@ async fn serve_tls_flow(
         Ok::<_, AnyError>(io)
     })
     .await??;
-    let frame = io.read_frame().await?;
+    let frame = timeout(
+        Duration::from_secs(handshake_timeout_seconds),
+        io.read_frame(),
+    )
+    .await??;
     if frame.frame_type == FrameType::Ping {
         io.write_frame(&Frame::new(
             FrameType::Pong,

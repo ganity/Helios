@@ -73,7 +73,7 @@ async fn probe_node_inner(node: NodeConfig) -> Result<ProbeMeasurement, ProbeErr
         TransportPreference::Tls => {
             let tcp = tokio::time::timeout(
                 Duration::from_secs(5),
-                tokio::net::TcpStream::connect(node.server),
+                helios_transport::connect_node_tcp(node.server),
             )
             .await??;
             let mut io = crypto.tls.connect(server_name, tcp).await?;

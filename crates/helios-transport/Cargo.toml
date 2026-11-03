@@ -11,8 +11,10 @@ getrandom.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 tokio-rustls.workspace = true
+tracing.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }

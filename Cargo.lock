@@ -2145,9 +2145,11 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

@@ -56,6 +56,7 @@ sed -e "s|127.0.0.1:1080|127.0.0.1:$socks_port|" \
     config/daemon.example.toml > "$work/daemon.toml"
 truncate -s 32M "$work/32m.bin"
 truncate -s 1M "$work/1m.bin"
+cp scripts/fixtures/browser.html scripts/fixtures/pixel.svg "$work/"
 
 python3 -m http.server "$origin_port" --bind 127.0.0.1 --directory "$work" > "$work/origin.log" 2>&1 & origin_pid=$!
 target/release/helios-server run --config "$work/server.toml" > "$work/server.log" 2>&1 & server_pid=$!
@@ -81,3 +82,8 @@ if [[ $transport == quic ]] && grep -q 'quic_flow_failed' "$work/daemon.log"; th
     exit 1
 fi
 echo "$transport survived ${IDLE_SECONDS:-35}s idle"
+if [[ -n ${BROWSER_SMOKE_URL:-} ]]; then
+    browser_url=$BROWSER_SMOKE_URL
+    if [[ $browser_url == local ]]; then browser_url="http://localhost:$origin_port/browser.html"; fi
+    node scripts/browser-smoke.mjs "$http_port" "$browser_url"
+fi

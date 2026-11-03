@@ -89,6 +89,44 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn repeated_connections_resume_tls_without_skipping_application_auth() {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = ServerCrypto::new(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = ClientCrypto::new(roots).unwrap();
+        for expected in [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed] {
+            let (a, b) = tokio::io::duplex(16384);
+            let (a, b) = tokio::join!(
+                client.tls.connect("localhost".try_into().unwrap(), a),
+                server.tls.accept(b)
+            );
+            let mut a = a.unwrap();
+            let mut b = b.unwrap();
+            // Application I/O also processes post-handshake session tickets.
+            let (auth_client, auth_server) = tokio::join!(
+                crate::authenticate_client(
+                    &mut a,
+                    "test",
+                    &[7; 32],
+                    helios_protocol::CAP_TCP_CONNECT
+                ),
+                crate::authenticate_server(&mut b, helios_protocol::CAP_TCP_CONNECT, |_| Some(
+                    [7; 32]
+                ))
+            );
+            auth_client.unwrap();
+            auth_server.unwrap();
+            assert_eq!(a.into_inner().get_ref().1.handshake_kind(), Some(expected));
+        }
+    }
+
     #[test]
     fn builds_matching_tls_and_quic_configs() {
         let CertifiedKey { cert, signing_key } =

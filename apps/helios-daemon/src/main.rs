@@ -1255,7 +1255,7 @@ async fn probe_tls(
     credential_id: &str,
     token: &[u8; 32],
 ) -> Result<Duration, AnyError> {
-    let tcp = TcpStream::connect(server).await?;
+    let tcp = helios_transport::connect_node_tcp(server).await?;
     let mut io = client.connect(server_name.clone(), tcp).await?;
     authenticate_client(&mut io, credential_id, token, CAP_TCP_CONNECT).await?;
     Ok(ping(&mut io, 200, b"tls-health").await?)
@@ -1639,7 +1639,7 @@ async fn open_udp_association(quic: &QuicRemote) -> Result<(FrameIo<QuicBiStream
 async fn open_tls_udp_association(
     remote: &Remote,
 ) -> Result<(FrameIo<helios_transport::ClientTlsStream<TcpStream>>, u32), AnyError> {
-    let tcp = TcpStream::connect(remote.server).await?;
+    let tcp = helios_transport::connect_node_tcp(remote.server).await?;
     let mut io = remote.tls.connect(remote.server_name.clone(), tcp).await?;
     authenticate_client(
         &mut io,
@@ -1858,17 +1858,42 @@ impl Remote {
         let io = timeout(
             Duration::from_millis(self.connect_milliseconds.into()),
             async {
-                let tcp = TcpStream::connect(self.server).await?;
+                let stage = std::time::Instant::now();
+                debug!(event = "node_connect_stage", stage = "tcp");
+                let tcp = helios_transport::connect_node_tcp(self.server).await?;
+                debug!(
+                    event = "node_tcp_connected",
+                    elapsed_ms = stage.elapsed().as_millis() as u64
+                );
+                let stage = std::time::Instant::now();
+                debug!(event = "node_connect_stage", stage = "tls");
                 let mut io = self.tls.connect(self.server_name.clone(), tcp).await?;
-                authenticate_client(&mut io, &self.credential_id, &self.token, CAP_TCP_CONNECT)
-                    .await?;
+                debug!(
+                    event = "node_tls_connected",
+                    elapsed_ms = stage.elapsed().as_millis() as u64
+                );
+                let stage = std::time::Instant::now();
+                debug!(event = "node_connect_stage", stage = "auth");
+                helios_transport::authenticate_client_with_connect(
+                    &mut io,
+                    &self.credential_id,
+                    &self.token,
+                    request,
+                )
+                .await?;
+                debug!(
+                    event = "node_authenticated",
+                    elapsed_ms = stage.elapsed().as_millis() as u64
+                );
                 Ok::<_, AnyError>(io)
             },
         )
         .await
         .map_err(|error| RemoteError::Transport(Box::new(error)))?
         .map_err(RemoteError::Transport)?;
-        Ok(RemoteStream::Tls(Box::new(open_tcp(io, 3, request).await?)))
+        Ok(RemoteStream::Tls(Box::new(
+            helios_transport::finish_tcp_connect(io, request).await?,
+        )))
     }
 }
 

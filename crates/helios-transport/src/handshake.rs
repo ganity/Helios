@@ -48,6 +48,39 @@ pub async fn authenticate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    authenticate_client_inner(io, credential_id, token, capabilities, None).await
+}
+
+/// Queues ConnectTcp behind Auth; the server still verifies Auth before handling it.
+pub async fn authenticate_client_with_connect<S>(
+    io: &mut FrameIo<S>,
+    credential_id: &str,
+    token: &[u8; 32],
+    request: &helios_protocol::ConnectTcp,
+) -> Result<AuthenticatedSession, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    authenticate_client_inner(
+        io,
+        credential_id,
+        token,
+        helios_protocol::CAP_TCP_CONNECT,
+        Some(request),
+    )
+    .await
+}
+
+async fn authenticate_client_inner<S>(
+    io: &mut FrameIo<S>,
+    credential_id: &str,
+    token: &[u8; 32],
+    capabilities: u32,
+    connect: Option<&helios_protocol::ConnectTcp>,
+) -> Result<AuthenticatedSession, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let capabilities = capabilities | CAP_PADDING_TIERS;
     let mut nonce = [0; NONCE_LEN];
     getrandom::fill(&mut nonce)?;
@@ -75,6 +108,17 @@ where
     let auth_payload = auth.encode()?;
     io.write_frame(&Frame::new(FrameType::Auth, AUTH_REQUEST_ID, auth_payload)?)
         .await?;
+
+    if let Some(request) = connect {
+        let mut request = request.clone();
+        if server_hello.capabilities & capabilities & CAP_PADDING_TIERS != 0
+            && request.padding.is_empty()
+        {
+            request.padding = crate::padding::random_padding(request.encode()?.len())?;
+        }
+        io.write_frame(&Frame::new(FrameType::ConnectTcp, 3, request.encode()?)?)
+            .await?;
+    }
 
     let response = io.read_frame().await?;
     if response.request_id != AUTH_REQUEST_ID {
@@ -191,6 +235,111 @@ mod tests {
     use tokio::io::duplex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn connect_is_queued_before_auth_reply_and_proof_is_verified() {
+        let (client, server) = duplex(16384);
+        let token = [7; 32];
+        let request = helios_protocol::ConnectTcp::new(
+            helios_protocol::Target::new(
+                helios_protocol::Address::Domain("example.com".into()),
+                443,
+            )
+            .unwrap(),
+            1000,
+            vec![],
+        )
+        .unwrap();
+        let peer = tokio::spawn(async move {
+            let mut io = FrameIo::new(server);
+            let hello = io.read_frame().await.unwrap();
+            let response = ServerHello::new(
+                [3; NONCE_LEN],
+                CAP_TCP_CONNECT,
+                MAX_CONTROL_PAYLOAD as u32,
+                vec![],
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            io.write_frame(&Frame::new(FrameType::ServerHello, 1, response.clone()).unwrap())
+                .await
+                .unwrap();
+            let auth = Auth::decode(&io.read_frame().await.unwrap().payload).unwrap();
+            assert!(verify_auth_proof(
+                &token,
+                &hello.payload,
+                &response,
+                &auth.proof
+            ));
+            // No AuthOk yet: a serial client would deadlock here.
+            let connect = io.read_frame().await.unwrap();
+            assert_eq!(connect.frame_type, FrameType::ConnectTcp);
+            assert!(
+                helios_protocol::ConnectTcp::decode(&connect.payload)
+                    .unwrap()
+                    .padding
+                    .is_empty()
+            );
+            io.write_frame(
+                &Frame::new(
+                    FrameType::AuthOk,
+                    2,
+                    AuthOk {
+                        session_id: [1; SESSION_ID_LEN],
+                    }
+                    .encode()
+                    .to_vec(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            io.write_frame(&Frame::new(FrameType::ConnectOk, 3, vec![]).unwrap())
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut io = FrameIo::new(client);
+            authenticate_client_with_connect(&mut io, "test", &token, &request)
+                .await
+                .unwrap();
+            crate::finish_tcp_connect(io, &request).await.unwrap();
+            peer.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipelined_connect_does_not_bypass_bad_credentials() {
+        let (client, server) = duplex(16384);
+        let peer = tokio::spawn(async move {
+            authenticate_server(&mut FrameIo::new(server), CAP_TCP_CONNECT, |_| {
+                Some([7; 32])
+            })
+            .await
+        });
+        let request = helios_protocol::ConnectTcp::new(
+            helios_protocol::Target::new(
+                helios_protocol::Address::Ip("127.0.0.1".parse().unwrap()),
+                443,
+            )
+            .unwrap(),
+            1000,
+            vec![],
+        )
+        .unwrap();
+        assert!(matches!(
+            authenticate_client_with_connect(&mut FrameIo::new(client), "test", &[8; 32], &request)
+                .await,
+            Err(HandshakeError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            peer.await.unwrap(),
+            Err(HandshakeError::AuthenticationFailed)
+        ));
+    }
 
     #[tokio::test]
     async fn new_client_authenticates_with_legacy_server_without_padding_capability() {

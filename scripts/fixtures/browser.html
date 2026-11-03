@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Helios browser relay smoke</title>
+<h1>48 uncached image requests through the proxy</h1>
+<script>
+for (let i = 0; i < 48; i++) {
+  const image = new Image(128, 128);
+  image.src = `/pixel.svg?request=${i}`;
+  document.body.append(image);
+}
+</script>
