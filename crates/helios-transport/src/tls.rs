@@ -143,12 +143,16 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, accepted) = tokio::join!(
-            connect_node_tcp(listener.local_addr().unwrap()),
-            listener.accept()
-        );
-        let mut client = client.unwrap();
-        let (mut server, _) = accepted.unwrap();
+        let (mut client, (mut server, _)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::try_join!(
+                    connect_node_tcp(listener.local_addr().unwrap()),
+                    listener.accept()
+                )
+            })
+            .await
+            .expect("node TCP connection timed out")
+            .expect("node TCP connection failed");
         assert!(client.nodelay().unwrap());
         assert!(socket2::SockRef::from(&client).keepalive().unwrap());
         #[cfg(unix)]

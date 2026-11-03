@@ -95,6 +95,8 @@ jobs:
           toolchain: 1.95.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Test native TCP socket setup and TLS transport
+        run: cargo test -p helios-transport tls::tests:: -- --nocapture
       - run: cargo check -p helios-daemon -p helios-client -p helios-helper -p heliosctl
       - name: Reject missing and corrupt TUN recovery records
         run: cargo test -p tproxy-config --features secure-state-file recovery_rejects_missing_or_corrupt_secure_record
