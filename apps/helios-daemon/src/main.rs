@@ -16,6 +16,9 @@ use std::{
 mod managed_proxy;
 mod runtime;
 
+#[cfg(test)]
+mod quic_tests;
+
 use helios_config::{DaemonConfig, TransportPreference, load_roots, load_token};
 use helios_control::{
     ActiveFlowSnapshot, ActiveTransport, CONTROL_VERSION, ConnectionState, ControlCommand,
@@ -1343,28 +1346,30 @@ async fn monitor_quic(
         if control.is_none() {
             metrics.quic_healthy.store(false, Ordering::Relaxed);
             tokio::time::sleep(probe_interval).await;
-            match establish_quic(&config).await {
-                Ok((remote, new_control)) => {
+            match timeout(Duration::from_secs(10), establish_quic(&config)).await {
+                Ok(Ok((remote, new_control))) => {
                     *quic_slot.write().await = Some(remote.clone());
                     current = Some(remote);
                     control = Some(new_control);
                     info!(event = "quic_recovered");
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     debug!(event = "quic_recovery_error", error = %error);
+                    continue;
+                }
+                Err(_) => {
+                    warn!(event = "quic_recovery_timeout");
                     continue;
                 }
             }
         }
         let mut io = control.take().expect("control exists after establish");
-        let mut timeout_failures = 0u8;
         let mut ticker = interval(probe_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let payload = request_id.to_be_bytes();
-            match timeout(Duration::from_secs(5), ping(&mut io, request_id, &payload)).await {
-                Ok(Ok(elapsed)) => {
+            match probe_quic_health(&mut io, request_id).await {
+                Ok(elapsed) => {
                     metrics
                         .quic_rtt_micros
                         .store(elapsed.as_micros().max(1) as u64, Ordering::Relaxed);
@@ -1373,23 +1378,11 @@ async fn monitor_quic(
                         *quic_slot.write().await = Some(remote.clone());
                     }
                     request_id = request_id.wrapping_add(1).max(100);
-                    timeout_failures = 0;
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     warn!(event = "quic_health_failed", fallback = "tls");
                     debug!(event = "quic_health_error", error = %error);
                     break;
-                }
-                Err(_) => {
-                    timeout_failures = timeout_failures.saturating_add(1);
-                    warn!(
-                        event = "quic_health_timeout",
-                        consecutive = timeout_failures
-                    );
-                    if should_degrade_after_timeout(timeout_failures) {
-                        warn!(event = "quic_degraded", fallback = "tls");
-                        break;
-                    }
                 }
             }
         }
@@ -1399,6 +1392,29 @@ async fn monitor_quic(
             remote.connection.close(0u32.into(), b"health probe failed");
         }
         control = None;
+    }
+}
+
+async fn probe_quic_health<S>(io: &mut FrameIo<S>, request_id: u32) -> Result<Duration, AnyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let payload = request_id.to_be_bytes();
+    // Retain the entire write/read transaction across soft deadlines: FrameIo is not cancel-safe.
+    let probe = ping(io, request_id, &payload);
+    tokio::pin!(probe);
+    let mut timeouts = 0;
+    loop {
+        match timeout(Duration::from_secs(5), &mut probe).await {
+            Ok(result) => return result.map_err(Into::into),
+            Err(error) => {
+                timeouts += 1;
+                warn!(event = "quic_health_timeout", consecutive = timeouts);
+                if should_degrade_after_timeout(timeouts) {
+                    return Err(error.into());
+                }
+            }
+        }
     }
 }
 
@@ -1795,12 +1811,22 @@ impl Remote {
         }
         let request = ConnectTcp::new(target, self.connect_milliseconds, Vec::new())
             .map_err(|error| RemoteError::Transport(Box::new(error)))?;
-        if let Some(quic) = self.quic.read().await.clone() {
+        let quic = self.quic.read().await.clone();
+        if let Some(quic) = quic {
             match quic.open(&request).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) if !should_fallback(&error) => return Err(error),
                 Err(error) => {
-                    *self.quic.write().await = None;
+                    // A single flow timeout must not evict a live or newly recovered session.
+                    if quic.connection.close_reason().is_some() {
+                        let mut current = self.quic.write().await;
+                        if current.as_ref().is_some_and(|active| {
+                            active.connection.stable_id() == quic.connection.stable_id()
+                        }) {
+                            *current = None;
+                            self.metrics.quic_healthy.store(false, Ordering::Relaxed);
+                        }
+                    }
                     warn!(event = "quic_flow_failed", fallback = "tls");
                     debug!(event = "quic_flow_error", error = %error);
                 }
@@ -1899,14 +1925,21 @@ impl Remote {
 
 impl QuicRemote {
     async fn open(&self, request: &ConnectTcp) -> Result<RemoteStream, RemoteError> {
-        let (send, recv) = self
-            .connection
-            .open_bi()
-            .await
-            .map_err(|error| RemoteError::Transport(Box::new(error)))?;
-        let mut io = FrameIo::new(QuicBiStream::new(send, recv));
-        io.set_padding_negotiated(self.padding_negotiated);
-        Ok(RemoteStream::Quic(open_tcp(io, 3, request).await?))
+        timeout(
+            Duration::from_millis(u64::from(request.timeout_ms) + 1000),
+            async {
+                let (send, recv) = self
+                    .connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| RemoteError::Transport(Box::new(error)))?;
+                let mut io = FrameIo::new(QuicBiStream::new(send, recv));
+                io.set_padding_negotiated(self.padding_negotiated);
+                Ok(RemoteStream::Quic(open_tcp(io, 3, request).await?))
+            },
+        )
+        .await
+        .map_err(|_| RemoteError::Connect(ConnectError::ResponseTimeout))?
     }
 }
 

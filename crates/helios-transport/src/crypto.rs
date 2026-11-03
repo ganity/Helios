@@ -11,6 +11,15 @@ use crate::{TlsClient, TlsServer};
 
 pub const HELIOS_ALPN: &[u8] = b"helios/1";
 
+fn quic_transport_config() -> quinn::TransportConfig {
+    let mut congestion = quinn::congestion::BbrConfig::default();
+    // Keep the initial burst conservative; BBR sustains throughput on lossy, high-RTT paths.
+    congestion.initial_window(12_000);
+    let mut transport = quinn::TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(congestion));
+    transport
+}
+
 pub struct ServerCrypto {
     pub tls: TlsServer,
     pub quic: quinn::ServerConfig,
@@ -33,10 +42,12 @@ impl ServerCrypto {
                 .with_single_cert(certificates, private_key)?;
         quic_tls_config.alpn_protocols = vec![HELIOS_ALPN.to_vec()];
         let quic_crypto = QuicServerConfig::try_from(quic_tls_config)?;
+        let mut quic = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        quic.transport_config(Arc::new(quic_transport_config()));
 
         Ok(Self {
             tls: TlsServer::new(tls_config),
-            quic: quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)),
+            quic,
         })
     }
 }
@@ -62,7 +73,7 @@ impl ClientCrypto {
         let quic_crypto = QuicClientConfig::try_from(quic_tls_config)?;
 
         let mut quic = quinn::ClientConfig::new(Arc::new(quic_crypto));
-        let mut transport = quinn::TransportConfig::default();
+        let mut transport = quic_transport_config();
         // Health probes may be slower than QUIC's default idle timeout.
         transport.keep_alive_interval(Some(Duration::from_secs(10)));
         quic.transport_config(Arc::new(transport));

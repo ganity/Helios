@@ -82,6 +82,9 @@ if [[ $transport == quic ]] && grep -q 'quic_flow_failed' "$work/daemon.log"; th
     exit 1
 fi
 echo "$transport survived ${IDLE_SECONDS:-35}s idle"
+if [[ -n ${CAPACITY_CONNECTIONS:-} ]]; then
+    python3 scripts/tls-capacity-smoke.py "$http_port" "$CAPACITY_CONNECTIONS"
+fi
 if [[ -n ${BROWSER_SMOKE_URL:-} ]]; then
     browser_url=$BROWSER_SMOKE_URL
     if [[ $browser_url == local ]]; then browser_url="http://localhost:$origin_port/browser.html"; fi

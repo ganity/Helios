@@ -176,3 +176,253 @@ TLS/QUIC 本地各 100 次、24 并发及各自 48 张图片验收通过。新�
 既有 VPS，Doodles 30 秒内 18/18 图片成功，54 个完成事件，10,718,450 字节，
 无非取消类资源错误。没有做同线路 Mihomo A/B，不据此报告相对加速百分比。
 VPS 仍是旧服务端，服务端 DNS 优化尚未部署；本轮仅更新本地 daemon 并保留运行。
+
+### 多个 X 视频的后续诊断
+
+用户报告多条视频同时加载后停止自动播放，点击并等待数秒仍可播放，普通页面正常。
+未登录 Chrome 直接访问第一条帖子时，Helios 和 7890 均收到 X 的 HTTP 403，
+不能用帖子页面的无视频结果判断代理失效。
+
+从 X 公开 syndication 接口取得用户给出的五条帖子的真实 HLS 和 MP4 地址。
+Helios 两轮、每轮五条视频并发：播放列表全部 HTTP 200，MP4 首 1 MiB Range 全部
+HTTP 206，无超时；视频平均首字节 1.165 秒，首 1 MiB 完成 2.127 秒。7890 一轮
+对应均值为 0.410 和 0.802 秒。两条代理不保证同线路，因此不把差距全部归因于内核。
+
+全新 Chrome 中，同时创建五个 muted、autoplay、playsInline 视频元素并显式调用
+play()，使用五条帖子的最高分辨率 MP4。Helios 五条均触发 playing，分别为
+4.933、6.408、5.600、8.242、7.721 秒；30 秒内无媒体错误，短视频正常结束，
+其余继续播放。7890 同测亦均播放，分别为 3.936、2.331、7.898、25.188、21.437 秒。
+加载过程中 Chrome 的 ERR_ABORTED 单独记录，不等同于视频失败。
+
+该测试未复现 X 登录页面的自动播放停止，也不覆盖 HLS/MSE 播放器或 X 的可见性、
+预加载策略；不能宣称已经修好。CDN 根路径的 HTTP 400 也不能代表媒体不可用。
+
+独立容量测试发现：TLS 额度为 8 时，保留 8 条空闲 CONNECT 后第 9 条请求等待
+超过 3 秒；保留连接占用额度符合现有设计，但可造成多标签页等待。VPS 采样为
+11 条已建立连接，额度 32，未证实本次用户现象发生时饱和。可用以下诊断命令复测：
+
+```sh
+SMOKE_TRANSPORT=tls SOAK_REQUESTS=10 SMOKE_MAX_SESSIONS=8 IDLE_SECONDS=1 \
+  CAPACITY_CONNECTIONS=8 bash scripts/local-transport-smoke.sh
+```
+
+当前饱和诊断预期失败；它使用本地临时服务，不会占用 VPS。不要把增大额度、强制
+关闭空闲连接或修改浏览器自动播放权限当成已证实的修复。仍需用户浏览器种类、
+客户端版本及同浏览器 Clash 对照；若仅 X 页面停止发起媒体请求，应检查实际登录
+页面的播放器状态和网络记录，而不是更改加密或忽略 TLS 错误。
+
+#### Chrome 双代理交替复测
+
+用户补充 Mac Chrome 使用 Clash 可自动播放。本机确认 7890 为运行中的 Mihomo，
+8080 为 Helios。全新无登录 Chrome 同时打开五条原始帖子，两套代理全部返回
+HTTP 403，均无视频元素或媒体请求，因此未获得帖子播放器的启动耗时。
+
+改用上述五条真实 MP4，在每轮新建且禁用缓存的 Chrome 中同时加载，按
+Clash → Helios → Helios → Clash 顺序测量从创建媒体元素到首次 playing 的秒数。
+仍显式调用 play()，不将结果解释为 X 页面的自动播放策略。
+
+| 帖子 ID | Clash 第 1 轮 | Helios 第 1 轮 | Helios 第 2 轮 | Clash 第 2 轮 |
+| --- | ---: | ---: | ---: | ---: |
+| 2117463721757012466 | 3.842 | 6.214 | 5.730 | 6.528 |
+| 2117176877177778425 | 2.066 | 5.499 | 5.133 | 7.851 |
+| 2117461320845152627 | 4.463 | 4.052 | 5.376 | 9.203 |
+| 2117180664432996505 | 9.165 | 12.008 | 8.318 | 21.923 |
+| 2117213787694698736 | 8.291 | 7.483 | 5.360 | 13.407 |
+
+每套代理 10 次媒体启动全部成功，无媒体错误。Clash 第二轮明显变慢，说明该组
+公网样本有较大波动；不能据两轮均值判断 Helios 更快，也不能证明用户问题消失。
+原始诊断数据位于本机 `/tmp/helios-x-ab-{7890,8080}.json` 和
+`/tmp/helios-video-ab-repeat.jsonl`，属于临时文件。未修改生产代码或部署。
+
+#### 有头 Chrome 原始帖子验证
+
+在本机 X11 `:0` 启动独立配置的可见 Chrome 后，五条原始帖子均能返回 200，
+不再受无头测试的 403 限制。用户肉眼确认第一轮 Clash 窗口的原始视频自动播放；
+该轮自动化未捕获 playing，不能据缺失事件否定用户观察。
+
+之后逐个创建并切前台，等待 12 秒再尝试鼠标点击，另等 12 秒；启动参数补充
+`--no-first-run --no-default-browser-check`，避免新配置的首次启动流程干扰。
+Helios 五条在点击前均已触发 playing，导航至首次 playing 分别为
+10.642、5.748、5.972、9.573、8.900 秒，且点击前 currentTime 已推进、readyState=4。
+捕获到真实 X 播放列表／分片请求。这是原始页面的自动播放验证，不是独立 MP4。
+
+后续 Clash 同脚本复测未得到五条一致的点击前 playing：第 3、4 条在观察窗口内
+播放，其余尚在等待。该样本与用户观察不同，也包含自动化鼠标操作，不能用于
+宣布 Clash 不支持自动播放或 Helios 更快；尚无稳定的自动播放失败重现环路。
+页面切前台不等同于保证操作系统焦点与用户交互条件完全相同；本轮逐个加载，
+不等同于同时打开五条再来回切换。原始记录在 `/tmp/helios-x-headed-helios.jsonl`
+和 `/tmp/helios-x-headed-clash.jsonl`。未修改生产代码或部署。
+
+#### 已登录、同一有头 Chrome 的正式对照
+
+用户在专用 Chrome 配置中登录后，通过既有 CDP 接口连接同一窗口，全程不关闭
+浏览器、不导出 Cookie、不点击播放按钮。为覆盖启动时固定的 Clash 代理，仅在
+该测试配置加载本地临时 MV3 扩展（仅 `proxy` 权限）；确认代理设置及 Chrome 到
+8080 的实际 socket。完成后清除扩展代理设置、卸载临时扩展，恢复启动参数的
+7890 Clash，并将首页带回前台。登录配置和所有标签页保持不变。
+
+顺序为 Helios → Clash，两轮都禁用 HTTP 缓存并绕过 service worker；测试结束
+恢复上述 CDP 设置。每轮先首页滚动 40 秒（8 次采样），再同时导航五条原始帖子，
+逐个切前台停留 14 秒，记录自动触发的 playing。切前台前后都采样
+performance.now()；以下耗时为首次 playing 减去切前台后立即采样的时间，不是
+单独视频下载时间，也不是每条都从冷启动开始计时。
+
+| 视频（用户提供顺序） | Helios 切前台至播放 | Clash 切前台至播放 |
+| --- | ---: | ---: |
+| 1 | 8.256 秒 | 7.382 秒 |
+| 2 | 1.534 秒 | 0.441 秒 |
+| 3 | 1.427 秒 | 0.842 秒 |
+| 4 | 1.616 秒 | 0.491 秒 |
+| 5 | 1.563 秒 | 0.488 秒 |
+
+两套代理五条均自动播放，采样时可见视频 currentTime 已推进、readyState=4。
+首条包含更多页面冷启动工作；后四条切前台前已后台预加载，不可直接混算均值。
+首页 Helios 捕获 4 次 playing、115 个媒体请求，Clash 5 次 playing、149 个媒体
+请求；首页内容动态变化，请求数和事件数不作为速度排名。两轮只见 ERR_ABORTED
+类网络取消，没有其它网络错误或视频 error 事件。
+
+本轮支持“Helios 在这些帖子切前台后的启动等待更长”，但只是单轮、不同出站
+线路对照，不能把差距直接归因于某段内核代码；仍未复现连锁停止自动播放。
+脱敏记录（仅域名、计时、状态，不含请求头和 Cookie）保存在
+`/tmp/helios-logged-in-comparison.json`；执行脚本为
+`/tmp/helios-live-compare.mjs`，均是本机临时诊断文件。未修改生产代码或部署。
+
+#### 首页长滚动与 QUIC 补测
+
+**结论更正：本节旧脚本只统计 `<video>`，漏掉了仅显示播放按钮、尚未创建播放器的
+卡片。以下成功计数仅代表被观察到的播放器，不代表首页全部视频正常；不得用来
+否定用户“前几个能播放、后续不自动预览”的反馈。有效复现见下一节。**
+
+用户明确问题在首页可视视频预览，而非帖子详情。继续连接原登录窗口，保留正常
+缓存和 service worker，使用真实滚轮事件而不调用 play()。仅将高度超过 100px、
+纵向可见比例至少 60% 的候选视频纳入观察；确认 document.hasFocus() 和
+visibilityState，观察 currentTime 是否推进。暂停超过 10 秒仅作告警，不自动判为
+网络故障：X 可能选择同屏另一条视频播放，或者主动暂停刚开始的预览。
+
+TLS 与 Clash 各滚动 60 次、每次 450px：分别观察到 20/20、23/23 个候选视频
+自动播放并推进；无失焦样本，媒体请求分别为 354、388，无非 ERR_ABORTED 错误。
+快速滚动各 40 组、每组 5 次 450px：TLS 23 个候选中 20 个推进，2 个因布局变化
+移出视野而排除，1 个在 playing 约 9ms 后 pause；Clash 26 个候选中 23 个推进，
+3 个短暂 playing 后 pause。其中一个告警时同屏另一视频正在播放。因此这些告警
+不等价于用户截图中的持续黑屏缓冲，不能据此认定代理传输失败。
+
+用户补充 Mac 为最新构建、首选 QUIC。本机此前固定 TLS，不能当作相同条件。
+另起同节点 QUIC 实例（仅临时端口 8081/1081 和私有控制 socket），没有更改现有
+daemon 配置。控制状态确认 transport=quic，采样活跃流全部为 quic，RTT 约
+165～223ms，并非回退 TLS。QUIC 快速滚动 40 组只遇到 5 个可观察候选，3 个推进，
+1 个旁边另一视频正在播放，1 个约 29ms 后 pause；再逐屏滚动 60 次，5/5 个候选
+推进，无媒体网络错误。后半段列表没有视频，不能将全部滚动次数算成视频成功数。
+
+本轮仍未建立“缓冲不足且后续视频连锁不播放”的稳定重现。Linux 浏览器临时
+代理扩展也未覆盖 macOS networksetup 系统代理接入路径。测试结束恢复 Clash、
+卸载临时扩展、保留浏览器窗口和登录配置。数据在本机
+`/tmp/helios-home-{soak,fast,quic,quic-normal}-results.json`，仅含媒体状态、
+域名及计时，无 Cookie 或请求头。未修改生产代码或部署。
+
+#### 首页停播有效复现与 X 带宽门槛
+
+用户肉眼指出后续卡片不播放。对同一屏幕检查，PlayStation 帖子
+`2117270756476309666` 显示 playButton，但当时整个首页没有 `<video>` 元素；此前
+“无视频可检查”实际是漏检。该卡片后来恢复，不能据此否定先前的停播。
+
+重新沿当前首页持续滚动，不刷新，不调用 play()。采样同时覆盖视频元素和
+playButton 占位卡片，并记录解码帧数、paused、currentTime。QUIC 实例控制状态
+及流列表确认真实 QUIC。前几个可见视频正常推进，随后多张卡片保持播放按钮，
+6 秒多次采样不创建播放器；保留页面切到 Clash 后，旧卡片仍未立即恢复。
+`node /tmp/helios-preview-stall.mjs` 在该现场运行，8 次采样后明确失败：
+`Visible video card stayed a play-button placeholder without an automatic preview`。
+两次均取得该失败信号，不再以短暂 playing 事件当成整体成功。
+
+读取 X 当前已加载的前端代码和组件状态，发现：
+
+- 账号自动播放选项为 Always，dataSaverMode=false，preventPlayback 未启用，
+  无 SoftIntervention；页面启用了自动播放带宽门槛。
+- 自动播放判断模块 411278 在估计带宽低于 1,000,000 bps 时拒绝自动预览，改为
+  仅渲染播放按钮；估计缓存模块 18158 按网络签名保存，最多有效 300,000ms。
+- 在第二轮真实 QUIC 连续滚动中，同步读取该页面自己的估计：约 35.7 Mbps →
+  2.92 Mbps → 1.29 Mbps → 0.657/0.676/0.557 Mbps。最后一组可见卡片没有
+  播放器，与失败画面一致；Chrome effectiveType 此时仍是 4g，不能把 3g 当作
+  必要条件。
+- 紧随其后的只读函数检查得到：开启带宽门槛时 false，不计带宽门槛时 true；
+  当时缓存约 893,184 bps，网络签名 4g:unknown。此检查没有修改门槛或缓存值。
+
+以上定位了该次“后续不自动预览”的直接页面机制。尚未确定带宽估计下降源于
+Helios 实际传输瓶颈、短时请求等待还是播放器估计方法，不能宣称代理内核已修复。
+之前在 Clash 下缓存恢复至约 30.8 Mbps 的现场，诊断性调用单张卡片的 forceUpdate()
+后记录到视频持续推进和解码帧增加；此操作只用于检验重新渲染，不是修复，也不
+纳入“未经干预自动播放成功”的验收。未修改账号设置或关闭浏览器。
+
+一手代码来自当时页面实际加载的 X 资源：
+[自动播放判断及组件](https://abs.twimg.com/responsive-web/client-web/shared~bundle.AudioSpaceAnalytics~bundle.AudioSpacePeek~bundle.AudioSpaceReport~bundle.AudioSpaceStart~bundle.8bab2b46a97b3bffa.js)、
+[带宽缓存与门槛模块](https://abs.twimg.com/responsive-web/client-web/shared~loader.inlineTombstoneHandler~loader.tweetHandler.466361b7583a225ea.js)。
+模块号与资源版本仅用于本次证据，不应写死进 Helios。
+
+现场数据：`/tmp/helios-home-continuous-results.json`、
+`/tmp/helios-home-bandwidth-results.json`、`/tmp/helios-preview-stall-reproduced.jsonl`，
+以及 `/tmp/helios-home-stalled-*.png`；均为本机临时诊断文件，不含 Cookie 或请求头。
+测试完成恢复 Clash、卸载临时扩展，窗口及登录配置保留。未修改生产代码或部署。
+
+#### QUIC 拥塞控制与会话管理修复（2026-11-03）
+
+随后进行了真正的传输层对照，修复范围包括客户端和服务端，不改私有协议：
+
+- 继续使用官方 Quinn 0.11.12；两端显式采用内置 BBR，初始拥塞窗口 12,000 字节。
+  VPS 同连接连续下载的 CUBIC 基线为 3.458～9.996 秒/1 MiB，并有两次 10 秒超时；
+  单纯将 CUBIC 初始窗口提高到 240,000 字节仍会逐次变慢，不能替代拥塞控制修复。
+- 开流前克隆会话并释放 RwLock，避免网络等待持有读锁、错误路径申请写锁而死锁。
+  单个流失败不再移除存活会话，旧连接失败也不能清掉新连接。
+- 将等待 QUIC stream credit 纳入连接总期限，避免并发请求无限等待。
+- 心跳保留完整读写 future，5 秒软超时后继续等待同一次 PING/PONG；15 秒硬期限后
+  才关闭会话。避免取消半帧读取、重发请求、迟到 PONG 导致控制流错位。
+  恢复连接与认证也设置 10 秒期限。
+
+针对锁、stream credit 和旧会话替换的四项回归先在旧代码失败，再在修复后通过。
+新增测试还覆盖延迟/分段 PONG、阻塞 PING 写入和心跳最终期限。
+
+验证命令：
+
+```sh
+cargo test --offline -p helios-transport -p helios-daemon -p helios-server
+cargo test --offline -p helios-transport --test quic_loss -- --ignored --nocapture
+cargo clippy --offline -p helios-daemon -p helios-server -p helios-transport --all-targets -- -D warnings
+cargo build --offline --release -p helios-daemon -p helios-server -p heliosctl
+SMOKE_TRANSPORT=quic SOAK_REQUESTS=120 SOAK_PARALLEL=24 IDLE_SECONDS=65 bash scripts/local-transport-smoke.sh
+```
+
+结果：常规测试 65 项通过；一个隔离 D-Bus 测试未运行，弱网测试另行显式执行。
+弱网测试用用户态 UDP 中继加入 160ms RTT、每 100 个下行数据报丢弃一个，读取并
+校验完整 1 MiB：CUBIC 4.959 秒，正式 BBR 配置 2.046 秒。该计时测试默认 ignored，
+需单独执行以免并行测试负载影响结果。Clippy 无警告，原生 release 与 musl 服务端
+构建成功。局域网 32 MiB 下载 0.349 秒，120 次下载/24 路并发全部完成，空闲 65 秒
+后继续下载成功，无 QUIC Flow 回退。
+
+修复版 musl 服务端已实际部署，配置校验、OpenRC 状态和文件 SHA-256 均检查通过；
+原二进制备份为 `/usr/local/bin/helios-server.before-bbr-1793698426480`。
+新二进制 SHA-256：`2a888ed1977d78604c5b4098a8cd56ba7f69a6c4da7a4ab2415a0fb1ba15470d`。
+客户端只重启独立 QUIC 测试实例（HTTP 8081），未修改桌面主实例配置。
+
+正式部署后，同一 QUIC 连接从 VPS 临时 loopback 源连续下载 9 次 1 MiB，含建流的
+耗时依次为 2.334、0.587、0.312、0.524、0.310、0.407、0.271、0.333、0.329 秒。
+没有超时、接收 socket 丢包或连接关闭，测试直接使用 QUIC、不允许 TLS 掩盖失败。
+这是当前线路的实测改善，不代表所有网络必然满速；BBR 也无法解决 UDP 阻断/限速。
+
+使用原来已登录的有头 Chrome 首页，通过临时代理扩展指向新版客户端 8081，连续
+滚动 55 次（450px/次），有效观察约 362 秒。每屏采样至少 6 秒，未播放时延长到
+10 秒；同时统计真实 video 与 playButton 占位卡片，不调用 play()，不修改播放器
+设置、带宽缓存或自动播放门槛。控制面多次采样均为 QUIC，活跃流也全部为 QUIC。
+
+- 21 张进入有效视野的视频卡片中，20 张在对应停留窗口内有解码帧推进；另 1 张
+  暂停在约 0.158 秒、readyState=4，继续滚动后自行播放，后续采样帧数达到 328。
+  所以最终 21 张均观察到播放，但不能记作“21/21 首次进入视野立即播放”。
+- 没有只剩 playButton 的卡片，也未出现先前的后续连锁停播；457 次视频资源响应，
+  均为 200，无非 ERR_ABORTED 网络错误，无失焦样本。HTTP 成功仅作辅助证据，
+  播放判据是 paused 状态与实际解码帧推进。
+- 期间发生一次 QUIC 5 秒软超时，后续心跳恢复；未记录 quic_health_failed、
+  quic_flow_failed 或重建事件，末次 RTT 约 174ms。后台 TLS 探测也有一次超时，
+  说明本次链路仍有短时波动，不能把 BBR 当作消除全部网络波动的保证。
+- 结束后恢复原 Clash 浏览器代理并卸载临时扩展，保留所有窗口和登录状态。
+
+现场数据：`/tmp/helios-bbr-browser-8081.json`、
+`/tmp/helios-bbr-browser-8081-{2,54}.png`、`/tmp/helios-bbr-daemon.log`。
+最终 VPS 服务仍为 started，二进制哈希与部署值一致。本轮未重新运行 macOS 真机、
+未进行数小时/数日稳定性验收，也未推送 Git 或触发新的客户端安装包构建。

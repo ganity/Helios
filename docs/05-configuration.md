@@ -75,7 +75,11 @@ type = "final"
 action = "proxy"
 ```
 
-`listen`（SOCKS5）、`http_listen`（HTTP proxy）和 `control_listen`（只读状态）必须是三个不同的 loopback 地址。HTTP 入口支持 CONNECT 和 HTTP/1.0/1.1 absolute-form forward proxy。control Adapter 只提供聚合状态与规则热更新，不允许系统网络或凭据变更，并使用 `[node].token_file` 中的 32 字节 token 验证本地请求。`udp_idle_seconds` 限制在 30–300 秒，默认 60 秒；有效 UDP 活动会续期关联。`preferred_transport` 取 `quic` 时，认证后立即执行一次应用层 PING/PONG，此后按 `health_probe_seconds` 周期测量 RTT；连续 3 次探测超时才标记 QUIC 降级，协议错误或 Flow 建立传输错误立即让新 Flow 改走 TLS。降级后 daemon 按同一间隔重新建立和认证 QUIC，恢复成功后只让新 Flow 使用 QUIC，已有 TLS Flow 不迁移。服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。`server` 当前必须是 IP socket address；`server_name` 用于证书校验。
+`listen`（SOCKS5）、`http_listen`（HTTP proxy）和 `control_listen`（只读状态）必须是三个不同的 loopback 地址。HTTP 入口支持 CONNECT 和 HTTP/1.0/1.1 absolute-form forward proxy。control Adapter 只提供聚合状态与规则热更新，不允许系统网络或凭据变更，并使用 `[node].token_file` 中的 32 字节 token 验证本地请求。`udp_idle_seconds` 限制在 30–300 秒，默认 60 秒；有效 UDP 活动会续期关联。
+
+`preferred_transport` 取 `quic` 时，认证后立即执行一次应用层 PING/PONG，此后按 `health_probe_seconds` 周期测量 RTT。一次探测每 5 秒记录超时，继续等待同一个读写事务，不重发或丢弃半帧；累计 15 秒无响应或协议错误才关闭该 QUIC 会话，让新 Flow 改走 TLS。降级后 daemon 按同一间隔重新建立和认证 QUIC，每次恢复尝试最多 10 秒；恢复成功只影响新 Flow，已有 TLS Flow 不迁移。
+
+QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_milliseconds + 1000` 毫秒总期限约束。单个 Flow 建立传输错误或超时可让该 Flow 尝试 TLS，不清除仍存活的 QUIC 会话；服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。客户端与服务端 QUIC 均使用 Quinn 内置 BBR，初始拥塞窗口为 12,000 字节；这不是 Linux TCP 的拥塞控制设置，也不能解除运营商的 UDP 限速。`server` 当前必须是 IP socket address；`server_name` 用于证书校验。
 
 `[dns]` 为可选配置。启用后 daemon 在指定 loopback UDP 地址运行 Fake-IP responder；容量限制为 1–65536，TTL 限制为 30–3600 秒。该配置不修改系统 DNS。
 
