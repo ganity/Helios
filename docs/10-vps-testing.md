@@ -426,3 +426,30 @@ SMOKE_TRANSPORT=quic SOAK_REQUESTS=120 SOAK_PARALLEL=24 IDLE_SECONDS=65 bash scr
 `/tmp/helios-bbr-browser-8081-{2,54}.png`、`/tmp/helios-bbr-daemon.log`。
 最终 VPS 服务仍为 started，二进制哈希与部署值一致。本轮未重新运行 macOS 真机、
 未进行数小时/数日稳定性验收，也未推送 Git 或触发新的客户端安装包构建。
+
+#### macOS TLS 节点测试 EINVAL 修复
+
+用户在 macOS 测试节点时，QUIC 正常，TLS 返回 `Invalid argument (os error 22)`。
+在 GitHub macOS 原生运行器执行：
+
+```sh
+cargo test -p helios-transport tls::tests:: -- --nocapture
+```
+
+[修复前回归运行](https://github.com/ganity/Helios/actions/runs/41616018197)
+的 TCP 连接测试实际返回 `Os { code: 22, kind: InvalidInput, message: "Invalid argument" }`，
+其余 6 项 TLS 测试通过。测试由原来的 join 改为有 5 秒期限的 try_join，使连接准备
+失败能立即报错，不会一直等待从未到达的 accept。
+
+根因是 `connect_node_tcp` 在所有 Unix 平台连接前设置 `TCP_MAXSEG=1000`。
+[Apple 内核](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/tcp_usrreq.c)
+只允许将 MSS 设置为不大于当前值；未连接 IPv4 socket 使用默认 MSS，
+[默认值为 512](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/tcp.h)，
+因此强设 1000 会在 connect/TLS 握手之前失败。这与证书路径或 token 无关。
+
+修复在 Apple 平台连接成功后读取协商 MSS，再设置 `min(当前 MSS, 1000)`；
+其他 Unix 保留原有连接前设置，Windows 保留 OS PMTU 处理。连接后的 Apple 设置
+约束本机发送分段，不应等同于 Linux 在 SYN 前配置的对端 MSS 协商行为。
+共享拨号入口同时覆盖桌面节点测试、daemon TLS 代理与 QUIC 回退；不改节点配置
+或服务端。真实 TLS 分帧测试也改走该入口，macOS CI 新增运行 TCP/TLS 原生测试，
+避免仅凭跨平台编译成功判定运行时可用。

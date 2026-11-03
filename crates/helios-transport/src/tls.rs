@@ -20,10 +20,16 @@ pub async fn connect_node_tcp(
         tokio::net::TcpSocket::new_v6()?
     };
     // shortcut: TCP_MAXSEG is unavailable here on Windows; that path still relies on OS PMTU discovery.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     socket2::SockRef::from(&socket).set_tcp_mss(1000)?;
     socket.set_nodelay(true)?;
     let stream = socket.connect(address).await?;
+    #[cfg(target_vendor = "apple")]
+    {
+        // Darwin only permits reducing MSS; wait until connect has negotiated it.
+        let socket = socket2::SockRef::from(&stream);
+        socket.set_tcp_mss(socket.tcp_mss()?.min(1000))?;
+    }
     configure_tcp(&stream)?;
     Ok(stream)
 }
@@ -208,7 +214,7 @@ mod tests {
                 .unwrap();
         });
 
-        let tcp = TcpStream::connect(address).await.unwrap();
+        let tcp = connect_node_tcp(address).await.unwrap();
         let mut io = client_tls
             .connect(ServerName::try_from("localhost").unwrap(), tcp)
             .await
