@@ -11,5 +11,6 @@ token_file = "token.hex"
 
 [limits]
 handshake_timeout_seconds = 10
-max_sessions = 8
+# TLS uses one session per browser connection; eight rejects ordinary parallel page loads.
+max_sessions = 32
 max_flows_per_session = 64

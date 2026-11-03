@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
 use rustls::{
@@ -61,9 +61,15 @@ impl ClientCrypto {
         quic_tls_config.alpn_protocols = vec![HELIOS_ALPN.to_vec()];
         let quic_crypto = QuicClientConfig::try_from(quic_tls_config)?;
 
+        let mut quic = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        // Health probes may be slower than QUIC's default idle timeout.
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        quic.transport_config(Arc::new(transport));
+
         Ok(Self {
             tls: TlsClient::new(tls_config),
-            quic: quinn::ClientConfig::new(Arc::new(quic_crypto)),
+            quic,
         })
     }
 }

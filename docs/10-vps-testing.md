@@ -1,5 +1,14 @@
 # VPS 真机测试与使用
 
+## 2026-11-03：吞吐与会话稳定性
+
+- 同一 10 MiB 下载：公网 QUIC 一次 48.5 秒、一次 60 秒超时；强制 TLS 两次约 4.3 秒。50 MiB 下载：Helios TLS 8.25 秒，本机 7890 代理 13.67 秒。公网测量随时间和路径变化，不是带宽上限保证。
+- 本机服务端回环测试：QUIC 32 MiB 约 0.19–0.25 秒；100 个并发请求通过。将应用健康探测延至 60 秒后，旧客户端在空闲约 35 秒后无法继续建流；客户端 QUIC 每 10 秒保活修复后，同一测试通过。
+- Alpine 模板原设 `max_sessions = 8`。本机复现旧版行为：并发超过上限即丢弃新 TCP 连接，表现为 TLS 握手 EOF/HTTP 502；服务端现在在 accept 循环中等待会话许可，避免无限创建等待任务并让内核 backlog 提供有界排队。保留上限 8、24 路并发下 TLS 与 QUIC 分别完成 100 个请求，闲置恢复测试也通过。模板上限仍提升到 32，减少排队延迟；高于配置上限的突发连接仍可能在内核 backlog 满时被拒绝。
+- 本机节点配置 `~/.helios/desktop.json` 与 `daemon.toml` 已改为 TLS 优先。VPS 的实际 `max_sessions` 尚未确认或修改：现有 SSH 公钥未获授权。需在 VPS 检查实际服务端配置，若仍为 8，则改为至少 32 并重启服务，再重测网页并发。
+- 可重复本机测试：先构建 Release 的 `helios-server`、`helios-daemon`、`heliosctl`，再运行 `bash scripts/local-transport-smoke.sh`；低会话上限回归可用 `SMOKE_TRANSPORT=tls SMOKE_MAX_SESSIONS=8 SOAK_PARALLEL=24 SOAK_REQUESTS=100 bash scripts/local-transport-smoke.sh`。脚本只绑定本机端口，使用临时证书与凭据，不修改系统代理。
+- 无头 Chrome 在 Helios 和本机 7890 代理下都超时，不能据此判定 Helios 浏览器兼容性；macOS 真机浏览器与连续 72 小时运行仍需验收。
+
 ## 2026-11-02：TLS 半关闭故障修复
 
 原故障不是“探测成功即可使用”：客户端输入结束后，真实隧道会报

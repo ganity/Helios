@@ -218,9 +218,12 @@ async fn run_tls(
                 return Ok(());
             }
         };
-        let Ok(permit) = sessions.clone().try_acquire_owned() else {
-            drop(stream);
-            continue;
+        let permit = tokio::select! {
+            permit = sessions.clone().acquire_owned() => permit?,
+            changed = shutdown.changed() => {
+                changed?;
+                return Ok(());
+            }
         };
         let tls = tls.clone();
         let credential = credential.clone();
@@ -291,9 +294,13 @@ async fn run_quic(
                 return Ok(());
             }
         };
-        let Ok(permit) = sessions.clone().try_acquire_owned() else {
-            incoming.refuse();
-            continue;
+        let permit = tokio::select! {
+            permit = sessions.clone().acquire_owned() => permit?,
+            changed = shutdown.changed() => {
+                changed?;
+                incoming.refuse();
+                return Ok(());
+            }
         };
         let credential = credential.clone();
         tokio::spawn(async move {
