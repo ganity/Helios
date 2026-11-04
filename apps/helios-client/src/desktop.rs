@@ -52,6 +52,10 @@ const ACCENT: Color32 = Color32::from_rgb(224, 255, 86);
 const GOOD: Color32 = Color32::from_rgb(79, 214, 151);
 const WARN: Color32 = Color32::from_rgb(255, 177, 66);
 const BAD: Color32 = Color32::from_rgb(255, 94, 94);
+const TRAY_ICON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/helios-tray.png"
+));
 #[cfg(not(target_os = "macos"))]
 const APP_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -138,7 +142,7 @@ enum Event {
     DnsPruned(Result<(), String>),
     #[cfg(target_os = "linux")]
     TrayReady(Result<linux_tray::LinuxTray, String>),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     TrayAction(TrayAction),
 }
 
@@ -197,6 +201,7 @@ struct HeliosApp {
     events: Receiver<Event>,
     event_tx: Sender<Event>,
     last_poll: Instant,
+    status_request_revision: Option<u64>,
     log_entries: Vec<LogEntry>,
     log_error: Option<String>,
     last_log_refresh: Instant,
@@ -217,6 +222,18 @@ impl HeliosApp {
         app.tun_enabled = tun_is_running();
         #[cfg(any(windows, target_os = "macos"))]
         {
+            let events = app.event_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                let action = match event.id().0.as_str() {
+                    TRAY_SHOW => TrayAction::Show,
+                    TRAY_TOGGLE_DAEMON => TrayAction::ToggleDaemon,
+                    TRAY_QUIT => TrayAction::Quit,
+                    _ => return,
+                };
+                let _ = events.send(Event::TrayAction(action));
+                ctx.request_repaint();
+            }));
             app._tray = create_tray().ok();
         }
         #[cfg(target_os = "linux")]
@@ -268,6 +285,7 @@ impl HeliosApp {
             events,
             event_tx,
             last_poll: Instant::now() - Duration::from_secs(5),
+            status_request_revision: None,
             log_entries: Vec::new(),
             log_error: None,
             last_log_refresh: Instant::now() - Duration::from_secs(5),
@@ -280,10 +298,13 @@ impl HeliosApp {
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
-        #[cfg(not(target_os = "linux"))]
-        let _ = ctx;
         self.tun_enabled = tun_is_running();
         while let Ok(event) = self.events.try_recv() {
+            if let Event::Status(revision, _) = &event
+                && self.status_request_revision == Some(*revision)
+            {
+                self.status_request_revision = None;
+            }
             match event {
                 Event::ConfigApplied(revision, _, _) if revision != self.daemon_revision => {}
                 Event::ConfigApplied(_, profile, result) => {
@@ -315,7 +336,7 @@ impl HeliosApp {
                     Ok(tray) => self.linux_tray = Some(tray),
                     Err(error) => self.notice = Some((format!("系统托盘不可用：{error}"), false)),
                 },
-                #[cfg(target_os = "linux")]
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 Event::TrayAction(action) => self.handle_tray_action(action, ctx),
                 Event::Status(revision, _) | Event::DaemonOffline(revision)
                     if revision != self.daemon_revision => {}
@@ -461,7 +482,9 @@ impl HeliosApp {
     }
 
     fn request_status(&mut self) {
-        if self.last_poll.elapsed() < Duration::from_secs(2) {
+        if self.last_poll.elapsed() < Duration::from_secs(1)
+            || self.status_request_revision == Some(self.daemon_revision)
+        {
             return;
         }
         self.last_poll = Instant::now();
@@ -496,6 +519,7 @@ impl HeliosApp {
         let control_socket = default_control_socket();
         let tx = self.event_tx.clone();
         let revision = self.daemon_revision;
+        self.status_request_revision = Some(revision);
         thread::spawn(move || {
             let client = DaemonClient::new(address, control_socket, token_file);
             let result = run_async(async move {
@@ -1074,11 +1098,15 @@ impl HeliosApp {
 }
 
 impl eframe::App for HeliosApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    // Hidden windows skip ui; status sampling and tray actions must keep ticking here.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         i18n::set_language(self.profile.language);
-        self.poll_events(ui.ctx());
+        self.poll_events(ctx);
         self.request_status();
-        self.handle_tray(ui.ctx());
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.page == Page::Logs && self.last_log_refresh.elapsed() >= Duration::from_secs(2) {
             self.refresh_logs();
         }
@@ -1104,32 +1132,25 @@ impl eframe::App for HeliosApp {
                 self.notice = Some((t("Helios 已最小化到托盘").into(), true));
             }
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
-
         self.content(ui);
     }
 }
 
 impl HeliosApp {
-    fn handle_tray(&mut self, ctx: &egui::Context) {
-        #[cfg(any(windows, target_os = "macos"))]
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let action = match event.id().0.as_str() {
-                TRAY_SHOW => TrayAction::Show,
-                TRAY_TOGGLE_DAEMON => TrayAction::ToggleDaemon,
-                TRAY_QUIT => TrayAction::Quit,
-                _ => continue,
-            };
-            self.handle_tray_action(action, ctx);
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let _ = ctx;
-    }
-
     #[cfg(target_os = "macos")]
     fn update_tray_traffic(&self) {
         if let Some(tray) = &self._tray {
-            tray_display::update(tray, self.upload_rate, self.download_rate);
+            let proxy = self.system_proxy_enabled && self.system_proxy_verified;
+            let connected = (proxy || self.tun_enabled)
+                && self.connecting_since.is_none()
+                && self.status.as_ref().is_some_and(node_ready);
+            tray_display::update(tray, connected, self.upload_rate, self.download_rate);
+            let (label, _) = connection_label(
+                self.status.as_ref(),
+                proxy || self.tun_enabled,
+                self.connecting_since.is_some(),
+            );
+            let _ = tray.set_tooltip(Some(format!("{} · {label}", t("Helios · 曜光"))));
         }
     }
 
@@ -1138,7 +1159,16 @@ impl HeliosApp {
         match action {
             TrayAction::Show => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(target_os = "macos")]
+                if let Some(mtm) = objc2::MainThreadMarker::new() {
+                    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+                    app.unhide(None);
+                    #[allow(deprecated)]
+                    app.activateIgnoringOtherApps(true);
+                }
+                ctx.request_repaint();
             }
             TrayAction::ToggleDaemon => self.toggle_connection(),
             TrayAction::Quit => {
@@ -2104,16 +2134,13 @@ fn create_tray() -> Result<TrayIcon, AnyError> {
     let builder = builder.with_icon_as_template(true);
     let tray = builder.build()?;
     #[cfg(target_os = "macos")]
-    tray_display::update(&tray, 0.0, 0.0);
+    tray_display::update(&tray, false, 0.0, 0.0);
     Ok(tray)
 }
 
 fn tray_icon_rgba() -> (Vec<u8>, u32, u32) {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/helios-tray.png"
-    )))
-    .expect("embedded tray icon must be a valid PNG");
+    let icon = eframe::icon_data::from_png_bytes(TRAY_ICON)
+        .expect("embedded tray icon must be a valid PNG");
     (icon.rgba, icon.width, icon.height)
 }
 
@@ -2769,6 +2796,80 @@ mod tests {
         profile.nodes[0].ca_certificate = directory.join("ca.pem");
         profile.nodes[0].token_file = directory.join("token.hex");
         HeliosApp::from_profile(directory.join("desktop.json"), profile)
+    }
+
+    #[test]
+    fn hidden_window_keeps_sampling_and_handles_show_without_painting_ui() {
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut app = preview_app();
+        app.last_poll = Instant::now();
+        let status: StatusSnapshot = serde_json::from_value(serde_json::json!({
+            "state": "connected", "transport": "quic",
+            "quic_rtt_micros": 100, "tls_rtt_micros": null,
+            "active_flows": 1, "uploaded_bytes": 1124, "downloaded_bytes": 2248,
+            "udp_dropped_packets": 0
+        }))
+        .unwrap();
+        app.last_traffic = Some((Instant::now() - Duration::from_secs(1), 100, 200));
+        app.event_tx
+            .send(Event::Status(0, Ok(status.clone())))
+            .unwrap();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(true);
+        let _ = ctx.run_logic(&input, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        assert_eq!(app.status.as_ref().map(|s| s.uploaded_bytes), Some(1124));
+        assert!(app.upload_rate > 0.0 && app.download_rate > 0.0);
+
+        // An idle sample must clear the previous rate, even without a visible window.
+        app.event_tx.send(Event::Status(0, Ok(status))).unwrap();
+        app.event_tx
+            .send(Event::TrayAction(TrayAction::Show))
+            .unwrap();
+        let output = ctx.run_logic(&input, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        assert_eq!((app.upload_rate, app.download_rate), (0.0, 0.0));
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Visible(true)))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Minimized(false)))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Focus))
+        );
+        assert!(!app.profile_path.exists());
+    }
+
+    #[test]
+    fn status_sampling_never_overlaps_or_clears_a_new_request_with_an_old_reply() {
+        let mut app = preview_app();
+        let ctx = egui::Context::default();
+        app.daemon_revision = 1;
+        app.status_request_revision = Some(1);
+        let last_poll = app.last_poll;
+        app.request_status();
+        assert_eq!(app.last_poll, last_poll);
+        app.event_tx
+            .send(Event::Status(0, Err("old reply".into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert_eq!(app.status_request_revision, Some(1));
+        app.event_tx
+            .send(Event::Status(1, Err("current reply".into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert_eq!(app.status_request_revision, None);
     }
 
     #[test]

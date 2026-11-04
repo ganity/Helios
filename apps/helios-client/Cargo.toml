@@ -30,8 +30,9 @@ tray-icon = "0.21.3"
 ksni = { version = "0.3.7", features = ["blocking"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAttributedString", "NSColor", "NSFont", "NSFontDescriptor", "NSParagraphStyle"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["block2", "NSAccessibilityProtocols", "NSApplication", "NSAttributedString", "NSBezierPath", "NSColor", "NSFont", "NSFontDescriptor", "NSGraphics", "NSImage", "NSStringDrawing"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSAttributedString", "NSDictionary"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
