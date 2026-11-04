@@ -21,11 +21,12 @@ cleanup() { rm -rf "$stage"; }
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
 chmod 0755 "$stage"
-install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications"
+install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/512x512/apps"
 for name in helios-client helios-daemon helios-helper heliosctl; do
     install -m 0755 "$build_dir/$name" "$stage/usr/bin/$name"
 done
 install -m 0644 "$script_dir/helios-client.desktop" "$stage/usr/share/applications/helios-client.desktop"
+install -m 0644 "$script_dir/../assets/helios-icon-512.png" "$stage/usr/share/icons/hicolor/512x512/apps/helios.png"
 {
     echo 'Package: helios'
     echo 'Version: 0.1.0'

@@ -5,6 +5,7 @@ AppId={{E8FBA0E7-CE38-47C4-9D91-3D810A99FC4A}
 AppName=Helios
 AppVersion={#AppVersion}
 AppPublisher=Helios
+SetupIconFile=..\assets\helios.ico
 DefaultDirName={autopf}\Helios
 DefaultGroupName=Helios
 OutputBaseFilename=Helios-Setup-x64
@@ -20,10 +21,11 @@ Source: "..\target\release\helios-client.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "..\target\release\helios-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\helios-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\heliosctl.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\helios.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Helios"; Filename: "{app}\helios-client.exe"
-Name: "{autodesktop}\Helios"; Filename: "{app}\helios-client.exe"; Tasks: desktopicon
+Name: "{group}\Helios"; Filename: "{app}\helios-client.exe"; IconFilename: "{app}\helios.ico"
+Name: "{autodesktop}\Helios"; Filename: "{app}\helios-client.exe"; IconFilename: "{app}\helios.ico"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked

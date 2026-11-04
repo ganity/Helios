@@ -639,6 +639,7 @@ async fn main() -> Result<(), AnyError> {
             ),
             run_dns_listener(dns_socket, fake_ips, shutdown.subscribe()),
             runtime.clone().monitor(shutdown.subscribe()),
+            runtime::restore_proxy_after_wake(metrics.clone(), shutdown.subscribe()),
         )
     };
     let result = tokio::select! {

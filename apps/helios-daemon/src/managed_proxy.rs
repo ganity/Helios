@@ -93,7 +93,7 @@ impl<A: SystemProxyAdapter> ManagedProxy<A> {
     pub fn set(&mut self, enabled: bool) -> Result<bool, Error> {
         if enabled {
             if self.enabled {
-                if !self.lease.is_applied()? {
+                if !self.lease.reapply_if_restored()? {
                     return Err(
                         "system proxy changed outside Helios; user settings were preserved".into(),
                     );
@@ -299,11 +299,30 @@ mod tests {
         let mut owner = ManagedProxy::new(adapter.clone(), &path, settings(8080)).unwrap();
         owner.set(true).unwrap();
         adapter.apply(&9999).unwrap();
+        assert!(owner.set(true).is_err());
+        assert_eq!(adapter.read().unwrap(), 9999);
         assert!(owner.set(false).is_err());
         assert_eq!((owner.status().0, owner.status().1), (true, false));
         drop(owner);
         assert_eq!(adapter.read().unwrap(), 9999);
         assert!(path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_proxy_reapplies_after_system_restores_original_settings() {
+        let directory =
+            std::env::temp_dir().join(format!("helios-proxy-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("lease.json");
+        let adapter = Adapter(Arc::new(Mutex::new(7000)));
+        let mut owner = ManagedProxy::new(adapter.clone(), &path, settings(8080)).unwrap();
+        owner.set(true).unwrap();
+        adapter.apply(&7000).unwrap(); // macOS can restore its pre-sleep settings.
+        assert!(owner.set(true).unwrap());
+        assert_eq!(adapter.read().unwrap(), 8080);
+        owner.set(false).unwrap();
+        assert_eq!(adapter.read().unwrap(), 7000);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

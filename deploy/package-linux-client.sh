@@ -15,7 +15,7 @@ mkdir -p "$output_dir"
 stage=$(mktemp -d "$output_dir/.helios-package.XXXXXX")
 cleanup() {
     rm -f "$stage/helios-client" "$stage/helios-daemon" "$stage/heliosctl" \
-        "$stage/install-linux-client.sh" "$stage/README.md" "$stage/SHA256SUMS"
+        "$stage/install-linux-client.sh" "$stage/README.md" "$stage/helios-icon.png" "$stage/SHA256SUMS"
     rmdir "$stage"
 }
 trap cleanup 0
@@ -25,9 +25,10 @@ for name in helios-client helios-daemon heliosctl; do
 done
 install -m 0644 "$script_dir/install-linux-client.sh" "$stage/install-linux-client.sh"
 install -m 0644 "$script_dir/linux-package-README.md" "$stage/README.md"
+install -m 0644 "$script_dir/../assets/helios-icon-512.png" "$stage/helios-icon.png"
 (
     cd "$stage"
-    sha256sum helios-client helios-daemon heliosctl install-linux-client.sh README.md > SHA256SUMS
+    sha256sum helios-client helios-daemon heliosctl install-linux-client.sh README.md helios-icon.png > SHA256SUMS
 )
 archive="$output_dir/helios-linux-$(uname -m).tar.gz"
 if [ -e "$archive" ]; then

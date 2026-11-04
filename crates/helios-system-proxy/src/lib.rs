@@ -63,6 +63,15 @@ pub trait SystemProxyAdapter {
         settings: &ProxySettings,
     ) -> Result<Self::Snapshot, SystemProxyError>;
     fn apply(&self, state: &Self::Snapshot) -> Result<(), SystemProxyError>;
+
+    fn was_reset(
+        &self,
+        current: &Self::Snapshot,
+        original: &Self::Snapshot,
+        _: &Self::Snapshot,
+    ) -> bool {
+        current == original
+    }
 }
 
 pub struct SystemProxyLease<A> {
@@ -122,7 +131,11 @@ impl<A: SystemProxyAdapter> SystemProxyLease<A> {
             self.remove_record()?;
             return Ok(ReleaseOutcome::AlreadyRestored);
         }
-        if current != record.applied {
+        if current != record.applied
+            && !self
+                .adapter
+                .was_reset(&current, &record.original, &record.applied)
+        {
             return Ok(ReleaseOutcome::Drifted { current });
         }
         self.adapter.apply(&record.original)?;
@@ -142,6 +155,31 @@ impl<A: SystemProxyAdapter> SystemProxyLease<A> {
             return Ok(false);
         };
         Ok(self.active_path().exists() && self.adapter.read()? == record.applied)
+    }
+
+    /// Reasserts only a lease that the platform recognizes as reset, never an unrelated proxy.
+    pub fn reapply_if_restored(&self) -> Result<bool, SystemProxyError> {
+        let Some(record) = read_record::<A::Snapshot>(&self.lease_path)? else {
+            return Ok(false);
+        };
+        if !self.active_path().exists() {
+            return Ok(false);
+        }
+        let current = self.adapter.read()?;
+        if current == record.applied {
+            return Ok(true);
+        }
+        if !self
+            .adapter
+            .was_reset(&current, &record.original, &record.applied)
+        {
+            return Ok(false);
+        }
+        self.adapter.apply(&record.applied)?;
+        if self.adapter.read()? != record.applied {
+            return Err(SystemProxyError::VerificationFailed);
+        }
+        Ok(true)
     }
 
     fn active_path(&self) -> PathBuf {

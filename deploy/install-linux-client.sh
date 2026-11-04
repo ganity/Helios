@@ -34,6 +34,14 @@ for name in helios-client helios-daemon heliosctl; do
     mv -f "$temporary" "$prefix/bin/$name"
 done
 
+icon=network-vpn
+if [ -f "$build_dir/helios-icon.png" ]; then
+    install -d "$prefix/share/icons/hicolor/512x512/apps"
+    install -m 0644 "$build_dir/helios-icon.png" "$prefix/share/icons/hicolor/512x512/apps/helios.png"
+    rm -f "$prefix/share/icons/hicolor/scalable/apps/helios.svg"
+    icon=helios
+fi
+
 temporary=$(mktemp "$prefix/share/applications/.helios-client.XXXXXX")
 {
     echo '[Desktop Entry]'
@@ -41,7 +49,7 @@ temporary=$(mktemp "$prefix/share/applications/.helios-client.XXXXXX")
     echo 'Name=Helios'
     echo 'Comment=Encrypted network client'
     printf 'Exec="%s/bin/helios-client"\n' "$prefix"
-    echo 'Icon=network-vpn'
+    printf 'Icon=%s\n' "$icon"
     echo 'Terminal=false'
     echo 'Categories=Network;'
     echo 'StartupNotify=true'

@@ -280,6 +280,56 @@ impl Runtime {
     }
 }
 
+pub async fn restore_proxy_after_wake(
+    metrics: Arc<DaemonMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), AnyError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::time::SystemTime;
+
+        let mut ticks = interval(Duration::from_secs(2));
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut previous = SystemTime::now();
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {
+                    let now = SystemTime::now();
+                    let resumed = now.duration_since(previous).is_ok_and(|gap| gap > Duration::from_secs(6));
+                    previous = now;
+                    if !resumed {
+                        continue;
+                    }
+                    info!(event = "system_resume_detected");
+                    for _ in 0..5 {
+                        tokio::select! {
+                            _ = sleep(Duration::from_secs(3)) => {},
+                            changed = shutdown.changed() => { changed?; return Ok(()); }
+                        }
+                        let metrics = metrics.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut proxy = metrics.proxy.lock().unwrap_or_else(|error| error.into_inner());
+                            proxy.as_mut().filter(|proxy| proxy.status().0).map(|proxy| proxy.set(true)).transpose()
+                        }).await?;
+                        match result {
+                            Ok(_) => break,
+                            Err(error) => warn!(event = "system_proxy_resume_failed", error = %error),
+                        }
+                    }
+                    previous = SystemTime::now();
+                }
+                changed = shutdown.changed() => { changed?; return Ok(()); }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = metrics;
+        shutdown.changed().await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

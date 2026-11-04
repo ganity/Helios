@@ -8,6 +8,7 @@ fi
 build_dir=$1
 output_dir=$2
 version=$3
+script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 for name in helios-client helios-daemon helios-helper heliosctl; do
     test -x "$build_dir/$name" || { echo "missing executable: $build_dir/$name" >&2; exit 2; }
 done
@@ -25,6 +26,15 @@ trap 'exit 1' HUP INT TERM
 for name in helios-client helios-daemon helios-helper heliosctl; do
     install -m 0755 "$build_dir/$name" "$app/Contents/MacOS/$name"
 done
+iconset="$stage/Helios.iconset"
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$script_dir/../assets/helios-icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    double=$((size * 2))
+    sips -z "$double" "$double" "$script_dir/../assets/helios-icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/Helios.icns"
+rm -r "$iconset"
 cat >"$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -32,6 +42,7 @@ cat >"$app/Contents/Info.plist" <<EOF
 <key>CFBundleExecutable</key><string>helios-client</string>
 <key>CFBundleIdentifier</key><string>net.helios.desktop</string>
 <key>CFBundleName</key><string>Helios</string>
+<key>CFBundleIconFile</key><string>Helios.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$version</string>

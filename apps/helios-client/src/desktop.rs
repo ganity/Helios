@@ -49,6 +49,10 @@ const ACCENT: Color32 = Color32::from_rgb(224, 255, 86);
 const GOOD: Color32 = Color32::from_rgb(79, 214, 151);
 const WARN: Color32 = Color32::from_rgb(255, 177, 66);
 const BAD: Color32 = Color32::from_rgb(255, 94, 94);
+const APP_ICON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/helios-icon-512.png"
+));
 
 pub fn run() -> Result<(), AnyError> {
     let _instance = lock_desktop_at(&default_state_dir().join("desktop.lock"))?;
@@ -57,7 +61,8 @@ pub fn run() -> Result<(), AnyError> {
         viewport: egui::ViewportBuilder::default()
             .with_title(t("Helios · 曜光"))
             .with_inner_size([660.0, 660.0])
-            .with_min_inner_size([520.0, 540.0]),
+            .with_min_inner_size([520.0, 540.0])
+            .with_icon(eframe::icon_data::from_png_bytes(APP_ICON)?),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -177,6 +182,8 @@ struct HeliosApp {
     daemon_profile: Option<DesktopProfile>,
     startup_checked: bool,
     daemon_revision: u64,
+    unexpected_restarts: u8,
+    recovering_connection: bool,
     applying_config: bool,
     events: Receiver<Event>,
     event_tx: Sender<Event>,
@@ -246,6 +253,8 @@ impl HeliosApp {
             daemon_profile: None,
             startup_checked: false,
             daemon_revision: 0,
+            unexpected_restarts: 0,
+            recovering_connection: false,
             applying_config: false,
             events,
             event_tx,
@@ -302,17 +311,7 @@ impl HeliosApp {
                 Event::Status(revision, _) | Event::DaemonOffline(revision)
                     if revision != self.daemon_revision => {}
                 Event::DaemonOffline(_) => {
-                    if self.daemon_profile.is_some() {
-                        if let Err(error) = recover_system_proxy() {
-                            self.notice = Some((error.to_string(), false));
-                            continue;
-                        }
-                        self.daemon_profile = None;
-                        self.system_proxy_enabled = false;
-                        self.system_proxy_verified = false;
-                        self.connecting_since = None;
-                        self.notice = Some((t("后台已退出，系统代理已恢复").into(), false));
-                    }
+                    self.handle_unexpected_daemon_exit();
                 }
                 Event::Status(_, Ok(status)) => {
                     if self
@@ -338,6 +337,11 @@ impl HeliosApp {
                     }
                     self.system_proxy_enabled = status.system_proxy_enabled;
                     self.system_proxy_verified = status.system_proxy_verified;
+                    if status.system_proxy_verified
+                        || (self.tun_enabled && status.desktop_managed && node_ready(&status))
+                    {
+                        self.unexpected_restarts = 0;
+                    }
                     if let Some(error) = &status.system_proxy_error {
                         self.notice = Some((error.clone(), false));
                     }
@@ -363,10 +367,11 @@ impl HeliosApp {
                     self.last_traffic = Some((now, status.uploaded_bytes, status.downloaded_bytes));
                     self.status = Some(status);
                     self.status_error = None;
+                    #[cfg(target_os = "macos")]
+                    self.update_tray_traffic();
                     if self.connecting_since.is_some()
                         && self.status.as_ref().is_some_and(node_ready)
                     {
-                        self.connecting_since = None;
                         self.set_system_proxy(true);
                     }
                 }
@@ -374,6 +379,11 @@ impl HeliosApp {
                     self.status = None;
                     self.system_proxy_verified = false;
                     self.status_error = Some(error);
+                    self.upload_rate = 0.0;
+                    self.download_rate = 0.0;
+                    self.last_traffic = None;
+                    #[cfg(target_os = "macos")]
+                    self.update_tray_traffic();
                 }
                 Event::Startup(Ok(DaemonPresence::Offline)) => {
                     self.startup_checked = true;
@@ -446,9 +456,10 @@ impl HeliosApp {
             return;
         }
         self.last_poll = Instant::now();
-        if self
-            .connecting_since
-            .is_some_and(|since| since.elapsed() > Duration::from_secs(20))
+        if !self.recovering_connection
+            && self
+                .connecting_since
+                .is_some_and(|since| since.elapsed() > Duration::from_secs(20))
         {
             self.connecting_since = None;
             self.notice = Some((
@@ -460,15 +471,7 @@ impl HeliosApp {
         if self.system_proxy_enabled && self.child.is_some() {
             match owned_daemon_running(&mut self.child) {
                 Ok(false) => {
-                    if let Err(error) = recover_system_proxy() {
-                        self.notice = Some((error.to_string(), false));
-                        return;
-                    }
-                    self.system_proxy_enabled = false;
-                    self.system_proxy_verified = false;
-                    if !self.system_proxy_enabled {
-                        self.notice = Some((t("后台已退出，系统代理已恢复").into(), false));
-                    }
+                    self.handle_unexpected_daemon_exit();
                 }
                 Ok(true) => {}
                 Err(error) => {
@@ -574,6 +577,35 @@ impl HeliosApp {
             return;
         }
         self.spawn_daemon(t("后台已启动"));
+        self.unexpected_restarts = 0;
+    }
+
+    fn handle_unexpected_daemon_exit(&mut self) {
+        if self.daemon_profile.is_none() || self.owns_running_daemon() {
+            return;
+        }
+        if let Err(error) = recover_system_proxy() {
+            self.notice = Some((error.to_string(), false));
+            return;
+        }
+        let was_system_proxy_enabled = self.system_proxy_enabled || self.recovering_connection;
+        let reconnect =
+            (was_system_proxy_enabled || self.tun_enabled) && self.unexpected_restarts < 3;
+        self.daemon_profile = None;
+        self.status = None;
+        self.system_proxy_enabled = false;
+        self.system_proxy_verified = false;
+        self.connecting_since = None;
+        self.recovering_connection = false;
+        self.notice = Some((t("后台已退出，系统代理已恢复").into(), false));
+        if reconnect {
+            self.unexpected_restarts += 1;
+            self.spawn_daemon(t("后台已启动"));
+            if self.child.is_some() && was_system_proxy_enabled {
+                self.connecting_since = Some(Instant::now());
+                self.recovering_connection = true;
+            }
+        }
     }
 
     fn toggle_connection(&mut self) {
@@ -582,6 +614,7 @@ impl HeliosApp {
             return;
         }
         if self.system_proxy_enabled || self.connecting_since.is_some() {
+            self.recovering_connection = false;
             self.connecting_since = None;
             self.stop_daemon();
             return;
@@ -723,6 +756,7 @@ impl HeliosApp {
         }
         self.daemon_revision = self.daemon_revision.wrapping_add(1);
         self.connecting_since = None;
+        self.recovering_connection = false;
         #[cfg(any(windows, target_os = "macos"))]
         if self.tun_enabled {
             self.stop_tun();
@@ -854,6 +888,7 @@ impl HeliosApp {
         match result {
             Ok(enabled) => {
                 self.connecting_since = None;
+                self.recovering_connection = false;
                 self.system_proxy_enabled = enabled;
                 self.system_proxy_verified = enabled;
                 self.notice = Some((
@@ -1082,6 +1117,17 @@ impl HeliosApp {
         let _ = ctx;
     }
 
+    #[cfg(target_os = "macos")]
+    fn update_tray_traffic(&self) {
+        if let Some(tray) = &self._tray {
+            tray.set_title(Some(format!(
+                "↑{}/s ↓{}/s",
+                format_bytes(self.upload_rate as u64),
+                format_bytes(self.download_rate as u64)
+            )));
+        }
+    }
+
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn handle_tray_action(&mut self, action: TrayAction, ctx: &egui::Context) {
         match action {
@@ -1129,6 +1175,8 @@ impl HeliosApp {
                     #[cfg(any(windows, target_os = "macos"))]
                     {
                         self._tray = create_tray().ok();
+                        #[cfg(target_os = "macos")]
+                        self.update_tray_traffic();
                     }
                     if let Err(error) = save_profile(&self.profile_path, &self.profile) {
                         self.notice = Some((error.to_string(), false));
@@ -2043,23 +2091,32 @@ fn create_tray() -> Result<TrayIcon, AnyError> {
     ))?;
     menu.append(&MenuItem::with_id(TRAY_QUIT, t("退出 Helios"), true, None))?;
     let (rgba, width, height) = tray_icon_rgba();
-    Ok(TrayIconBuilder::new()
+    let builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(t("Helios · 曜光"))
-        .with_icon(tray_icon::Icon::from_rgba(rgba, width, height)?)
-        .build()?)
+        .with_icon(tray_icon::Icon::from_rgba(rgba, width, height)?);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .with_icon_as_template(true)
+        .with_title("↑0 B/s ↓0 B/s");
+    Ok(builder.build()?)
 }
 
-#[cfg(any(test, windows, target_os = "macos", target_os = "linux"))]
 fn tray_icon_rgba() -> (Vec<u8>, u32, u32) {
     let (width, height) = (32, 32);
     let mut rgba = vec![0; width * height * 4];
     for y in 0..height {
         for x in 0..width {
             let index = (y * width + x) * 4;
-            let sun = (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) <= 90;
-            rgba[index..index + 4].copy_from_slice(if sun {
-                &[224, 255, 86, 255]
+            let (dx, dy) = (x as i32 - 16, y as i32 - 16);
+            let sun = dx * dx + dy * dy <= 100;
+            let rays = (dx.abs() <= 1 && (12..=15).contains(&dy.abs()))
+                || (dy.abs() <= 1 && (12..=15).contains(&dx.abs()));
+            let letter = ((-6..=-4).contains(&dx) || (4..=6).contains(&dx))
+                && (-6..=6).contains(&dy)
+                || (-1..=1).contains(&dy) && (-6..=6).contains(&dx);
+            rgba[index..index + 4].copy_from_slice(if (sun && !letter) || rays {
+                &[255, 205, 61, 255]
             } else {
                 &[0, 0, 0, 0]
             });
@@ -3080,11 +3137,19 @@ mod tests {
     }
 
     #[test]
+    fn app_icon_is_valid_png() {
+        let icon = eframe::icon_data::from_png_bytes(APP_ICON).unwrap();
+        assert_eq!((icon.width, icon.height), (512, 512));
+    }
+
+    #[test]
     fn tray_icon_is_valid_rgba() {
         let (rgba, width, height) = tray_icon_rgba();
         assert_eq!(rgba.len(), width as usize * height as usize * 4);
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
         let center = ((height as usize / 2 * width as usize) + width as usize / 2) * 4;
-        assert_eq!(&rgba[center..center + 4], &[224, 255, 86, 255]);
+        assert_eq!(&rgba[center..center + 4], &[0, 0, 0, 0]);
+        let ray = (width as usize + width as usize / 2) * 4;
+        assert_eq!(&rgba[ray..ray + 4], &[255, 205, 61, 255]);
     }
 }

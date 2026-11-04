@@ -90,6 +90,23 @@ impl SystemProxyAdapter for MacosProxyAdapter {
         }
         Ok(())
     }
+
+    fn was_reset(
+        &self,
+        current: &Self::Snapshot,
+        original: &Self::Snapshot,
+        applied: &Self::Snapshot,
+    ) -> bool {
+        if current == original {
+            return true;
+        }
+        let mut with_proxy_enabled = current.clone();
+        for service in &mut with_proxy_enabled.services {
+            service.web.enabled = true;
+            service.secure_web.enabled = true;
+        }
+        with_proxy_enabled == *applied
+    }
 }
 
 fn apply_proxy(service: &str, secure: bool, state: &ProxyState) -> Result<(), SystemProxyError> {
@@ -198,5 +215,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn resume_accepts_disabled_proxy_flags_but_not_another_proxy() {
+        let adapter = MacosProxyAdapter;
+        let original = MacosProxySnapshot {
+            services: vec![ServiceProxyState {
+                name: "Wi-Fi".into(),
+                web: ProxyState {
+                    enabled: false,
+                    server: String::new(),
+                    port: 0,
+                },
+                secure_web: ProxyState {
+                    enabled: false,
+                    server: String::new(),
+                    port: 0,
+                },
+                bypass: vec!["localhost".into()],
+            }],
+        };
+        let applied = adapter
+            .desired(
+                &original,
+                &ProxySettings {
+                    endpoint: crate::ProxyEndpoint::new("127.0.0.1", 8080).unwrap(),
+                    bypass: vec!["localhost".into()],
+                },
+            )
+            .unwrap();
+        let mut reset = applied.clone();
+        reset.services[0].web.enabled = false;
+        reset.services[0].secure_web.enabled = false;
+        assert!(adapter.was_reset(&reset, &original, &applied));
+        reset.services[0].web.server = "another-proxy".into();
+        assert!(!adapter.was_reset(&reset, &original, &applied));
     }
 }
