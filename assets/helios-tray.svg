@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <mask id="orbit-gap">
+      <rect width="64" height="64" fill="white"/>
+      <ellipse cx="32" cy="35" rx="29" ry="9" transform="rotate(-34 32 35)" fill="none" stroke="black" stroke-width="7"/>
+    </mask>
+  </defs>
+  <g fill="#FFCD3D" mask="url(#orbit-gap)">
+    <circle cx="29" cy="29" r="14"/>
+    <path d="M26 11 29 2 32 11ZM15 15 10 5 22 12ZM8 25 1 19 12 19ZM8 35 0 36 10 29ZM39 13 48 7 44 20ZM47 26 58 22 49 32Z"/>
+  </g>
+  <ellipse cx="32" cy="35" rx="29" ry="9" transform="rotate(-34 32 35)" fill="none" stroke="#FFCD3D" stroke-width="3.5"/>
+</svg>

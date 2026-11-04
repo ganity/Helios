@@ -34,6 +34,9 @@ type AnyError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(target_os = "linux")]
 #[path = "linux_tray.rs"]
 mod linux_tray;
+#[cfg(any(test, target_os = "macos"))]
+#[path = "tray_display.rs"]
+mod tray_display;
 use crate::i18n::{self, t};
 use helios_client_model::{
     DesktopProfile, Language, NodeProfile, RoutingMode, action_name, default_control_socket,
@@ -49,9 +52,15 @@ const ACCENT: Color32 = Color32::from_rgb(224, 255, 86);
 const GOOD: Color32 = Color32::from_rgb(79, 214, 151);
 const WARN: Color32 = Color32::from_rgb(255, 177, 66);
 const BAD: Color32 = Color32::from_rgb(255, 94, 94);
+#[cfg(not(target_os = "macos"))]
 const APP_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/helios-icon-512.png"
+));
+#[cfg(target_os = "macos")]
+const APP_ICON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/helios-icon-macos.png"
 ));
 
 pub fn run() -> Result<(), AnyError> {
@@ -1120,11 +1129,7 @@ impl HeliosApp {
     #[cfg(target_os = "macos")]
     fn update_tray_traffic(&self) {
         if let Some(tray) = &self._tray {
-            tray.set_title(Some(format!(
-                "↑{}/s ↓{}/s",
-                format_bytes(self.upload_rate as u64),
-                format_bytes(self.download_rate as u64)
-            )));
+            tray_display::update(tray, self.upload_rate, self.download_rate);
         }
     }
 
@@ -2096,33 +2101,20 @@ fn create_tray() -> Result<TrayIcon, AnyError> {
         .with_tooltip(t("Helios · 曜光"))
         .with_icon(tray_icon::Icon::from_rgba(rgba, width, height)?);
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .with_icon_as_template(true)
-        .with_title("↑0 B/s ↓0 B/s");
-    Ok(builder.build()?)
+    let builder = builder.with_icon_as_template(true);
+    let tray = builder.build()?;
+    #[cfg(target_os = "macos")]
+    tray_display::update(&tray, 0.0, 0.0);
+    Ok(tray)
 }
 
 fn tray_icon_rgba() -> (Vec<u8>, u32, u32) {
-    let (width, height) = (32, 32);
-    let mut rgba = vec![0; width * height * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let index = (y * width + x) * 4;
-            let (dx, dy) = (x as i32 - 16, y as i32 - 16);
-            let sun = dx * dx + dy * dy <= 100;
-            let rays = (dx.abs() <= 1 && (12..=15).contains(&dy.abs()))
-                || (dy.abs() <= 1 && (12..=15).contains(&dx.abs()));
-            let letter = ((-6..=-4).contains(&dx) || (4..=6).contains(&dx))
-                && (-6..=6).contains(&dy)
-                || (-1..=1).contains(&dy) && (-6..=6).contains(&dx);
-            rgba[index..index + 4].copy_from_slice(if (sun && !letter) || rays {
-                &[255, 205, 61, 255]
-            } else {
-                &[0, 0, 0, 0]
-            });
-        }
-    }
-    (rgba, width as u32, height as u32)
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/helios-tray.png"
+    )))
+    .expect("embedded tray icon must be a valid PNG");
+    (icon.rgba, icon.width, icon.height)
 }
 
 #[cfg(windows)]
@@ -3139,17 +3131,36 @@ mod tests {
     #[test]
     fn app_icon_is_valid_png() {
         let icon = eframe::icon_data::from_png_bytes(APP_ICON).unwrap();
+        #[cfg(not(target_os = "macos"))]
         assert_eq!((icon.width, icon.height), (512, 512));
+        #[cfg(target_os = "macos")]
+        assert_eq!((icon.width, icon.height), (1024, 1024));
+    }
+
+    #[test]
+    fn macos_icon_preserves_transparent_dock_margins() {
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/helios-icon-macos.png"
+        )))
+        .unwrap();
+        assert_eq!((icon.width, icon.height), (1024, 1024));
+        for (index, pixel) in icon.rgba.chunks_exact(4).enumerate() {
+            let (x, y) = (index % 1024, index / 1024);
+            if !(100..924).contains(&x) || !(100..924).contains(&y) {
+                assert_eq!(pixel[3], 0, "Dock margin must be transparent");
+            }
+        }
+        assert_eq!(icon.rgba[(512 * 1024 + 512) * 4 + 3], 255);
     }
 
     #[test]
     fn tray_icon_is_valid_rgba() {
         let (rgba, width, height) = tray_icon_rgba();
+        assert_eq!((width, height), (64, 64));
         assert_eq!(rgba.len(), width as usize * height as usize * 4);
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
         let center = ((height as usize / 2 * width as usize) + width as usize / 2) * 4;
-        assert_eq!(&rgba[center..center + 4], &[0, 0, 0, 0]);
-        let ray = (width as usize + width as usize / 2) * 4;
-        assert_eq!(&rgba[ray..ray + 4], &[255, 205, 61, 255]);
+        assert_eq!(&rgba[center..center + 4], &[255, 205, 61, 255]);
     }
 }

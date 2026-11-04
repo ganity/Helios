@@ -255,9 +255,7 @@ mod tests {
         let icon = tray.icon_pixmap().remove(0);
         assert_eq!(icon.data.len(), (icon.width * icon.height * 4) as usize);
         let center = ((icon.height / 2 * icon.width + icon.width / 2) * 4) as usize;
-        assert_eq!(&icon.data[center..center + 4], &[0, 0, 0, 0]);
-        let ray = ((icon.width + icon.width / 2) * 4) as usize;
-        assert_eq!(&icon.data[ray..ray + 4], &[255, 255, 205, 61]);
+        assert_eq!(&icon.data[center..center + 4], &[255, 255, 205, 61]);
         tray.activate(0, 0);
         assert!(matches!(
             receiver.recv().unwrap(),
