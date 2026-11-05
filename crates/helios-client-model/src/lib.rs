@@ -8,7 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use helios_config::{ClientTimeouts, DaemonConfig, DnsConfig, NodeConfig, TransportPreference};
+use helios_config::{
+    ClientTimeouts, ConnectionLink, DaemonConfig, DnsConfig, NodeConfig, TransportPreference,
+};
 use helios_protocol::{Address, Target};
 use helios_routing::{Network, RouteAction, RuleConfig, RuleSet};
 use serde::{Deserialize, Serialize};
@@ -69,6 +71,8 @@ pub struct DesktopProfile {
     pub helper_config: PathBuf,
     #[serde(default = "default_tun_mtu")]
     pub tun_mtu: u16,
+    #[serde(default = "default_true")]
+    pub tun_ipv6_enabled: bool,
     pub active_node: usize,
     pub nodes: Vec<NodeProfile>,
     #[serde(default)]
@@ -139,6 +143,7 @@ impl From<LegacyDesktopProfile> for DesktopProfile {
             helper_binary: default_helper_binary(),
             helper_config: default_helper_config(),
             tun_mtu: default_tun_mtu(),
+            tun_ipv6_enabled: true,
             active_node: 0,
             auto_failover: false,
             nodes: vec![NodeProfile {
@@ -182,6 +187,7 @@ impl Default for DesktopProfile {
             helper_binary: default_helper_binary(),
             helper_config: default_helper_config(),
             tun_mtu: default_tun_mtu(),
+            tun_ipv6_enabled: true,
             active_node: 0,
             nodes: vec![NodeProfile::default()],
             auto_failover: false,
@@ -304,7 +310,7 @@ impl DesktopProfile {
             socks_listen,
             server_ip,
             mtu: self.tun_mtu,
-            ipv6_enabled: false,
+            ipv6_enabled: self.tun_ipv6_enabled,
             bypass,
             status_file: tun_status_file(),
             stop_file: tun_stop_file(),
@@ -538,6 +544,34 @@ pub fn import_node(text: &str) -> Result<NodeProfile, String> {
         return Err("credential ID must contain 1 to 64 characters".into());
     }
     Ok(node)
+}
+
+pub fn import_connection_link(text: &str, state_dir: &Path) -> Result<NodeProfile, String> {
+    let link = ConnectionLink::decode(text).map_err(|error| error.to_string())?;
+    let node_dir = state_dir.join("nodes").join(format!(
+        "imported-{}",
+        link.storage_id().map_err(|error| error.to_string())?
+    ));
+    let certificate = node_dir.join("cert.pem");
+    let token = node_dir.join("token.hex");
+    write_atomic(
+        &certificate,
+        link.certificate_pem()
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    write_atomic(&token, link.token.as_bytes()).map_err(|error| error.to_string())?;
+    let node = NodeProfile {
+        name: link.name,
+        server: link.server.to_string(),
+        server_name: link.server_name,
+        ca_certificate: certificate,
+        credential_id: link.credential_id,
+        token_file: token,
+        preferred_transport: link.preferred_transport,
+    };
+    import_node(&serde_json::to_string(&node).map_err(|error| error.to_string())?)
 }
 
 pub fn default_state_dir() -> PathBuf {
@@ -774,6 +808,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_helper_config_enables_ipv6_when_requested() {
+        let profile = DesktopProfile {
+            tun_ipv6_enabled: true,
+            ..Default::default()
+        };
+        let value: toml::Value = toml::from_str(&profile.helper_config_toml().unwrap()).unwrap();
+        assert_eq!(value["ipv6_enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
     fn legacy_profile_migrates_to_single_node() {
         let legacy = serde_json::json!({
             "name": "Old VPS",
@@ -890,5 +934,47 @@ mod tests {
         assert!(!json.contains(&"07".repeat(32)));
         assert_eq!(import_node(&json).unwrap().server, node.server);
         assert!(import_node("{}").is_err());
+    }
+
+    #[test]
+    fn connection_link_import_writes_private_material_and_returns_a_node() {
+        let root =
+            std::env::temp_dir().join(format!("helios-client-link-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["node-a1.helios.invalid".to_owned()])
+                .unwrap()
+                .cert;
+        let link = ConnectionLink::new(
+            "Imported VPS".into(),
+            "203.0.113.10:4800".parse().unwrap(),
+            "node-a1.helios.invalid".into(),
+            certificate.der(),
+            "desktop-main".into(),
+            [9; 32],
+            TransportPreference::Tls,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let node = import_connection_link(&link, &root).unwrap();
+        assert_eq!(node.name, "Imported VPS");
+        assert_eq!(node.server_name, "node-a1.helios.invalid");
+        assert!(node.ca_certificate.starts_with(root.join("nodes")));
+        assert!(node.ca_certificate.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&node.token_file).unwrap(),
+            "09".repeat(32)
+        );
+        #[cfg(unix)]
+        for file in [&node.ca_certificate, &node.token_file] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

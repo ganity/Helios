@@ -1,6 +1,6 @@
 use std::{
     io::{Error as IoError, ErrorKind},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,7 +13,6 @@ use helios_control::{
 use helios_protocol::CAP_TCP_CONNECT;
 use helios_routing::RuleConfig;
 use helios_transport::{ClientCrypto, FrameIo, QuicBiStream, authenticate_client, ping};
-use quinn::Endpoint;
 use rustls::pki_types::ServerName;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -83,8 +82,7 @@ async fn probe_node_inner(node: NodeConfig) -> Result<ProbeMeasurement, ProbeErr
             Ok(ProbeMeasurement { handshake, rtt })
         }
         TransportPreference::Quic => {
-            let mut endpoint =
-                Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+            let mut endpoint = helios_transport::client_quic_endpoint(node.server)?;
             endpoint.set_default_client_config(crypto.quic);
             let connection = tokio::time::timeout(
                 Duration::from_secs(5),

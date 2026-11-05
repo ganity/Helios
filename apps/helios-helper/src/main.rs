@@ -577,6 +577,13 @@ mod tests {
     }
 
     #[test]
+    fn enables_ipv6_routes_and_packets_when_configured() {
+        let mut config = config();
+        config.ipv6_enabled = true;
+        assert!(config.tun_args().unwrap().ipv6_enabled);
+    }
+
+    #[test]
     fn rejects_unsafe_or_invalid_configuration() {
         let mut value = config();
         value.socks_listen = "0.0.0.0:1080".parse().unwrap();

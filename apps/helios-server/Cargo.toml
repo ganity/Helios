@@ -11,7 +11,12 @@ helios-protocol = { path = "../../crates/helios-protocol" }
 helios-transport = { path = "../../crates/helios-transport" }
 getrandom.workspace = true
 quinn.workspace = true
+socket2.workspace = true
+base64 = "0.22.1"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
+rustls.workspace = true
 bytes = "1.10.1"
+time = "0.3.44"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

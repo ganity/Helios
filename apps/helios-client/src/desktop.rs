@@ -40,8 +40,9 @@ mod tray_display;
 use crate::i18n::{self, t};
 use helios_client_model::{
     DesktopProfile, Language, NodeProfile, RoutingMode, action_name, default_control_socket,
-    default_state_dir, import_node, load_profile, parse_proxy_bypass, parse_rules, render_rules,
-    save_profile, test_route_for_network, tun_status_file, tun_stop_file,
+    default_state_dir, import_connection_link as import_link, import_node, load_profile,
+    parse_proxy_bypass, parse_rules, render_rules, save_profile, test_route_for_network,
+    tun_status_file, tun_stop_file,
 };
 const BG: Color32 = Color32::from_rgb(11, 15, 18);
 const PANEL: Color32 = Color32::from_rgb(18, 24, 28);
@@ -174,6 +175,7 @@ struct HeliosApp {
     rule_test_host: String,
     rule_test_port: String,
     rule_test_network: Network,
+    connection_link_text: String,
     node_exchange_text: String,
     open_node_editor: bool,
     status: Option<StatusSnapshot>,
@@ -258,6 +260,7 @@ impl HeliosApp {
             rule_test_host: "example.com".into(),
             rule_test_port: "443".into(),
             rule_test_network: Network::Tcp,
+            connection_link_text: String::new(),
             node_exchange_text: String::new(),
             open_node_editor: false,
             status: None,
@@ -322,9 +325,6 @@ impl HeliosApp {
                             });
                         }
                         Err(error) => {
-                            if let Some(running) = &self.daemon_profile {
-                                self.profile.active_node = running.active_node;
-                            }
                             self.notice =
                                 Some((format!("配置未生效，原节点继续运行：{error}"), false));
                         }
@@ -351,7 +351,10 @@ impl HeliosApp {
                     {
                         continue;
                     }
-                    if status.desktop_managed && !self.applying_config {
+                    if status.desktop_managed
+                        && !self.applying_config
+                        && self.daemon_profile.is_none()
+                    {
                         if let Some(server) = status.active_server
                             && let Some(index) = self.profile.nodes.iter().position(|node| {
                                 node.server.parse::<std::net::SocketAddr>().ok() == Some(server)
@@ -359,11 +362,7 @@ impl HeliosApp {
                         {
                             self.profile.active_node = index;
                         }
-                        if let Some(running) = &mut self.daemon_profile {
-                            running.active_node = self.profile.active_node;
-                        } else {
-                            self.daemon_profile = Some(self.profile.clone());
-                        }
+                        self.daemon_profile = Some(self.profile.clone());
                     }
                     self.system_proxy_enabled = status.system_proxy_enabled;
                     self.system_proxy_verified = status.system_proxy_verified;
@@ -564,6 +563,33 @@ impl HeliosApp {
             .and_then(|()| save_profile(&self.profile_path, &self.profile))
         {
             Ok(()) => self.notice = Some((t("配置已保存").into(), true)),
+            Err(error) => self.notice = Some((error.to_string(), false)),
+        }
+    }
+
+    fn add_connection_link(&mut self) {
+        self.add_connection_link_at(&default_state_dir());
+    }
+
+    fn add_connection_link_at(&mut self, state_dir: &Path) {
+        let node = match import_link(&self.connection_link_text, state_dir) {
+            Ok(node) => node,
+            Err(error) => {
+                self.notice = Some((error, false));
+                return;
+            }
+        };
+        let mut profile = self.profile.clone();
+        profile.nodes.push(node);
+        profile.active_node = profile.nodes.len() - 1;
+        match save_profile(&self.profile_path, &profile) {
+            Ok(()) => {
+                self.profile = profile;
+                self.probes.push(ProbeState::Untested);
+                self.connection_link_text.clear();
+                self.open_node_editor = false;
+                self.notice = Some((t("连接链接已导入，点击“应用配置”生效").into(), true));
+            }
             Err(error) => self.notice = Some((error.to_string(), false)),
         }
     }
@@ -1407,6 +1433,25 @@ impl HeliosApp {
             t("节点"),
             "Select the active server, edit credentials, and test authenticated RTT",
         );
+        ui.label(RichText::new(t("连接链接")).color(MUTED));
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.connection_link_text)
+                    .password(true)
+                    .hint_text("helios://v1/...")
+                    .desired_width((ui.available_width() - 150.0).max(220.0)),
+            );
+            if ui
+                .add_enabled(
+                    !self.connection_link_text.trim().is_empty(),
+                    primary_button(t("解析并添加")),
+                )
+                .clicked()
+            {
+                self.add_connection_link();
+            }
+        });
+        ui.add_space(20.0);
         let previous = self.profile.auto_failover;
         ui.checkbox(
             &mut self.profile.auto_failover,
@@ -1519,9 +1564,10 @@ impl HeliosApp {
                 }
             }
             ui.separator();
-            egui::CollapsingHeader::new(t("编辑节点配置"))
+            let open_editor = std::mem::take(&mut self.open_node_editor);
+            let editor = egui::CollapsingHeader::new(t("编辑节点配置"))
                 .id_salt(("node-editor", self.profile.active_node))
-                .open(std::mem::take(&mut self.open_node_editor).then_some(true))
+                .open(open_editor.then_some(true))
                 .show(ui, |ui| {
                     ui.label(RichText::new(t("首次使用：从服务端安全复制证书 cert.pem 和凭据 token.hex 到本机，再填写两个文件的完整路径。不要复制服务端私钥 key.pem。所有输入框支持系统复制 / 粘贴快捷键。")).color(MUTED));
                     let active = self.profile.active_node;
@@ -1593,6 +1639,12 @@ impl HeliosApp {
                         });
                     });
                 });
+            if open_editor {
+                editor.header_response.scroll_to_me_animation(
+                    Some(Align::TOP),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
         });
         if let Some(index) = selected {
             self.select_node(index);
@@ -1767,6 +1819,7 @@ impl HeliosApp {
             self.system_proxy_control(ui);
             self.tun_control(ui);
             ui.add(egui::Slider::new(&mut self.profile.tun_mtu, 576..=1500).text("TUN MTU"));
+            ui.toggle_value(&mut self.profile.tun_ipv6_enabled, t("TUN 接管 IPv6"));
             ui.add_space(12.0);
             if ui.add(primary_button(t("保存设置"))).clicked() {
                 self.save();
@@ -3059,9 +3112,107 @@ mod tests {
         assert_eq!(app.profile.nodes.len(), 2);
         assert_eq!(app.profile.active_node, 1);
         let mut output = draw(&ctx, &mut app, Vec::new());
-        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == t("服务器地址"))));
+        output.textures_delta.clear();
+        output = draw(&ctx, &mut app, Vec::new());
+        output.textures_delta.clear();
+        output = draw(&ctx, &mut app, Vec::new());
+        let labels = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            labels.iter().any(|label| label == t("服务器地址")),
+            "{labels:?}"
+        );
         output.textures_delta.clear();
         assert!(!app.profile_path.exists());
+    }
+
+    #[test]
+    fn daemon_events_do_not_discard_the_node_being_edited() {
+        let mut app = preview_app();
+        app.daemon_profile = Some(app.profile.clone());
+        app.profile.nodes.push(NodeProfile {
+            name: "Draft VPS".into(),
+            ..Default::default()
+        });
+        app.probes.push(ProbeState::Untested);
+        app.profile.active_node = 1;
+        let ctx = egui::Context::default();
+        let status = StatusSnapshot {
+            dns_cache: None,
+            config_revision: 1,
+            active_server: app.profile.nodes[0].server.parse().ok(),
+            system_proxy_enabled: false,
+            system_proxy_verified: false,
+            system_proxy_error: None,
+            desktop_managed: true,
+            state: ConnectionState::Connected,
+            transport: helios_control::ActiveTransport::Tls,
+            quic_rtt_micros: None,
+            tls_rtt_micros: None,
+            active_flows: 0,
+            uploaded_bytes: 0,
+            downloaded_bytes: 0,
+            udp_dropped_packets: 0,
+            active_flow_details: Vec::new(),
+        };
+        app.event_tx.send(Event::Status(0, Ok(status))).unwrap();
+        app.poll_events(&ctx);
+        assert_eq!(app.profile.active_node, 1);
+
+        app.event_tx
+            .send(Event::ConfigApplied(
+                0,
+                app.profile.clone(),
+                Err("authentication failed".into()),
+            ))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert_eq!(app.profile.active_node, 1);
+        assert_eq!(app.profile.active_node().name, "Draft VPS");
+    }
+
+    #[test]
+    fn connection_link_adds_and_saves_a_selected_node() {
+        let root =
+            std::env::temp_dir().join(format!("helios-desktop-link-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["node-a1.helios.invalid".to_owned()])
+                .unwrap()
+                .cert;
+        let link = helios_config::ConnectionLink::new(
+            "Imported VPS".into(),
+            "203.0.113.10:4800".parse().unwrap(),
+            "node-a1.helios.invalid".into(),
+            certificate.der(),
+            "desktop-main".into(),
+            [5; 32],
+            TransportPreference::Tls,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let mut app = preview_app();
+        app.profile_path = root.join("desktop.json");
+        app.profile.daemon_config = root.join("daemon.toml");
+        app.connection_link_text = link;
+
+        app.add_connection_link_at(&root);
+
+        assert_eq!(app.profile.nodes.len(), 2);
+        assert_eq!(app.profile.active_node, 1);
+        assert_eq!(app.profile.active_node().name, "Imported VPS");
+        assert!(app.connection_link_text.is_empty());
+        assert!(app.profile_path.is_file());
+        assert!(app.profile.active_node().ca_certificate.is_file());
+        assert!(app.profile.active_node().token_file.is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

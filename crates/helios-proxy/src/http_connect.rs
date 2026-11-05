@@ -201,6 +201,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_bracketed_ipv6_connect_authority() {
+        let (mut client, server) = duplex(256);
+        client
+            .write_all(b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n")
+            .await
+            .unwrap();
+        let (_, target) = HttpConnect::accept(server).await.unwrap();
+        assert_eq!(target.address, Address::Ip("2001:db8::1".parse().unwrap()));
+        assert_eq!(target.port, 443);
+    }
+
+    #[tokio::test]
     async fn rewrites_forward_proxy_requests_and_preserves_body() {
         let (mut client, server) = duplex(256);
         client

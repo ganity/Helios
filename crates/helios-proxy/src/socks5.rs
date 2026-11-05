@@ -278,6 +278,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_an_ipv6_connect_target() {
+        let (client, server) = duplex(64);
+        let peer = tokio::spawn(async move {
+            let mut client = client;
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            let mut request = vec![5, 1, 0, 4];
+            request.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+            request.extend_from_slice(&443u16.to_be_bytes());
+            client.write_all(&request).await.unwrap();
+        });
+
+        let mut socks = Socks5::negotiate(server).await.unwrap();
+        let target = socks.read_connect().await.unwrap();
+        assert_eq!(target.address, Address::Ip("2001:db8::1".parse().unwrap()));
+        assert_eq!(target.port, 443);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_client_without_no_auth_method() {
         let (mut client, server) = duplex(16);
         let peer = tokio::spawn(async move {

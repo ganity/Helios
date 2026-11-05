@@ -229,4 +229,16 @@ mod tests {
         .unwrap();
         assert!(stream.peer_addr().unwrap().is_ipv4());
     }
+
+    #[tokio::test]
+    async fn connects_to_an_ipv6_target() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let target = helios_protocol::Target::new(
+            helios_protocol::Address::Ip("::1".parse().unwrap()),
+            listener.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        let stream = connect_target(&target).await.unwrap();
+        assert!(stream.peer_addr().unwrap().is_ipv6());
+    }
 }

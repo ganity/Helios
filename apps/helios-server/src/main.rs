@@ -1,17 +1,34 @@
 use std::{
-    env, error::Error, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc, time::Duration,
+    env,
+    error::Error,
+    fs::OpenOptions,
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
-use helios_config::{ServerConfig, load_certificates, load_private_key, load_token};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use helios_config::{
+    ConnectionLink, ServerConfig, TransportPreference, load_certificates, load_private_key,
+    load_token,
+};
 use helios_protocol::{
     Address, CAP_TCP_CONNECT, CAP_UDP_DATAGRAM, CAP_UDP_OVER_STREAM, Frame, FrameType,
     MAX_UDP_PAYLOAD, Target, UdpAssociate, UdpPacket,
 };
 use helios_transport::{
-    FrameIo, QuicBiStream, ServerCrypto, TlsServer, accept_tcp_frame, authenticate_server,
-    serve_control,
+    ClientCrypto, FrameIo, QuicBiStream, ServerCrypto, TlsServer, accept_tcp_frame,
+    authenticate_server, serve_control,
 };
 use quinn::Endpoint;
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
+};
+use rustls::{RootCertStore, pki_types::ServerName};
+use socket2::{Domain, Protocol, Socket, Type};
+use time::OffsetDateTime;
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -29,10 +46,27 @@ struct Credential {
     token: [u8; 32],
 }
 
+#[derive(Clone)]
+struct ListenerServices {
+    tls: TlsServer,
+    credential: Credential,
+    handshake_timeout_seconds: u64,
+    max_flows_per_session: usize,
+    sessions: Arc<Semaphore>,
+    shutdown: watch::Receiver<bool>,
+}
+
 enum ServerCommand {
     Run(PathBuf),
     Check(PathBuf),
     GenerateToken(PathBuf),
+    GenerateIdentity(PathBuf),
+    ClientLink {
+        config: PathBuf,
+        address: SocketAddr,
+        server_name: String,
+        name: String,
+    },
     Version,
 }
 
@@ -48,6 +82,23 @@ async fn main() -> Result<(), AnyError> {
         ServerCommand::GenerateToken(path) => {
             generate_token_file(path)?;
             println!("token generated");
+            return Ok(());
+        }
+        ServerCommand::GenerateIdentity(path) => {
+            let server_name = generate_identity(&path)?;
+            println!("{server_name}");
+            return Ok(());
+        }
+        ServerCommand::ClientLink {
+            config,
+            address,
+            server_name,
+            name,
+        } => {
+            println!(
+                "{}",
+                generate_client_link(config, address, server_name, name).await?
+            );
             return Ok(());
         }
         ServerCommand::Version => {
@@ -68,33 +119,45 @@ async fn run(config_path: PathBuf) -> Result<(), AnyError> {
         token: load_token(&config.auth.token_file)?,
     };
     let crypto = ServerCrypto::new(certificates, private_key)?;
-    let tcp_listener = TcpListener::bind(config.listen).await?;
-    let quic_endpoint = Endpoint::server(crypto.quic, config.listen)?;
+    let tcp_listener = bind_tcp_listener(config.listen, false)?;
+    let quic_endpoint = server_quic_endpoint(crypto.quic.clone(), config.listen, false)?;
+    let ipv6_listener = if let Some(address) = config.listen_ipv6 {
+        Some((
+            bind_tcp_listener(address, true)?,
+            server_quic_endpoint(crypto.quic.clone(), address, true)?,
+            address,
+        ))
+    } else {
+        None
+    };
     let sessions = Arc::new(Semaphore::new(config.limits.max_sessions));
     let shutdown_sessions = sessions.clone();
     let max_sessions = config.limits.max_sessions;
     info!(event = "server_listening", listen = %config.listen);
+    if let Some((_, _, address)) = &ipv6_listener {
+        info!(event = "server_listening", listen = %address);
+    }
 
     let (shutdown, _) = watch::channel(false);
     let listeners = async {
-        tokio::try_join!(
-            run_tls(
-                tcp_listener,
-                crypto.tls,
-                credential.clone(),
-                config.limits.handshake_timeout_seconds,
-                sessions.clone(),
-                shutdown.subscribe(),
-            ),
-            run_quic(
-                quic_endpoint,
-                credential,
-                config.limits.handshake_timeout_seconds,
-                config.limits.max_flows_per_session,
-                sessions,
-                shutdown.subscribe(),
-            ),
-        )
+        let services = ListenerServices {
+            tls: crypto.tls,
+            credential,
+            handshake_timeout_seconds: config.limits.handshake_timeout_seconds,
+            max_flows_per_session: config.limits.max_flows_per_session,
+            sessions,
+            shutdown: shutdown.subscribe(),
+        };
+        let primary = run_listener_pair(tcp_listener, quic_endpoint, services.clone());
+        if let Some((tcp_listener, quic_endpoint, _)) = ipv6_listener {
+            tokio::try_join!(
+                primary,
+                run_listener_pair(tcp_listener, quic_endpoint, services)
+            )?;
+            Ok(())
+        } else {
+            primary.await
+        }
     };
     tokio::select! {
         result = listeners => {
@@ -109,6 +172,76 @@ async fn run(config_path: PathBuf) -> Result<(), AnyError> {
             Ok::<(), AnyError>(())
         }
     }?;
+    Ok(())
+}
+
+fn bind_tcp_listener(address: SocketAddr, ipv6_only: bool) -> std::io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if ipv6_only {
+        socket.set_only_v6(true)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
+fn bind_udp_socket(address: SocketAddr, ipv6_only: bool) -> std::io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    if ipv6_only {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    Ok(socket.into())
+}
+
+fn server_quic_endpoint(
+    config: quinn::ServerConfig,
+    address: SocketAddr,
+    ipv6_only: bool,
+) -> std::io::Result<Endpoint> {
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        bind_udp_socket(address, ipv6_only)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+}
+
+async fn run_listener_pair(
+    tcp_listener: TcpListener,
+    quic_endpoint: Endpoint,
+    services: ListenerServices,
+) -> Result<(), AnyError> {
+    tokio::try_join!(
+        run_tls(
+            tcp_listener,
+            services.tls,
+            services.credential.clone(),
+            services.handshake_timeout_seconds,
+            services.sessions.clone(),
+            services.shutdown.clone(),
+        ),
+        run_quic(
+            quic_endpoint,
+            services.credential,
+            services.handshake_timeout_seconds,
+            services.max_flows_per_session,
+            services.sessions,
+            services.shutdown,
+        ),
+    )?;
     Ok(())
 }
 
@@ -139,6 +272,136 @@ fn generate_token_file(path: PathBuf) -> Result<(), AnyError> {
     file.write_all(encoded.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+fn generate_identity(output: &Path) -> Result<String, AnyError> {
+    if output.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "identity output already exists",
+        )
+        .into());
+    }
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)?;
+    let id = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let server_name = format!("node-{id}.helios.invalid");
+    let mut params = CertificateParams::new(vec![server_name.clone()])?;
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(365 * 5);
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, server_name.clone());
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate()?;
+    let certificate = params.self_signed(&key)?;
+
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".helios-identity-{id}.tmp"));
+    std::fs::create_dir(&temporary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let result = (|| -> Result<(), AnyError> {
+        write_new_file(
+            &temporary.join("cert.pem"),
+            encode_pem("CERTIFICATE", certificate.der()).as_bytes(),
+            0o644,
+        )?;
+        write_new_file(
+            &temporary.join("key.pem"),
+            encode_pem("PRIVATE KEY", &key.serialize_der()).as_bytes(),
+            0o600,
+        )?;
+        write_new_file(
+            &temporary.join("server-name.txt"),
+            server_name.as_bytes(),
+            0o644,
+        )?;
+        std::fs::rename(&temporary, output)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+    result?;
+    Ok(server_name)
+}
+
+fn encode_pem(label: &str, der: &[u8]) -> String {
+    let encoded = STANDARD.encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), AnyError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+async fn generate_client_link(
+    config_path: PathBuf,
+    address: SocketAddr,
+    server_name: String,
+    name: String,
+) -> Result<String, AnyError> {
+    let config = ServerConfig::load(config_path)?;
+    let certificates = load_certificates(&config.tls.certificate)?;
+    let trust_anchor = certificates
+        .last()
+        .cloned()
+        .ok_or("server certificate file is empty")?;
+    let private_key = load_private_key(&config.tls.private_key)?;
+    let server_crypto = ServerCrypto::new(certificates, private_key)?;
+    let mut roots = RootCertStore::empty();
+    roots.add(trust_anchor.clone())?;
+    let client_crypto = ClientCrypto::new(roots)?;
+    let tls_name = ServerName::try_from(server_name.clone())?;
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (client_result, server_result) = tokio::join!(
+        client_crypto.tls.connect(tls_name, client_io),
+        server_crypto.tls.accept(server_io),
+    );
+    client_result?;
+    server_result?;
+
+    let link = ConnectionLink::new(
+        name,
+        address,
+        server_name,
+        trust_anchor.as_ref(),
+        config.auth.id,
+        load_token(&config.auth.token_file)?,
+        TransportPreference::Tls,
+    )?;
+    Ok(link.encode()?)
 }
 
 fn init_logging() -> Result<(), AnyError> {
@@ -530,7 +793,36 @@ fn parse_command(values: impl IntoIterator<Item = String>) -> Result<ServerComma
         {
             Ok(ServerCommand::GenerateToken(PathBuf::from(path)))
         }
-        _ => Err("usage: helios-server CONFIG_TOML | run --config PATH | check --config PATH | credential generate --output TOKEN_FILE | version".into()),
+        [_, parent, command, flag, path]
+            if parent == "identity" && command == "generate" && flag == "--output" =>
+        {
+            Ok(ServerCommand::GenerateIdentity(PathBuf::from(path)))
+        }
+        [
+            _,
+            command,
+            config_flag,
+            config,
+            address_flag,
+            address,
+            server_name_flag,
+            server_name,
+            name_flag,
+            name,
+        ] if command == "client-link"
+            && config_flag == "--config"
+            && address_flag == "--address"
+            && server_name_flag == "--server-name"
+            && name_flag == "--name" =>
+        {
+            Ok(ServerCommand::ClientLink {
+                config: PathBuf::from(config),
+                address: address.parse()?,
+                server_name: server_name.clone(),
+                name: name.clone(),
+            })
+        }
+        _ => Err("usage: helios-server CONFIG_TOML | run --config PATH | check --config PATH | credential generate --output TOKEN_FILE | identity generate --output DIRECTORY | client-link --config PATH --address IP:PORT --server-name NAME --name DISPLAY_NAME | version".into()),
     }
 }
 
@@ -546,6 +838,35 @@ mod tests {
     struct TestWriter(Arc<Mutex<Vec<u8>>>);
 
     struct TestGuard(Arc<Mutex<Vec<u8>>>);
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_wildcard_listeners_can_share_a_port() {
+        let tcp4 = bind_tcp_listener("0.0.0.0:0".parse().unwrap(), false).unwrap();
+        let tcp_port = tcp4.local_addr().unwrap().port();
+        let tcp6 =
+            bind_tcp_listener(SocketAddr::new("::".parse().unwrap(), tcp_port), true).unwrap();
+        assert!(tcp6.local_addr().unwrap().is_ipv6());
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let crypto = ServerCrypto::new(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                signing_key.serialize_der(),
+            )),
+        )
+        .unwrap();
+        let quic4 =
+            server_quic_endpoint(crypto.quic.clone(), "0.0.0.0:0".parse().unwrap(), false).unwrap();
+        let quic_port = quic4.local_addr().unwrap().port();
+        let quic6 = server_quic_endpoint(
+            crypto.quic,
+            SocketAddr::new("::".parse().unwrap(), quic_port),
+            true,
+        )
+        .unwrap();
+        assert!(quic6.local_addr().unwrap().is_ipv6());
+    }
 
     impl std::io::Write for TestGuard {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -586,6 +907,34 @@ mod tests {
             parse_command(["helios-server".into(), "version".into()]).unwrap(),
             ServerCommand::Version
         ));
+        assert!(matches!(
+            parse_command([
+                "helios-server".into(),
+                "identity".into(),
+                "generate".into(),
+                "--output".into(),
+                "identity".into(),
+            ])
+            .unwrap(),
+            ServerCommand::GenerateIdentity(path) if path.as_os_str() == "identity"
+        ));
+        assert!(matches!(
+            parse_command([
+                "helios-server".into(),
+                "client-link".into(),
+                "--config".into(),
+                "server.toml".into(),
+                "--address".into(),
+                "203.0.113.10:4800".into(),
+                "--server-name".into(),
+                "node-a.helios.invalid".into(),
+                "--name".into(),
+                "VPS A".into(),
+            ])
+            .unwrap(),
+            ServerCommand::ClientLink { address, .. }
+                if address == "203.0.113.10:4800".parse().unwrap()
+        ));
         assert!(parse_command(["helios-server".into()]).is_err());
     }
 
@@ -609,6 +958,64 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_identity_produces_an_importable_verified_link() {
+        let root = std::env::temp_dir().join(format!(
+            "helios-server-identity-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let identity = root.join("identity");
+        std::fs::create_dir(&root).unwrap();
+        let server_name = generate_identity(&identity).unwrap();
+        assert!(server_name.starts_with("node-"));
+        assert!(server_name.ends_with(".helios.invalid"));
+        assert!(generate_identity(&identity).is_err());
+        let token = root.join("token.hex");
+        generate_token_file(token.clone()).unwrap();
+        let config = root.join("server.toml");
+        std::fs::write(
+            &config,
+            r#"schema_version = 1
+listen = "0.0.0.0:4800"
+[tls]
+certificate = "identity/cert.pem"
+private_key = "identity/key.pem"
+[auth]
+id = "desktop-main"
+token_file = "token.hex"
+"#,
+        )
+        .unwrap();
+
+        let encoded = generate_client_link(
+            config,
+            "[2001:db8::10]:4800".parse().unwrap(),
+            server_name.clone(),
+            "Test VPS".into(),
+        )
+        .await
+        .unwrap();
+        let link = ConnectionLink::decode(&encoded).unwrap();
+        assert_eq!(link.server, "[2001:db8::10]:4800".parse().unwrap());
+        assert_eq!(link.server_name, server_name);
+        assert_eq!(link.name, "Test VPS");
+        assert_eq!(link.preferred_transport, TransportPreference::Tls);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(identity.join("key.pem"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

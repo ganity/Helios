@@ -3,13 +3,14 @@ use std::{
     error::Error,
     fs::File,
     io::{BufReader, Error as IoError, ErrorKind},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::Path,
 };
 
 use helios_protocol::{Address, CAP_TCP_CONNECT, ConnectTcp, Target};
-use helios_transport::{ClientCrypto, FrameIo, QuicBiStream, authenticate_client, open_tcp};
-use quinn::Endpoint;
+use helios_transport::{
+    ClientCrypto, FrameIo, QuicBiStream, authenticate_client, client_quic_endpoint, open_tcp,
+};
 use rustls::{RootCertStore, pki_types::ServerName};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -70,7 +71,7 @@ async fn run_tls(args: Args, crypto: ClientCrypto) -> Result<(), AnyError> {
 }
 
 async fn run_quic(args: Args, crypto: ClientCrypto) -> Result<(), AnyError> {
-    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let mut endpoint = client_quic_endpoint(args.server)?;
     endpoint.set_default_client_config(crypto.quic);
     let connection = endpoint.connect(args.server, &args.server_name)?.await?;
 

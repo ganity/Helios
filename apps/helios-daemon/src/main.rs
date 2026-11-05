@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     error::Error,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -1309,7 +1309,7 @@ async fn monitor_tls(
 async fn establish_quic(
     config: &QuicConnectConfig,
 ) -> Result<(QuicRemote, FrameIo<QuicBiStream>), AnyError> {
-    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let mut endpoint = helios_transport::client_quic_endpoint(config.server)?;
     endpoint.set_default_client_config(config.client_config.clone());
     let connection = endpoint
         .connect(config.server, config.server_name.to_str().as_ref())?
@@ -2085,6 +2085,8 @@ fn default_state_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use helios_protocol::{Address, Frame, FrameType};
     use helios_routing::RuleConfig;
     use helios_transport::{ServerCrypto, accept_tcp_frame, authenticate_server, serve_control};

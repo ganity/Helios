@@ -5,6 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use helios_protocol::{AUTH_PROOF_LEN, Auth};
 use helios_routing::{RuleConfig, RuleSet};
 use rustls::{
@@ -12,15 +16,146 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONNECTION_LINK_PREFIX: &str = "helios://v1/";
+const MAX_CONNECTION_LINK_LEN: usize = 16 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionLink {
+    pub version: u8,
+    pub name: String,
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub certificate: String,
+    pub credential_id: String,
+    pub token: String,
+    pub preferred_transport: TransportPreference,
+}
+
+impl ConnectionLink {
+    pub fn new(
+        name: String,
+        server: SocketAddr,
+        server_name: String,
+        certificate: &[u8],
+        credential_id: String,
+        token: [u8; 32],
+        preferred_transport: TransportPreference,
+    ) -> Result<Self, ConfigError> {
+        let value = Self {
+            version: 1,
+            name,
+            server,
+            server_name,
+            certificate: URL_SAFE_NO_PAD.encode(certificate),
+            credential_id,
+            token: token.iter().map(|byte| format!("{byte:02x}")).collect(),
+            preferred_transport,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn encode(&self) -> Result<String, ConfigError> {
+        self.validate()?;
+        let payload =
+            serde_json::to_vec(self).map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        let encoded = URL_SAFE_NO_PAD.encode(payload);
+        if CONNECTION_LINK_PREFIX.len() + encoded.len() > MAX_CONNECTION_LINK_LEN {
+            return Err(ConfigError::Invalid("connection link is too long".into()));
+        }
+        Ok(format!("{CONNECTION_LINK_PREFIX}{encoded}"))
+    }
+
+    pub fn decode(value: &str) -> Result<Self, ConfigError> {
+        let value = value.trim();
+        if value.len() > MAX_CONNECTION_LINK_LEN {
+            return Err(ConfigError::Invalid("connection link is too long".into()));
+        }
+        let payload = value.strip_prefix(CONNECTION_LINK_PREFIX).ok_or_else(|| {
+            ConfigError::Invalid("connection link must start with helios://v1/".into())
+        })?;
+        let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| {
+            ConfigError::Invalid("connection link payload is not valid base64url".into())
+        })?;
+        let link: Self = serde_json::from_slice(&bytes).map_err(|error| {
+            ConfigError::Invalid(format!("connection link JSON is invalid: {error}"))
+        })?;
+        link.validate()?;
+        Ok(link)
+    }
+
+    pub fn certificate_der(&self) -> Result<Vec<u8>, ConfigError> {
+        URL_SAFE_NO_PAD
+            .decode(&self.certificate)
+            .map_err(|_| ConfigError::Invalid("connection link certificate is invalid".into()))
+    }
+
+    pub fn certificate_pem(&self) -> Result<String, ConfigError> {
+        let encoded = STANDARD.encode(self.certificate_der()?);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for line in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        Ok(pem)
+    }
+
+    pub fn token_bytes(&self) -> Result<[u8; 32], ConfigError> {
+        parse_token(&self.token)
+    }
+
+    pub fn storage_id(&self) -> Result<String, ConfigError> {
+        let payload =
+            serde_json::to_vec(self).map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        let digest = Sha256::digest(payload);
+        Ok(digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != 1 {
+            return Err(ConfigError::Invalid(format!(
+                "unsupported connection link version {}",
+                self.version
+            )));
+        }
+        if self.name.trim().is_empty()
+            || self.name.len() > 80
+            || self.name.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Invalid(
+                "node name must contain 1 to 80 printable characters".into(),
+            ));
+        }
+        if self.server.port() == 0 {
+            return Err(ConfigError::Invalid("server port must not be zero".into()));
+        }
+        ServerName::try_from(self.server_name.clone())
+            .map_err(|_| ConfigError::Invalid("TLS server name is invalid".into()))?;
+        validate_credential_id(&self.credential_id)?;
+        parse_token(&self.token)?;
+        let certificate = self.certificate_der()?;
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(certificate))?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub schema_version: u32,
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub listen_ipv6: Option<SocketAddr>,
     pub tls: TlsFiles,
     pub auth: CredentialConfig,
     #[serde(default)]
@@ -159,6 +294,18 @@ impl ServerConfig {
         validate_schema(self.schema_version)?;
         if self.listen.port() == 0 {
             return Err(ConfigError::Invalid("listen port must not be zero".into()));
+        }
+        if let Some(listen_ipv6) = self.listen_ipv6 {
+            if self.listen.is_ipv6() || !listen_ipv6.is_ipv6() {
+                return Err(ConfigError::Invalid(
+                    "listen_ipv6 requires an IPv4 listen address and an IPv6 address".into(),
+                ));
+            }
+            if listen_ipv6.port() == 0 {
+                return Err(ConfigError::Invalid(
+                    "listen_ipv6 port must not be zero".into(),
+                ));
+            }
         }
         validate_credential_id(&self.auth.id)?;
         if !(1..=60).contains(&self.limits.handshake_timeout_seconds) {
@@ -509,6 +656,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_link_round_trips_and_rejects_tampering() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["node-a1.helios.invalid".to_owned()])
+                .unwrap()
+                .cert;
+        let link = ConnectionLink::new(
+            "Personal VPS".into(),
+            "203.0.113.10:4800".parse().unwrap(),
+            "node-a1.helios.invalid".into(),
+            certificate.der(),
+            "desktop-main".into(),
+            [7; 32],
+            TransportPreference::Tls,
+        )
+        .unwrap();
+        let encoded = link.encode().unwrap();
+        assert!(encoded.starts_with(CONNECTION_LINK_PREFIX));
+        assert_eq!(ConnectionLink::decode(&encoded).unwrap(), link);
+        assert!(
+            link.certificate_pem()
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
+        assert_eq!(link.token_bytes().unwrap(), [7; 32]);
+        assert_eq!(link.storage_id().unwrap().len(), 32);
+
+        assert!(ConnectionLink::decode("https://example.com/node").is_err());
+        let mut json = serde_json::to_value(&link).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json).unwrap());
+        assert!(ConnectionLink::decode(&format!("{CONNECTION_LINK_PREFIX}{payload}")).is_err());
+    }
+
+    #[test]
     fn local_control_identity_is_private_stable_and_never_overwrites_invalid_existing_data() {
         let path =
             std::env::temp_dir().join(format!("helios-control-token-{}.hex", std::process::id()));
@@ -550,6 +731,30 @@ token_file = "token.hex"
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.limits, ServerLimits::default());
+    }
+
+    #[test]
+    fn server_accepts_an_optional_ipv6_listener() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+schema_version = 1
+listen = "0.0.0.0:443"
+listen_ipv6 = "[::]:443"
+[tls]
+certificate = "cert.pem"
+private_key = "key.pem"
+[auth]
+id = "desktop-main"
+token_file = "token.hex"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.listen_ipv6, Some("[::]:443".parse().unwrap()));
+
+        let mut invalid = config.clone();
+        invalid.listen_ipv6 = Some("0.0.0.0:443".parse().unwrap());
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

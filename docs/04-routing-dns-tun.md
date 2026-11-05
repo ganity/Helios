@@ -87,10 +87,10 @@ Helios DNS 为域名分配保留地址，TUN Flow 用该地址查回域名，再
 
 ```text
 IPv4: 198.18.0.0/15
-IPv6: 独立配置的 ULA /64
+IPv6: fdfe:dcba:9876::/96
 ```
 
-Fake-IP 映射只在内存保存，重启后重新分配。当前实现使用 198.18.0.0/15，提供稳定正反向映射、容量上限、TTL 清理与最旧项驱逐；默认容量 4096、TTL 60 秒。daemon 的可选 UDP DNS responder 只回答 A，AAAA 返回空答案以避免未支持的 IPv6 静默旁路，其他类型返回 NotImplemented。
+Fake-IP 映射只在内存保存，重启后重新分配。当前实现使用 198.18.0.0/15 与 fdfe:dcba:9876::/96，共享稳定的域名映射、容量上限、TTL 清理与最旧项驱逐；默认容量 4096、TTL 60 秒。daemon 的可选 UDP DNS responder 同时回答 A 与 AAAA，IPv4/IPv6 Fake-IP 均可反查回原域名；其他类型返回 NotImplemented。
 
 ## 4. DNS 查询路由
 
@@ -188,7 +188,7 @@ created_at
 
 - 初始 TUN MTU 取保守值 1280，实测后按平台调整。
 - 不依赖 IP 分片；过大 UDP 在进入 Transport 前按能力拒绝或由上层降低大小。
-- IPv6 不能简单丢弃：首个 TUN 版本可以显式禁用并阻止泄漏，完整支持前不能静默旁路。
+- 桌面默认让 TUN 同时接管 IPv4/IPv6；高级设置可显式关闭 IPv6 接管。helper 会同步配置 IPv6 默认路由，SOCKS/HTTP、协议 Target、TLS/QUIC 与服务端拨号均保留 IPv6 地址族。
 - UDP association 默认空闲超时 60 秒，可配置 30–300 秒。
 - Direct UDP 和 Proxy UDP 使用相同规则结果，但不同 socket Adapter。
 

@@ -30,6 +30,7 @@ tokio = "1.48.0"
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 hmac = "0.12.1"
 sha2 = "0.10.9"
 getrandom = "0.4.3"

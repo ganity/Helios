@@ -1973,6 +1973,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2007,6 +2008,7 @@ dependencies = [
  "helios-config",
  "helios-protocol",
  "helios-routing",
+ "rcgen",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -2016,12 +2018,16 @@ dependencies = [
 name = "helios-config"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "helios-protocol",
  "helios-routing",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
 ]
@@ -2117,13 +2123,18 @@ dependencies = [
 name = "helios-server"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "getrandom 0.4.3",
  "helios-config",
  "helios-protocol",
  "helios-transport",
  "quinn",
+ "rcgen",
+ "rustls",
  "serde_json",
+ "socket2",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",

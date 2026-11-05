@@ -16,7 +16,7 @@ pub use handshake::{
     authenticate_server,
 };
 pub use proxy::{ConnectError, accept_tcp, accept_tcp_frame, finish_tcp_connect, open_tcp};
-pub use quic::QuicBiStream;
+pub use quic::{QuicBiStream, client_quic_endpoint};
 pub use tls::{
     ClientTlsStream, ServerTlsStream, TlsClient, TlsServer, TlsTransport, configure_tcp,
     connect_node_tcp,

@@ -1,10 +1,19 @@
 use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
 
-use quinn::{RecvStream, SendStream};
+use quinn::{Endpoint, RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+pub fn client_quic_endpoint(server: SocketAddr) -> std::io::Result<Endpoint> {
+    let bind_ip = match server.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    Endpoint::client(SocketAddr::new(bind_ip, 0))
+}
 
 pub struct QuicBiStream {
     send: SendStream,
@@ -141,5 +150,14 @@ mod tests {
         assert_eq!(pong.payload, ping.payload);
         connection.close(0u32.into(), b"test complete");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_uses_the_servers_ip_family() {
+        let ipv4 = client_quic_endpoint("127.0.0.1:443".parse().unwrap()).unwrap();
+        assert!(ipv4.local_addr().unwrap().is_ipv4());
+
+        let ipv6 = client_quic_endpoint("[::1]:443".parse().unwrap()).unwrap();
+        assert!(ipv6.local_addr().unwrap().is_ipv6());
     }
 }

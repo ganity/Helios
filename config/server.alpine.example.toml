@@ -1,5 +1,6 @@
 schema_version = 1
 listen = "0.0.0.0:24443"
+listen_ipv6 = "[::]:24443"
 
 [tls]
 certificate = "cert.pem"

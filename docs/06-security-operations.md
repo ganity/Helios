@@ -152,10 +152,14 @@ sudo cat /etc/helios/token.hex
 helios-server check --config PATH
 helios-server run --config PATH
 helios-server credential generate --output TOKEN_FILE
+helios-server identity generate --output DIRECTORY
+helios-server client-link --config PATH --address IP:PORT --server-name NAME --name DISPLAY_NAME
 helios-server version
 ```
 
 为兼容已有 systemd unit，`helios-server PATH` 仍等价于 `run --config PATH`。`check` 会解析严格 TOML、读取并验证 token、证书和私钥，并构建 TLS/QUIC crypto 配置，但不会绑定端口。`credential generate` 使用操作系统 CSPRNG 创建恰好 32 字节的 token，以 64 位十六进制写入新文件；目标已存在时拒绝覆盖，Unix 权限为 `0600`。
+
+`identity generate` 创建独立私钥及绑定随机 `node-<128-bit>.helios.invalid` 名称的五年期终端证书；该名称只用于 TLS 身份校验，不参与 DNS 解析，因此公网 IP 变化不要求换证书。`client-link` 在输出链接前使用实际私钥、证书和给定名称完成一次内存 TLS 握手；名称不匹配时拒绝生成。`helios://` 链接内含 token，必须按密码处理，不能记录到日志或诊断包。每台 VPS 使用独立私钥，不能跨节点共享 `key.pem`。
 
 客户端恢复命令：
 

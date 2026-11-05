@@ -9,6 +9,7 @@
 ```toml
 schema_version = 1
 listen = "0.0.0.0:443"
+listen_ipv6 = "[::]:443"
 
 [tls]
 certificate = "cert.pem"
@@ -24,7 +25,7 @@ max_sessions = 64
 max_flows_per_session = 1024
 ```
 
-同一个 `listen` 地址同时绑定 TCP/TLS 和 UDP/QUIC。`max_sessions` 是两种传输共享的已接受会话上限；`max_flows_per_session` 限制单个 QUIC connection 的并发数据流。TLS 每个连接只承载一个 Flow。
+每个监听地址都同时绑定 TCP/TLS 和 UDP/QUIC。`listen` 保持单栈配置兼容；同时配置 IPv4 `listen` 与 IPv6 `listen_ipv6` 时，服务端使用独立的 IPv6-only socket，让两个地址族可靠共用同一端口。如果主机内核禁用了 IPv6，应省略 `listen_ipv6`。`max_sessions` 是所有地址与传输共享的会话上限；`max_flows_per_session` 限制单个 QUIC connection 的并发数据流。TLS 每个连接只承载一个 Flow。
 
 ## SOCKS5 daemon
 
@@ -79,7 +80,7 @@ action = "proxy"
 
 `preferred_transport` 取 `quic` 时，认证后立即执行一次应用层 PING/PONG，此后按 `health_probe_seconds` 周期测量 RTT。一次探测每 5 秒记录超时，继续等待同一个读写事务，不重发或丢弃半帧；累计 15 秒无响应或协议错误才关闭该 QUIC 会话，让新 Flow 改走 TLS。降级后 daemon 按同一间隔重新建立和认证 QUIC，每次恢复尝试最多 10 秒；恢复成功只影响新 Flow，已有 TLS Flow 不迁移。
 
-QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_milliseconds + 1000` 毫秒总期限约束。单个 Flow 建立传输错误或超时可让该 Flow 尝试 TLS，不清除仍存活的 QUIC 会话；服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。客户端与服务端 QUIC 均使用 Quinn 内置 BBR，初始拥塞窗口为 12,000 字节；这不是 Linux TCP 的拥塞控制设置，也不能解除运营商的 UDP 限速。`server` 当前必须是 IP socket address；`server_name` 用于证书校验。
+QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_milliseconds + 1000` 毫秒总期限约束。单个 Flow 建立传输错误或超时可让该 Flow 尝试 TLS，不清除仍存活的 QUIC 会话；服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。客户端与服务端 QUIC 均使用 Quinn 内置 BBR，初始拥塞窗口为 12,000 字节；这不是 Linux TCP 的拥塞控制设置，也不能解除运营商的 UDP 限速。`server` 必须是 IP socket address；IPv6 使用带方括号的形式，例如 `[2001:db8::10]:443`。`server_name` 用于证书校验。
 
 `[dns]` 为可选配置。启用后 daemon 在指定 loopback UDP 地址运行 Fake-IP responder；容量限制为 1–65536，TTL 限制为 30–3600 秒。该配置不修改系统 DNS。
 
@@ -106,7 +107,7 @@ helios-server check --config /etc/helios/server.toml
 ## 验证范围
 
 - `schema_version` 必须为 1。
-- 监听端口和服务端端口不能为 0。
+- 监听端口和服务端端口不能为 0；`listen_ipv6` 必须是 IPv6 地址，且只可与 IPv4 `listen` 同时配置。
 - handshake/SOCKS/HTTP Header 超时范围为 1 到 60 秒。
 - connect timeout 范围为 1000 到 30000 毫秒。
 - QUIC 健康探测间隔范围为 5 到 300 秒，单次响应超时为 5 秒。

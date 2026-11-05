@@ -62,6 +62,7 @@ if [ ! -e "$config_file" ]; then
     cat >"$config_tmp" <<'EOF'
 schema_version = 1
 listen = "0.0.0.0:443"
+listen_ipv6 = "[::]:443"
 
 [tls]
 certificate = "cert.pem"
