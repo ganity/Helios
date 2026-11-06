@@ -385,6 +385,10 @@ fn configure_route_state() -> Result<(), AnyError> {
 mod tests {
     use super::*;
 
+    // fork on macOS can temporarily inherit another test's flock until exec closes it.
+    #[cfg(unix)]
+    static CHILD_PROCESS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn failed_run_preserves_status_and_success_cleans_it() {
         let path = std::env::temp_dir().join(format!(
@@ -450,6 +454,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn instance_lock_excludes_other_processes_and_releases_on_drop() {
+        let _serial = CHILD_PROCESS_TEST.lock().unwrap();
         const LOCK_PATH: &str = "HELIOS_HELPER_LOCK_TEST_PATH";
         if let Some(path) = std::env::var_os(LOCK_PATH) {
             assert!(lock_instance_file(Path::new(&path)).is_err());
@@ -515,6 +520,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_signal_handles_sigterm_and_sigint_in_child() {
+        let _serial = CHILD_PROCESS_TEST.lock().unwrap();
         use std::{
             future::Future,
             process::Command,

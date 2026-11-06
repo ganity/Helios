@@ -76,7 +76,15 @@ fn get_crate_dir(crate_name: &str) -> Result<std::path::PathBuf, Box<dyn std::er
     let output = std::process::Command::new("cargo")
         .arg("metadata")
         .arg("--format-version=1")
+        .arg("--locked")
+        .arg("--manifest-path")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
+        .arg("--filter-platform")
+        .arg(std::env::var("TARGET")?)
         .output()?;
+    if !output.status.success() {
+        return Err(format!("cargo metadata failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
 
     let metadata = serde_json::from_slice::<serde_json::Value>(&output.stdout)?;
     let packages = metadata["packages"].as_array().ok_or("packages")?;

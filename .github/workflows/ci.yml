@@ -107,6 +107,7 @@ jobs:
   macos:
     name: macOS (${{ matrix.arch }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-latest
