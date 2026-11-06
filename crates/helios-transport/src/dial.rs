@@ -116,6 +116,22 @@ pub(crate) async fn connect_target(target: &helios_protocol::Target) -> io::Resu
 }
 
 async fn race_addresses(ips: Vec<IpAddr>, port: u16) -> io::Result<TcpStream> {
+    connect_tcp_ips(ips, port, None).await
+}
+
+/// Bound mode never falls back to an unbound socket for a missing source family.
+pub async fn connect_tcp_ips(
+    mut ips: Vec<IpAddr>,
+    port: u16,
+    sources: Option<&[IpAddr]>,
+) -> io::Result<TcpStream> {
+    if let Some(sources) = sources {
+        ips.retain(|ip| {
+            sources
+                .iter()
+                .any(|source| source.is_ipv4() == ip.is_ipv4())
+        });
+    }
     // Interleave address families so a broken first family cannot consume the whole deadline.
     let first_v6 = ips.first().is_some_and(IpAddr::is_ipv6);
     let (mut first, mut other): (Vec<_>, Vec<_>) =
@@ -139,7 +155,8 @@ async fn race_addresses(ips: Vec<IpAddr>, port: u16) -> io::Result<TcpStream> {
         tokio::select! {
             _ = tokio::time::sleep_until(next), if addresses.len() > 0 => {
                 let ip = addresses.next().unwrap();
-                pending.spawn(TcpStream::connect((ip, port)));
+                let source = sources.and_then(|sources| sources.iter().find(|source| source.is_ipv4() == ip.is_ipv4()).copied());
+                pending.spawn(async move { tcp_socket((ip, port).into(), source)?.connect((ip, port).into()).await });
                 next = tokio::time::Instant::now() + Duration::from_millis(250);
             }
             result = pending.join_next(), if !pending.is_empty() => {
@@ -153,6 +170,28 @@ async fn race_addresses(ips: Vec<IpAddr>, port: u16) -> io::Result<TcpStream> {
             else => return Err(last),
         }
     }
+}
+
+/// Creates a socket without connecting, allowing node-specific options before SYN.
+pub fn tcp_socket(
+    address: std::net::SocketAddr,
+    source: Option<IpAddr>,
+) -> io::Result<tokio::net::TcpSocket> {
+    if source.is_some_and(|ip| ip.is_ipv4() != address.is_ipv4()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source/target IP family mismatch",
+        ));
+    }
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    if let Some(source) = source {
+        socket.bind((source, 0).into())?;
+    }
+    Ok(socket)
 }
 
 #[cfg(test)]

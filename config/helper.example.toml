@@ -6,5 +6,11 @@ ipv6_enabled = true
 status_file = "/absolute/path/to/helios-helper.status"
 stop_file = "/absolute/path/to/helios-helper.stop"
 
+# Linux only: required for start, and must exactly match daemon [outbound].source_bypass.
+# Replace with addresses owned by the physical uplink, not the TUN.
+# source_bypass = ["192.0.2.2", "2001:db8::2"]
+# Linux supports unmanaged regular resolv.conf or the standard systemd-resolved stub symlink.
+# resolved requires no competing search/routing domains; other managed DNS modes are refused.
+
 # The server IP is always bypassed automatically to prevent a routing loop.
 bypass = ["192.168.0.0/16", "10.0.0.0/8"]

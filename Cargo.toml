@@ -50,4 +50,5 @@ lto = "thin"
 strip = "symbols"
 
 [patch.crates-io]
+tun2proxy = { path = "vendor/tun2proxy" }
 tproxy-config = { path = "vendor/tproxy-config" }

@@ -2,7 +2,14 @@
 // Legacy gateway/fwmark helpers remain available to builds without protected desktop recovery.
 #![cfg_attr(feature = "secure-state-file", allow(dead_code))]
 
+#[cfg(feature = "secure-state-file")]
+pub(crate) mod monitor;
 pub(crate) mod recovery;
+#[cfg(feature = "secure-state-file")]
+pub(crate) mod resolved;
+pub(crate) mod resolver;
+#[cfg(feature = "secure-state-file")]
+mod source_policy;
 
 use futures::stream::TryStreamExt;
 use std::fs;
@@ -125,6 +132,17 @@ async fn ip_link_del(dev: &str) -> Result<()> {
     netlink_do(async |handle| Ok(handle.link().del(index).execute().await?)).await
 }
 
+fn route_table(route: &RouteMessage) -> u32 {
+    route
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            rtnetlink::packet_route::route::RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(u32::from(route.header.table))
+}
+
 async fn ip_route_show(ip_version: IpVersion, table: u32) -> Result<Vec<RouteMessage>> {
     netlink_do(async |handle| {
         let route = match ip_version {
@@ -138,37 +156,26 @@ async fn ip_route_show(ip_version: IpVersion, table: u32) -> Result<Vec<RouteMes
         let mut routes = handle.route().get(route).execute();
         let mut route_messages = Vec::new();
         while let Some(route) = routes.try_next().await? {
-            route_messages.push(route);
+            // Route dumps are not consistently table-filtered by the kernel.
+            if route_table(&route) == table {
+                route_messages.push(route);
+            }
         }
 
-        // Sort routes by prefix length, the most specific route comes first.
-        route_messages.sort_by(|entry1: &RouteMessage, entry2: &RouteMessage| {
-            // If the prefix lengths are equal, we compare the priority of the routes.
-
-            let mut prio1 = 0;
-            let mut prio2 = 0;
-
-            for nla in &entry1.attributes {
-                if let rtnetlink::packet_route::route::RouteAttribute::Priority(prio) = nla {
-                    prio1 = *prio
-                }
-            }
-
-            for nla in &entry1.attributes {
-                if let rtnetlink::packet_route::route::RouteAttribute::Priority(prio) = nla {
-                    prio2 = *prio
-                }
-            }
-
-            let prio_cmp = prio1.cmp(&prio2);
-            if prio_cmp != std::cmp::Ordering::Equal {
-                return prio_cmp;
-            }
-
-            entry2
-                .header
-                .destination_prefix_length
-                .cmp(&entry1.header.destination_prefix_length)
+        // Longest prefix wins; metrics only order routes with the same prefix length.
+        route_messages.sort_by_key(|route| {
+            let metric = route
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    rtnetlink::packet_route::route::RouteAttribute::Priority(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            (
+                std::cmp::Reverse(route.header.destination_prefix_length),
+                metric,
+            )
         });
 
         Ok(route_messages)
@@ -769,6 +776,11 @@ pub(crate) async fn _tproxy_setup(tproxy_args: &TproxyArgs) -> Result<TproxyStat
     }
     #[cfg(not(feature = "secure-state-file"))]
     {
+        if !tproxy_args.source_bypass.is_empty() {
+            return Err(
+                std::io::Error::other("source-policy routing requires secure-state-file").into(),
+            );
+        }
         let mut state: TproxyStateInner = TproxyStateInner {
             tproxy_args: Some(tproxy_args.clone()),
             ..Default::default()

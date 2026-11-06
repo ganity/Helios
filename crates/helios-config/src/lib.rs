@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::BufReader,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -211,6 +211,8 @@ pub struct DaemonConfig {
     pub proxy_bypass: Vec<String>,
     #[serde(default)]
     pub dns: Option<DnsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<OutboundConfig>,
     pub node: NodeConfig,
     #[serde(default)]
     pub backup_nodes: Vec<NodeConfig>,
@@ -218,6 +220,90 @@ pub struct DaemonConfig {
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
     pub timeouts: ClientTimeouts,
+}
+
+/// Explicit uplink binding for Linux source-policy TUN; absence preserves normal routing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundConfig {
+    pub source_bypass: Vec<IpAddr>,
+    pub dns_servers: Vec<SocketAddr>,
+}
+
+/// Bounded, path-free request passed through pkexec's stdin. Never contains root file paths.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopTunRequest {
+    pub socks_listen: SocketAddr,
+    pub server_ip: IpAddr,
+    pub node_ips: Vec<IpAddr>,
+    pub mtu: u16,
+    pub ipv6_enabled: bool,
+    pub outbound: OutboundConfig,
+    pub desktop_pid: u32,
+    pub daemon_pid: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunDaemonInfo {
+    pub pid: u32,
+    pub outbound: OutboundConfig,
+}
+
+impl OutboundConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !cfg!(target_os = "linux") {
+            return Err(ConfigError::Invalid(
+                "outbound binding currently requires Linux".into(),
+            ));
+        }
+        if self.source_bypass.is_empty()
+            || self.source_bypass.len() > 2
+            || self.source_bypass.iter().any(|ip| !valid_uplink(*ip))
+            || (self.source_bypass.len() == 2
+                && self.source_bypass[0].is_ipv4() == self.source_bypass[1].is_ipv4())
+        {
+            return Err(ConfigError::Invalid(
+                "outbound.source_bypass requires one unicast uplink address per enabled IP family"
+                    .into(),
+            ));
+        }
+        if self.dns_servers.is_empty()
+            || self.dns_servers.len() > 4
+            || self.dns_servers.iter().any(|server| {
+                server.port() == 0
+                    || !valid_uplink(server.ip())
+                    || !self
+                        .source_bypass
+                        .iter()
+                        .any(|source| source.is_ipv4() == server.is_ipv4())
+            })
+        {
+            return Err(ConfigError::Invalid("outbound.dns_servers requires 1 to 4 real upstream addresses with a matching source family; loopback/stub resolvers are unsupported".into()));
+        }
+        Ok(())
+    }
+}
+
+fn valid_uplink(ip: IpAddr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_link_local()
+                && !ip.is_broadcast()
+                && ip.octets()[0] != 0
+                && ip.octets()[0] < 224
+                && (u32::from(ip) & 0xfffe_0000 != 0xc612_0000)
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_unicast_link_local()
+                && ip.to_ipv4_mapped().is_none()
+                && (u128::from(ip) >> 32 != 0xfdfe_dcba_9876_0000_0000_0000)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -383,6 +469,22 @@ impl DaemonConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_schema(self.schema_version)?;
+        if let Some(outbound) = &self.outbound {
+            outbound.validate()?;
+            if std::iter::once(&self.node)
+                .chain(&self.backup_nodes)
+                .any(|node| {
+                    !outbound
+                        .source_bypass
+                        .iter()
+                        .any(|source| source.is_ipv4() == node.server.is_ipv4())
+                })
+            {
+                return Err(ConfigError::Invalid(
+                    "every node needs a matching outbound source family".into(),
+                ));
+            }
+        }
         if self.backup_nodes.len() > 16 {
             return Err(ConfigError::Invalid(
                 "at most 16 backup nodes are allowed".into(),
@@ -777,6 +879,52 @@ preferred_transport = "quic"
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.timeouts, ClientTimeouts::default());
+        assert!(config.outbound.is_none());
+    }
+
+    #[test]
+    fn outbound_binding_requires_real_sources_and_explicit_matching_dns_servers() {
+        let mut config = OutboundConfig {
+            source_bypass: vec!["192.0.2.1".parse().unwrap()],
+            dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
+        };
+        assert_eq!(config.validate().is_ok(), cfg!(target_os = "linux"));
+        let encoded = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<OutboundConfig>(&encoded).unwrap(), config);
+        assert!(toml::from_str::<OutboundConfig>(&(encoded + "unknown = 1\n")).is_err());
+        for source in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "198.18.0.1",
+            "169.254.0.1",
+            "224.0.0.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "fdfe:dcba:9876::1",
+            "::ffff:192.0.2.1",
+        ] {
+            config.source_bypass = vec![source.parse().unwrap()];
+            assert!(config.validate().is_err(), "{source}");
+        }
+        config.source_bypass = vec!["192.0.2.1".parse().unwrap()];
+        for server in [
+            "127.0.0.53:53",
+            "198.19.255.254:53",
+            "192.0.2.53:0",
+            "[::1]:53",
+            "[2001:db8::53]:53",
+        ] {
+            config.dns_servers = vec![server.parse().unwrap()];
+            assert!(config.validate().is_err(), "{server}");
+        }
+        config.dns_servers.clear();
+        assert!(config.validate().is_err());
+        config.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+        config.source_bypass.push("192.0.2.2".parse().unwrap());
+        assert!(config.validate().is_err());
+        config.source_bypass.clear();
+        assert!(config.validate().is_err());
     }
 
     #[test]

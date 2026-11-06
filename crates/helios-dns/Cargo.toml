@@ -9,4 +9,7 @@ rust-version.workspace = true
 serde = { workspace = true, features = ["derive"] }
 hickory-proto.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

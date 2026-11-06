@@ -9,7 +9,8 @@ use std::{
 };
 
 use helios_config::{
-    ClientTimeouts, ConnectionLink, DaemonConfig, DnsConfig, NodeConfig, TransportPreference,
+    ClientTimeouts, ConnectionLink, DaemonConfig, DnsConfig, NodeConfig, OutboundConfig,
+    TransportPreference,
 };
 use helios_protocol::{Address, Target};
 use helios_routing::{Network, RouteAction, RuleConfig, RuleSet};
@@ -63,6 +64,9 @@ pub struct DesktopProfile {
     pub language: Language,
     pub daemon_binary: PathBuf,
     pub daemon_config: PathBuf,
+    /// Session-only binding; never restore a stale physical address from desktop.json.
+    #[serde(skip)]
+    pub tun_outbound: Option<OutboundConfig>,
     #[serde(default = "default_true")]
     pub auto_start_daemon: bool,
     #[serde(default = "default_helper_binary")]
@@ -139,6 +143,7 @@ impl From<LegacyDesktopProfile> for DesktopProfile {
             language: Language::default(),
             daemon_binary: legacy.daemon_binary,
             daemon_config: legacy.daemon_config,
+            tun_outbound: None,
             auto_start_daemon: true,
             helper_binary: default_helper_binary(),
             helper_config: default_helper_config(),
@@ -183,6 +188,7 @@ impl Default for DesktopProfile {
             language: Language::default(),
             daemon_binary: sibling_binary("helios-daemon"),
             daemon_config: default_state_dir().join("daemon.toml"),
+            tun_outbound: None,
             auto_start_daemon: true,
             helper_binary: default_helper_binary(),
             helper_config: default_helper_config(),
@@ -223,7 +229,7 @@ impl DesktopProfile {
         if self.nodes.is_empty() {
             return Err("at least one node is required".into());
         }
-        let dns = if self.fake_ip_dns_enabled {
+        let dns = if self.fake_ip_dns_enabled || self.tun_outbound.is_some() {
             Some(DnsConfig {
                 listen: self.dns_listen.parse()?,
                 fake_ip_capacity: self.fake_ip_capacity,
@@ -242,6 +248,7 @@ impl DesktopProfile {
             control_token_file: Some(default_state_dir().join("control-token.hex")),
             proxy_bypass: system_proxy_bypass(self),
             dns,
+            outbound: self.tun_outbound.clone(),
             node: self.active_node().config()?,
             backup_nodes: if self.auto_failover {
                 self.nodes
@@ -597,7 +604,11 @@ pub fn default_control_socket() -> Option<PathBuf> {
 }
 
 pub fn tun_status_file() -> PathBuf {
-    default_state_dir().join("helios-helper.status")
+    if cfg!(target_os = "linux") {
+        PathBuf::from("/run/helios/tun.status")
+    } else {
+        default_state_dir().join("helios-helper.status")
+    }
 }
 
 pub fn tun_stop_file() -> PathBuf {

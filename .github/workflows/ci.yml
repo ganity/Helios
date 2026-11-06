@@ -16,7 +16,7 @@ jobs:
       - name: Install Linux desktop validation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libglib2.0-bin gsettings-desktop-schemas dconf-service dbus-x11 desktop-file-utils
+          sudo apt-get install -y libglib2.0-bin gsettings-desktop-schemas dconf-service dbus-x11 desktop-file-utils iproute2 openssl systemd-resolved polkitd pkexec
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -26,6 +26,14 @@ jobs:
       - run: cargo test --workspace
       - name: Keep failed Linux route cleanup retryable
         run: cargo test -p tproxy-config --features secure-state-file
+      - name: Test Linux TUN routing and SIGKILL recovery in disposable namespaces
+        run: sh deploy/test-linux-tun-routing.sh
+      - name: Test real Linux TUN data plane and helper recovery in disposable namespaces
+        run: sh deploy/test-linux-tun-dataplane.sh
+      - name: Test real systemd-resolved DNS leases and recovery in disposable namespaces
+        run: HELIOS_TEST_RESOLVED=1 sh deploy/test-linux-tun-dataplane.sh
+      - name: Test segmented TCP DNS framing
+        run: cargo test -p tun2proxy --lib dns_tcp_retains
       - name: Validate Linux desktop entry
         run: desktop-file-validate deploy/helios-client.desktop
       - name: Test isolated GNOME proxy lease and recovery
@@ -49,6 +57,16 @@ jobs:
           dpkg-deb --info target/installers/helios_*.deb
           dpkg-deb --contents target/installers/helios_*.deb
           dpkg-deb --field target/installers/helios_*.deb Depends | grep -q 'libwayland-client0'
+      - name: Validate Linux TUN installer resources
+        run: |
+          task_package_dir=$(mktemp -d)
+          dpkg-deb --extract target/installers/helios_*.deb "$task_package_dir"
+          test -x "$task_package_dir/usr/libexec/helios-helper"
+          test -f "$task_package_dir/usr/share/polkit-1/actions/com.helios.tun.policy"
+          test -f "$task_package_dir/usr/lib/systemd/system/helios-tun-recover.service"
+          sh deploy/package-linux-client.sh target/release "$task_package_dir"
+          tar -xzf "$task_package_dir/helios-linux-$(uname -m).tar.gz" -C "$task_package_dir"
+          (cd "$task_package_dir" && sha256sum -c SHA256SUMS)
       - name: Upload Linux installer
         uses: actions/upload-artifact@v4
         with:

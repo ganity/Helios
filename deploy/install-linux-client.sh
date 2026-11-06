@@ -58,3 +58,7 @@ chmod 0644 "$temporary"
 mv -f "$temporary" "$prefix/share/applications/helios-client.desktop"
 trap - 0 HUP INT TERM
 printf 'Helios installed under %s; existing ~/.helios configuration was not changed.\n' "$prefix"
+
+if [ -f "$build_dir/install-linux-tun.sh" ]; then
+    printf 'For TUN, install its system component once: sudo sh "%s/install-linux-tun.sh" "%s"\n' "$build_dir" "$build_dir"
+fi

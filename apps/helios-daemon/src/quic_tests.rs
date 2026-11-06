@@ -33,8 +33,16 @@ async fn peer(stream_limit: u32) -> Peer {
     crypto.quic.transport_config(Arc::new(transport));
     let endpoint = Endpoint::server(crypto.quic, "127.0.0.1:0".parse().unwrap()).unwrap();
     let listener = endpoint.clone();
+    let source: std::net::IpAddr = if cfg!(target_os = "linux") {
+        "127.0.0.2"
+    } else {
+        "127.0.0.1"
+    }
+    .parse()
+    .unwrap();
     let task = tokio::spawn(async move {
         let connection = listener.accept().await.unwrap().await.unwrap();
+        assert_eq!(connection.remote_address().ip(), source);
         let (send, recv) = connection.accept_bi().await.unwrap();
         let mut control = FrameIo::new(QuicBiStream::new(send, recv));
         authenticate_server(&mut control, CAP_TCP_CONNECT, |_| Some([7; 32]))
@@ -45,11 +53,15 @@ async fn peer(stream_limit: u32) -> Peer {
     let mut roots = RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
     let crypto = ClientCrypto::new(roots).unwrap();
-    let config = QuicConnectConfig {
+    let config = NodeConnectConfig {
         server: endpoint.local_addr().unwrap(),
         server_name: "localhost".try_into().unwrap(),
         credential_id: Arc::from("test"),
         token: [7; 32],
+        outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+            source_bypass: vec![source],
+            dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+        })),
         client_config: crypto.quic,
     };
     let (quic, control) = establish_quic(&config).await.unwrap();
@@ -58,6 +70,7 @@ async fn peer(stream_limit: u32) -> Peer {
         std::future::pending::<()>().await;
     });
     let remote = Remote {
+        outbound: config.outbound.clone(),
         _monitors: Some(Arc::new(MonitorTasks(vec![control_task.abort_handle()]))),
         tls: crypto.tls,
         quic: Arc::new(RwLock::new(Some(quic))),

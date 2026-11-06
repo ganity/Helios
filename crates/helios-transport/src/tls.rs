@@ -14,11 +14,14 @@ use crate::FrameIo;
 pub async fn connect_node_tcp(
     address: std::net::SocketAddr,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let socket = if address.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()?
-    } else {
-        tokio::net::TcpSocket::new_v6()?
-    };
+    connect_node_tcp_bound(address, None).await
+}
+
+pub async fn connect_node_tcp_bound(
+    address: std::net::SocketAddr,
+    source: Option<std::net::IpAddr>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let socket = crate::dial::tcp_socket(address, source)?;
     // shortcut: TCP_MAXSEG is unavailable here on Windows; that path still relies on OS PMTU discovery.
     #[cfg(all(unix, not(target_vendor = "apple")))]
     socket2::SockRef::from(&socket).set_tcp_mss(1000)?;

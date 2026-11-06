@@ -14,9 +14,23 @@ use hickory_proto::{
 };
 use tokio::net::UdpSocket;
 
+/// Reserved outside the allocation range: SOCKS DNS gateway for the Linux helper.
+pub const TUN_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0));
+
 const FIRST_FAKE_IP: u32 = 0xc612_0001;
 const LAST_FAKE_IP: u32 = 0xc613_fffe;
 const IPV6_PREFIX: u128 = 0xfdfe_dcba_9876_0000_0000_0000_0000_0000;
+
+/// Includes the whole reserved IPv4 pool, not only currently allocated entries.
+pub fn is_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => u32::from(ip) & 0xfffe_0000 == 0xc612_0000,
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|ip| is_fake_ip(IpAddr::V4(ip)))
+            .unwrap_or(u128::from(ip) & !u128::from(u32::MAX) == IPV6_PREFIX),
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStats {
@@ -159,11 +173,49 @@ pub async fn serve_udp(
     }
 }
 
+/// DNS over TCP used by the TUN-to-SOCKS bridge; each query is bounded and idle connections expire.
+pub async fn serve_tcp(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    pool: FakeIpPool,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let query = async {
+            let length = stream.read_u16().await? as usize;
+            if length > 4096 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "DNS query exceeds 4096 bytes",
+                ));
+            }
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await?;
+            Ok(bytes)
+        };
+        let bytes = match tokio::time::timeout(Duration::from_secs(60), query).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
+        };
+        let response = answer_query(&bytes, &pool, u32::MAX).map_err(std::io::Error::other)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            stream
+                .write_u16(response.len().try_into().map_err(std::io::Error::other)?)
+                .await?;
+            stream.write_all(&response).await
+        })
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    }
+}
+
 pub fn answer_query(
     bytes: &[u8],
     pool: &FakeIpPool,
     ttl_seconds: u32,
 ) -> Result<Vec<u8>, DnsError> {
+    let ttl_seconds = ttl_seconds.min(pool.ttl.as_secs().min(u32::MAX.into()) as u32);
     let request = Message::from_vec(bytes)?;
     let mut response = Message::response(request.id, request.op_code);
     response.add_queries(request.queries.iter().cloned());
@@ -276,6 +328,46 @@ mod tests {
         op::{Message, Query},
         rr::{Name, RData, RecordType},
     };
+
+    #[tokio::test]
+    async fn tcp_dns_handles_split_queries_shared_dual_stack_cache_and_limits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pool = FakeIpPool::new(4, Duration::from_secs(30)).unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let shared = pool.clone();
+        let worker = tokio::spawn(async move { serve_tcp(server, shared).await });
+        for kind in [RecordType::A, RecordType::AAAA] {
+            let mut request = Message::query();
+            request.add_query(Query::query(
+                Name::from_ascii("example.test.").unwrap(),
+                kind,
+            ));
+            let bytes = request.to_vec().unwrap();
+            let length = (bytes.len() as u16).to_be_bytes();
+            client.write_all(&length[..1]).await.unwrap();
+            tokio::task::yield_now().await;
+            client.write_all(&length[1..]).await.unwrap();
+            for byte in bytes {
+                client.write_all(&[byte]).await.unwrap();
+            }
+            let size = client.read_u16().await.unwrap();
+            let mut bytes = vec![0; size as usize];
+            client.read_exact(&mut bytes).await.unwrap();
+            let response = Message::from_vec(&bytes).unwrap();
+            assert_eq!(response.answers[0].ttl, 30);
+            let ip = match response.answers[0].data {
+                RData::A(ip) => IpAddr::V4(ip.0),
+                RData::AAAA(ip) => IpAddr::V6(ip.0),
+                _ => panic!("expected IP"),
+            };
+            assert_eq!(pool.lookup_ip(ip).as_deref(), Some("example.test"));
+        }
+        client.write_u16(4097).await.unwrap();
+        assert_eq!(
+            worker.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn allocation_is_stable_and_reverse_lookup_works() {

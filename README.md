@@ -29,6 +29,7 @@ Helios 是面向个人使用的跨平台加密网络工具，由 Windows/macOS/L
 - [Helios 协议](docs/02-protocol.md)
 - [客户端、桌面界面与 IPC](docs/03-client.md)
 - [Linux 客户端安装与支持范围](docs/09-linux-client.md)
+- [Linux TUN 实现与进度](docs/15-linux-tun-implementation.md)
 - [路由、DNS 与 TUN](docs/04-routing-dns-tun.md)
 - [配置与状态模型](docs/05-configuration.md)
 - [安全、部署与运维](docs/06-security-operations.md)

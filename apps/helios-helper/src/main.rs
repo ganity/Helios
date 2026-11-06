@@ -10,7 +10,12 @@ use std::{
 use serde::Deserialize;
 use tproxy_config::IpCidr;
 use tproxy_config::tproxy_remove;
-use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken, general_run_async};
+#[cfg(not(target_os = "linux"))]
+use tun2proxy::general_run_async;
+use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken};
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -28,6 +33,8 @@ struct HelperConfig {
     ipv6_enabled: bool,
     #[serde(default)]
     bypass: Vec<String>,
+    #[serde(default)]
+    source_bypass: Vec<IpAddr>,
     status_file: PathBuf,
     stop_file: PathBuf,
 }
@@ -46,11 +53,33 @@ impl HelperConfig {
         if !self.socks_listen.ip().is_loopback() || self.socks_listen.port() == 0 {
             return Err("socks_listen must be a loopback address with a nonzero port".into());
         }
-        if self.server_ip.is_loopback() || self.server_ip.is_unspecified() {
+        if self.server_ip.is_loopback()
+            || self.server_ip.is_unspecified()
+            || helios_dns::is_fake_ip(self.server_ip)
+        {
             return Err("server_ip must be the public Helios server IP".into());
         }
         if !(576..=9000).contains(&self.mtu) {
             return Err("mtu must be between 576 and 9000".into());
+        }
+        if cfg!(target_os = "linux") && !self.source_bypass.is_empty() {
+            helios_config::OutboundConfig {
+                source_bypass: self.source_bypass.clone(),
+                dns_servers: vec![SocketAddr::new(self.server_ip, 53)],
+            }
+            .validate()?;
+        } else if !cfg!(target_os = "linux") && !self.source_bypass.is_empty() {
+            return Err("source_bypass is only supported on Linux".into());
+        }
+        if cfg!(target_os = "linux")
+            && let Some(name) = &self.tun_name
+            && (name.is_empty()
+                || name.len() > 15
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)))
+        {
+            return Err("tun_name must contain 1 to 15 ASCII letters, digits, '_' or '-'".into());
         }
         for value in &self.bypass {
             IpCidr::from_str(value)?;
@@ -60,6 +89,14 @@ impl HelperConfig {
         }
         if self.status_file == self.stop_file {
             return Err("status_file and stop_file must be different".into());
+        }
+        Ok(())
+    }
+
+    fn validate_for_start(&self) -> Result<(), AnyError> {
+        self.validate()?;
+        if cfg!(target_os = "linux") && self.source_bypass.is_empty() {
+            return Err("Linux TUN requires source_bypass matching the running daemon; legacy unbound routing is unsafe".into());
         }
         Ok(())
     }
@@ -129,7 +166,24 @@ async fn wait_for_stop(path: &Path, status: &fs::File) -> Result<(), AnyError> {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init()
+        .ok();
     let values: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    {
+        if values
+            .first()
+            .is_some_and(|arg| arg.to_string_lossy().starts_with("--desktop"))
+        {
+            return linux::desktop::command(&values).await;
+        }
+        if std::env::var_os("PKEXEC_UID").is_some() {
+            return Err("pkexec only supports --desktop and --desktop-recover; administrator CLI mode is not delegated".into());
+        }
+    }
     let (recover, path) = parse_command(&values)?;
     let config = HelperConfig::load(path)?;
     #[cfg(unix)]
@@ -138,6 +192,7 @@ async fn main() -> Result<(), AnyError> {
     if recover {
         return recover_helper(&config).await;
     }
+    config.validate_for_start()?;
     if status_is_fresh(&config.status_file) {
         return Err("another helios-helper instance is already running".into());
     }
@@ -145,12 +200,17 @@ async fn main() -> Result<(), AnyError> {
         return Err("stale helper state detected; refusing to modify routes without a trusted recovery record".into());
     }
     let args = config.tun_args()?;
+    #[cfg(target_os = "linux")]
+    linux::preflight(&config).await?;
     if let Some(parent) = config.status_file.parent() {
         fs::create_dir_all(parent)?;
     }
     let _ = fs::remove_file(&config.stop_file);
     let status_file = create_status_file(&config.status_file)?;
     let shutdown = CancellationToken::new();
+    #[cfg(target_os = "linux")]
+    let run = linux::run(&config, args, shutdown.clone(), None);
+    #[cfg(not(target_os = "linux"))]
     let run = general_run_async(
         args,
         config.mtu,
@@ -176,6 +236,12 @@ async fn main() -> Result<(), AnyError> {
         }
     };
     drop(status_file);
+    #[cfg(target_os = "linux")]
+    if result.is_err() && !Path::new("/var/lib/helios/tun-route-lease.json").try_exists()? {
+        // A failed preflight or a fully recovered data-plane error has no pending network lease.
+        fs::remove_file(&config.status_file)?;
+        return result;
+    }
     finish_helper_run(&config.status_file, result)
 }
 
@@ -561,6 +627,11 @@ mod tests {
             mtu: 1280,
             ipv6_enabled: false,
             bypass: vec!["192.168.0.0/16".into()],
+            source_bypass: if cfg!(target_os = "linux") {
+                vec!["192.0.2.1".parse().unwrap()]
+            } else {
+                vec![]
+            },
             status_file: std::env::temp_dir().join("helios-helper-test.status"),
             stop_file: std::env::temp_dir().join("helios-helper-test.stop"),
         }
@@ -598,6 +669,10 @@ mod tests {
         assert!(value.validate().is_err());
 
         let mut value = config();
+        value.server_ip = "198.18.1.2".parse().unwrap();
+        assert!(value.validate().is_err());
+
+        let mut value = config();
         value.mtu = 500;
         assert!(value.validate().is_err());
 
@@ -608,6 +683,17 @@ mod tests {
         let mut value = config();
         value.stop_file = value.status_file.clone();
         assert!(value.validate().is_err());
+        if cfg!(target_os = "linux") {
+            let mut value = config();
+            value.source_bypass.clear();
+            assert!(value.validate().is_ok()); // Legacy configuration remains usable for --recover.
+            assert!(value.validate_for_start().is_err());
+            value.source_bypass = vec!["127.0.0.1".parse().unwrap()];
+            assert!(value.validate().is_err());
+        }
+        let mut value = config();
+        value.tun_name = Some("../eth0".into());
+        assert_eq!(value.validate().is_err(), cfg!(target_os = "linux"));
     }
 
     #[test]
@@ -617,6 +703,7 @@ mod tests {
         let paths = config();
         value.status_file = paths.status_file;
         value.stop_file = paths.stop_file;
+        value.source_bypass = paths.source_bypass;
         value.validate().unwrap();
     }
 

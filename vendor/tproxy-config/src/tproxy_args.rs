@@ -15,6 +15,9 @@ pub struct TproxyArgs {
     pub tun_name: String,
     pub proxy_addr: SocketAddr,
     pub bypass_ips: Vec<IpCidr>,
+    /// Linux source-policy routing. The daemon must bind its outgoing sockets to these addresses.
+    #[serde(default)]
+    pub source_bypass: Vec<IpAddr>,
     pub ipv4_default_route: bool,
     pub ipv6_default_route: bool,
     pub gateway_mode: bool,
@@ -33,6 +36,7 @@ impl Default for TproxyArgs {
             tun_name: TUN_NAME.to_string(),
             proxy_addr: PROXY_ADDR,
             bypass_ips: vec![],
+            source_bypass: vec![],
             ipv4_default_route: true,
             ipv6_default_route: false,
             gateway_mode: false,
@@ -87,13 +91,18 @@ impl TproxyArgs {
         self
     }
 
+    pub fn source_bypass(mut self, addresses: &[IpAddr]) -> Self {
+        self.source_bypass = addresses.to_vec();
+        self
+    }
+
     pub fn ipv6_default_route(mut self, enabled: bool) -> Self {
         self.ipv6_default_route = enabled;
         self
     }
 
     pub fn ipv4_default_route(mut self, enabled: bool) -> Self {
-        self.ipv6_default_route = enabled;
+        self.ipv4_default_route = enabled;
         self
     }
 

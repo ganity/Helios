@@ -73,18 +73,21 @@ env XDG_CONFIG_HOME="$task_proxy_dir" \
   managed_guard_restores_lease_on_exit_and_on_startup_recovery -- --ignored
 ```
 
+## Linux TUN 桌面接入已完成
+
+已接通桌面开关、固定 helper 的 pkexec/polkit 授权、源地址/DNS 握手、就绪自检、运行监视及独立 SIGKILL 恢复；静态 DNS 和 resolved 的真实双栈 TUN、真实授权接口与桌面状态机在隔离容器通过。Debian/便携包已包含系统组件。只支持桌面模式，不开放 gateway/fwmark；支持边界与安装见 [Linux TUN 实现与进度](15-linux-tun-implementation.md)。
+
 ## 仍未完成，不计为已实现
 
 | 优先级 | 缺口 | 完成条件 |
 |---|---|---|
-| P0 | Linux TUN 产品化 | journal/recovery 基础和隔离容器 SIGKILL 测试已通过，但 helper 未接入客户端/提权流程，UI 开关仍禁用；只支持桌面模式，不开放 gateway/fwmark。需宿主桌面、DNS 管理器和真实流量验收 |
-| P1 | DNS 完整产品能力 | 已有 IPv4/IPv6 Fake-IP 和过期项清理；Real-IP 上游策略、系统 DNS lease/桌面 DNS 接管仍未实现 |
+| P1 | DNS 完整产品能力 | 已有双栈 Fake-IP、Direct 的绑定上游解析和 Linux 系统 DNS 租约；仍缺少可配置的 Real-IP 响应模式和按域上游策略 |
 | P1 | 凭据与证书管理 | 原生凭据库、双 token 轮换窗口、SPKI pin、证书到期提示、按来源认证限速及日志限流 |
 | P1 | 平台真机验收 | Windows/macOS TUN 授权、睡眠/切网、强杀恢复；macOS NetworkExtension 正式方案；Linux KDE 自动代理 |
 | P2 | 配置和交互完善 | 事件推送、规则图形化排序/编辑、IDNA、登录自启/自动连接和关闭行为设置；监听/DNS/timeout 仍需重启 |
 | P2 | 协议完整性 | 版本集合协商及完整 GOAWAY；当前能力协商和固定 v1 帧不等于完整版本协商 |
 | P2 | 发布与长期稳定性 | Win/macOS 签名安装包、更新验证、fuzz/netem/72 小时压力与资源占用验收。Linux 校验和包不是签名发布 |
 
-本机 `unshare -Urn true` 返回 `Operation not permitted`；改在无外网、受限 Docker network/mount namespace 做 journal/recovery 故障测试。此结果不替代宿主桌面提权与真实流量验收，Linux TUN 开关继续禁用。
+本机 `unshare -Urn true` 返回 `Operation not permitted`；改在无外网、受限 Docker network/mount namespace 做 journal/recovery 故障测试。早期此结果只验证路由；后续已补真实流量、桌面授权接口与状态机测试并开放开关，证据与范围见上文。
 
 签名发布、长期稳定性和 iPhone/iOS 客户端按用户要求暂缓。

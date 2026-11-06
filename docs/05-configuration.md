@@ -84,9 +84,27 @@ QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_mi
 
 `[dns]` 为可选配置。启用后 daemon 在指定 loopback UDP 地址运行 Fake-IP responder；容量限制为 1–65536，TTL 限制为 30–3600 秒。该配置不修改系统 DNS。
 
-规则按配置顺序匹配，第一个命中即停止。支持 `domain`、`domain-suffix`、`ip-cidr`、`ip-cidr6`、`dst-port` 和 `final`；动作支持 `direct`、`proxy`、`reject`。非空规则必须以唯一且位于末尾的 `final` 结束。规则为空时等价于 `FINAL,proxy`。域名规则大小写不敏感，后缀规则匹配根域及其子域，不匹配仅有字符串后缀的无关域名。Direct 域名使用本机 DNS；Proxy 域名仍由服务端解析。daemon 自身两个入口始终优先拒绝，不能被用户 Direct 规则覆盖。
+规则按配置顺序匹配，第一个命中即停止。支持 `domain`、`domain-suffix`、`ip-cidr`、`ip-cidr6`、`dst-port` 和 `final`；动作支持 `direct`、`proxy`、`reject`。非空规则必须以唯一且位于末尾的 `final` 结束。规则为空时等价于 `FINAL,proxy`。域名规则大小写不敏感，后缀规则匹配根域及其子域，不匹配仅有字符串后缀的无关域名。未配置 `[outbound]` 时，Direct 域名使用本机 DNS；启用出站绑定时使用下述显式真实 DNS 上游。Proxy 域名仍由服务端解析。daemon 自身两个入口始终优先拒绝，不能被用户 Direct 规则覆盖。
 
 macOS/Linux 设置 `control_socket` 后，daemon 使用权限为 `0600` 的 Unix Domain Socket。Windows 设置 `control_pipe` 后，daemon 使用拒绝远程客户端、仅允许对象所有者与 SYSTEM 访问的 Named Pipe。`control_listen` 仅保留为旧配置兼容入口。
+
+## Linux 出站绑定
+
+Linux daemon 可选配置 `[outbound]`，为 TUN 源地址策略路由准备普通权限的出站路径。此节只约束 daemon 的 socket；不会创建 TUN、安装策略规则或启动 helper，桌面客户端暂不生成此节。尚未完成的系统接入见 [Linux TUN 实现与进度](15-linux-tun-implementation.md)。
+
+```toml
+[outbound]
+# 替换为当前物理接口拥有的地址，必须与 helper 的 source_bypass 完全一致。
+source_bypass = ["192.0.2.2", "2001:db8::2"]
+# 显式真实上游；不能使用 loopback/stub、Fake-IP 或域名地址。
+dns_servers = ["192.0.2.53:53", "[2001:db8::53]:53"]
+```
+
+每个地址族最多一个源地址，至少一个；上游数量为 1–4，端口不可为零，每个上游和每个节点均须有对应地址族的源地址。拒绝 unspecified、loopback、multicast、link-local、Fake-IP 和 IPv4-mapped IPv6 的配置地址。实际绑定还要求该源地址当前属于本机；绑定失败或缺少地址族时不会改用未绑定连接。
+
+Direct TCP/UDP、QUIC/TLS 节点、重连及健康探测全部使用指定源地址。绑定模式下的 Direct 域名只查询显式上游，支持 A/AAAA、CNAME 及 UDP 截断后的 TCP 重试，不回退本机 DNS。每个上游尝试最多 3 秒，Direct 的整体解析/连接还受 `connect_milliseconds` 约束；真实 DNS 当前按 Flow/UDP 包查询，不缓存结果。Fake-IP 映射缺失/过期或真实上游返回 Fake-IP 时拒绝连接。
+
+此节的修改需要显式重启 daemon，与 helper 的租约一起重建；节点切换、规则更新和自动故障转移保留该配置。未设置此节时保留普通 SOCKS5/HTTP 代理的系统路由和解析行为。
 
 ## 凭据与证书
 

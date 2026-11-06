@@ -8,10 +8,23 @@ use quinn::{Endpoint, RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub fn client_quic_endpoint(server: SocketAddr) -> std::io::Result<Endpoint> {
-    let bind_ip = match server.ip() {
+    client_quic_endpoint_bound(server, None)
+}
+
+pub fn client_quic_endpoint_bound(
+    server: SocketAddr,
+    source: Option<IpAddr>,
+) -> std::io::Result<Endpoint> {
+    if source.is_some_and(|ip| ip.is_ipv4() != server.is_ipv4()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source/target IP family mismatch",
+        ));
+    }
+    let bind_ip = source.unwrap_or_else(|| match server.ip() {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    };
+    });
     Endpoint::client(SocketAddr::new(bind_ip, 0))
 }
 

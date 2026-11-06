@@ -14,6 +14,7 @@ use std::{
 };
 
 mod managed_proxy;
+mod outbound;
 mod runtime;
 
 #[cfg(test)]
@@ -48,7 +49,7 @@ use rustls::pki_types::ServerName;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{RwLock, watch},
     time::{Instant, MissedTickBehavior, interval, sleep, timeout},
@@ -60,6 +61,7 @@ type AnyError = Box<dyn Error + Send + Sync>;
 const MAX_ACTIVE_FLOW_DETAILS: usize = 256;
 
 struct Args {
+    outbound: outbound::Outbound,
     transport: TransportPreference,
     listen: SocketAddr,
     http_listen: SocketAddr,
@@ -92,10 +94,11 @@ enum DaemonCommand {
 
 #[derive(Clone)]
 struct Remote {
+    outbound: outbound::Outbound,
     _monitors: Option<Arc<MonitorTasks>>,
     tls: TlsClient,
     quic: Arc<RwLock<Option<QuicRemote>>>,
-    udp_config: Option<QuicConnectConfig>,
+    udp_config: Option<NodeConnectConfig>,
     server: SocketAddr,
     server_name: ServerName<'static>,
     credential_id: Arc<str>,
@@ -124,7 +127,8 @@ struct QuicRemote {
 }
 
 #[derive(Clone)]
-struct QuicConnectConfig {
+struct NodeConnectConfig {
+    outbound: outbound::Outbound,
     server: SocketAddr,
     server_name: ServerName<'static>,
     credential_id: Arc<str>,
@@ -509,6 +513,7 @@ async fn main() -> Result<(), AnyError> {
     let roots = load_roots(&config.node.ca_certificate)?;
     let crypto = ClientCrypto::new(roots)?;
     let args = Args {
+        outbound: outbound::Outbound(config.outbound.clone()),
         transport: config.node.preferred_transport,
         listen: config.listen,
         http_listen: config.http_listen,
@@ -552,6 +557,8 @@ async fn main() -> Result<(), AnyError> {
     };
     // Only the desktop-managed process owns the desktop proxy lease.
     let desktop_managed = proxy_lease.is_some();
+    #[cfg(target_os = "linux")]
+    let bound_desktop = desktop_managed && config.outbound.is_some();
     if let Some(path) = proxy_lease {
         let settings = helios_system_proxy::ProxySettings {
             endpoint: helios_system_proxy::ProxyEndpoint::new(
@@ -642,12 +649,30 @@ async fn main() -> Result<(), AnyError> {
             runtime::restore_proxy_after_wake(metrics.clone(), shutdown.subscribe()),
         )
     };
+    #[cfg(target_os = "linux")]
+    let desktop_lifetime = async {
+        if bound_desktop {
+            use std::os::fd::AsFd;
+            let mut pipe = tokio::net::unix::pipe::Receiver::from_owned_fd(
+                std::io::stdin().as_fd().try_clone_to_owned()?,
+            )?;
+            let _ = pipe.read_u8().await;
+            Ok::<(), std::io::Error>(())
+        } else {
+            std::future::pending().await
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let desktop_lifetime = std::future::pending::<std::io::Result<()>>();
     let result = tokio::select! {
         result = listeners => {
             drain_for_shutdown(&shutdown_metrics).await;
             result.map(|_| ())
         },
-        result = shutdown_signal() => {
+        result = async { tokio::select! {
+            result = shutdown_signal() => result,
+            result = desktop_lifetime => result,
+        }} => {
             runtime.close();
             let _ = shutdown.send(true);
             drain_for_shutdown(&shutdown_metrics).await;
@@ -1173,26 +1198,24 @@ async fn build_remote(
     fake_ips: Option<FakeIpPool>,
 ) -> Result<Remote, AnyError> {
     let metrics = Arc::new(DaemonMetrics::new(args.transport));
-    let mut monitors = MonitorTasks(vec![
-        tokio::spawn(monitor_tls(
-            crypto.tls.clone(),
-            args.server,
-            args.server_name.clone(),
-            args.credential_id.clone(),
-            args.token,
-            Duration::from_secs(args.health_probe_seconds),
-            metrics.clone(),
-        ))
-        .abort_handle(),
-    ]);
-    let quic = Arc::new(RwLock::new(None));
-    let quic_config = QuicConnectConfig {
+    let quic_config = NodeConnectConfig {
+        outbound: args.outbound.clone(),
         server: args.server,
         server_name: args.server_name.clone(),
         credential_id: args.credential_id.clone(),
         token: args.token,
         client_config: crypto.quic.clone(),
     };
+    let mut monitors = MonitorTasks(vec![
+        tokio::spawn(monitor_tls(
+            crypto.tls.clone(),
+            quic_config.clone(),
+            Duration::from_secs(args.health_probe_seconds),
+            metrics.clone(),
+        ))
+        .abort_handle(),
+    ]);
+    let quic = Arc::new(RwLock::new(None));
     let udp_config = (args.transport == TransportPreference::Quic).then(|| quic_config.clone());
     if args.transport == TransportPreference::Quic {
         match timeout(
@@ -1236,6 +1259,7 @@ async fn build_remote(
         }
     }
     Ok(Remote {
+        outbound: args.outbound.clone(),
         _monitors: Some(Arc::new(monitors)),
         tls: crypto.tls,
         quic,
@@ -1258,8 +1282,9 @@ async fn probe_tls(
     server_name: &ServerName<'static>,
     credential_id: &str,
     token: &[u8; 32],
+    outbound: &outbound::Outbound,
 ) -> Result<Duration, AnyError> {
-    let tcp = helios_transport::connect_node_tcp(server).await?;
+    let tcp = outbound.node_tcp(server).await?;
     let mut io = client.connect(server_name.clone(), tcp).await?;
     authenticate_client(&mut io, credential_id, token, CAP_TCP_CONNECT).await?;
     Ok(ping(&mut io, 200, b"tls-health").await?)
@@ -1267,10 +1292,7 @@ async fn probe_tls(
 
 async fn monitor_tls(
     client: TlsClient,
-    server: SocketAddr,
-    server_name: ServerName<'static>,
-    credential_id: Arc<str>,
-    token: [u8; 32],
+    config: NodeConnectConfig,
     probe_interval: Duration,
     metrics: Arc<DaemonMetrics>,
 ) {
@@ -1280,7 +1302,14 @@ async fn monitor_tls(
         ticker.tick().await;
         match timeout(
             Duration::from_secs(5),
-            probe_tls(&client, server, &server_name, &credential_id, &token),
+            probe_tls(
+                &client,
+                config.server,
+                &config.server_name,
+                &config.credential_id,
+                &config.token,
+                &config.outbound,
+            ),
         )
         .await
         {
@@ -1307,9 +1336,9 @@ async fn monitor_tls(
 }
 
 async fn establish_quic(
-    config: &QuicConnectConfig,
+    config: &NodeConnectConfig,
 ) -> Result<(QuicRemote, FrameIo<QuicBiStream>), AnyError> {
-    let mut endpoint = helios_transport::client_quic_endpoint(config.server)?;
+    let mut endpoint = config.outbound.quic(config.server)?;
     endpoint.set_default_client_config(config.client_config.clone());
     let connection = endpoint
         .connect(config.server, config.server_name.to_str().as_ref())?
@@ -1335,7 +1364,7 @@ async fn establish_quic(
 
 async fn monitor_quic(
     initial_control: Option<FrameIo<QuicBiStream>>,
-    config: QuicConnectConfig,
+    config: NodeConnectConfig,
     probe_interval: Duration,
     quic_slot: Arc<RwLock<Option<QuicRemote>>>,
     metrics: Arc<DaemonMetrics>,
@@ -1430,8 +1459,8 @@ async fn serve_socks_udp(
     idle_seconds: u64,
 ) -> Result<(), AnyError> {
     let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
-    let direct_socket_v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-    let direct_socket_v6 = UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).await?;
+    let direct_socket_v4 = remote.outbound.udp(false).await.ok();
+    let direct_socket_v6 = remote.outbound.udp(true).await.ok();
     let bound = socket.local_addr()?;
     let proxy = if let Some(config) = remote.udp_config.as_ref() {
         match timeout(
@@ -1521,15 +1550,21 @@ async fn serve_socks_udp(
                 if source.is_none() { source = Some(peer); }
                 if source != Some(peer) { remote.metrics.record_udp_drop(); continue; }
                 idle.as_mut().reset(Instant::now() + Duration::from_secs(idle_seconds));
-                let target = remote.restore_target(packet.target);
+                let target = match remote.restore_target(packet.target) {
+                    Ok(target) => target,
+                    Err(_) => { remote.metrics.record_udp_drop(); continue; },
+                };
                 let action = remote.rules.read().await.decide_for_network(&target, Network::Udp);
                 if action == RouteAction::Reject { remote.metrics.record_udp_drop(); continue; }
                 if action == RouteAction::Direct {
-                    let destination = match &target.address {
-                        helios_protocol::Address::Ip(ip) => SocketAddr::new(*ip, target.port),
-                        helios_protocol::Address::Domain(domain) => match tokio::net::lookup_host((domain.as_str(), target.port)).await?.next() { Some(value) => value, None => { remote.metrics.record_udp_drop(); continue; } },
+                    let destination = match timeout(Duration::from_millis(remote.connect_milliseconds.into()), remote.outbound.resolve(&target)).await {
+                        Ok(Ok(ips)) => SocketAddr::new(ips[0], target.port),
+                        _ => { remote.metrics.record_udp_drop(); continue; },
                     };
-                    let direct_socket = if destination.is_ipv4() { &direct_socket_v4 } else { &direct_socket_v6 };
+                    if remote.protected_listeners.contains(&destination) { remote.metrics.record_udp_drop(); continue; }
+                    let Some(direct_socket) = (if destination.is_ipv4() { &direct_socket_v4 } else { &direct_socket_v6 }) else {
+                        remote.metrics.record_udp_drop(); continue;
+                    };
                     if direct_socket.send_to(&packet.payload, destination).await.is_ok() {
                         remote.metrics.uploaded_bytes.fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
                         active.upload(packet.payload.len());
@@ -1597,7 +1632,7 @@ async fn serve_socks_udp(
                     remote.metrics.record_udp_drop();
                 }
             }
-            result = direct_socket_v4.recv_from(&mut direct_buffer_v4) => {
+            result = outbound::receive(&direct_socket_v4, &mut direct_buffer_v4) => {
                 let (length, peer) = result?;
                 idle.as_mut().reset(Instant::now() + Duration::from_secs(idle_seconds));
                 let target = Target::new(helios_protocol::Address::Ip(peer.ip()), peer.port())?;
@@ -1611,7 +1646,7 @@ async fn serve_socks_udp(
                     remote.metrics.record_udp_drop();
                 }
             }
-            result = direct_socket_v6.recv_from(&mut direct_buffer_v6) => {
+            result = outbound::receive(&direct_socket_v6, &mut direct_buffer_v6) => {
                 let (length, peer) = result?;
                 idle.as_mut().reset(Instant::now() + Duration::from_secs(idle_seconds));
                 let target = Target::new(helios_protocol::Address::Ip(peer.ip()), peer.port())?;
@@ -1656,7 +1691,7 @@ async fn open_udp_association(quic: &QuicRemote) -> Result<(FrameIo<QuicBiStream
 async fn open_tls_udp_association(
     remote: &Remote,
 ) -> Result<(FrameIo<helios_transport::ClientTlsStream<TcpStream>>, u32), AnyError> {
-    let tcp = helios_transport::connect_node_tcp(remote.server).await?;
+    let tcp = remote.outbound.node_tcp(remote.server).await?;
     let mut io = remote.tls.connect(remote.server_name.clone(), tcp).await?;
     authenticate_client(
         &mut io,
@@ -1700,6 +1735,31 @@ async fn serve_socks(
     }
 
     let target = target.ok_or_else(|| AnyError::from("SOCKS CONNECT target is required"))?;
+    if target.port == 54
+        && target.address == helios_protocol::Address::Ip(helios_dns::TUN_DNS)
+        && remote.fake_ips.is_some()
+        && let Some(outbound) = &remote.outbound.0
+    {
+        socks.reply(Socks5Reply::Succeeded).await?;
+        let bytes = serde_json::to_vec(&helios_config::TunDaemonInfo {
+            pid: std::process::id(),
+            outbound: outbound.clone(),
+        })?;
+        let mut stream = socks.into_inner();
+        stream.write_u32(bytes.len().try_into()?).await?;
+        stream.write_all(&bytes).await?;
+        return Ok(());
+    }
+    if remote.outbound.0.is_some()
+        && target.port == 53
+        && target.address == helios_protocol::Address::Ip(helios_dns::TUN_DNS)
+        && let Some(pool) = &remote.fake_ips
+    {
+        socks.reply(Socks5Reply::Succeeded).await?;
+        return helios_dns::serve_tcp(socks.into_inner(), pool.clone())
+            .await
+            .map_err(Into::into);
+    }
     let target_label = target_label(&target);
     let mut remote_stream = match remote.open(target).await {
         Ok(stream) => stream,
@@ -1787,21 +1847,25 @@ fn target_label(target: &Target) -> String {
 }
 
 impl Remote {
-    fn restore_target(&self, target: Target) -> Target {
+    fn restore_target(&self, target: Target) -> std::io::Result<Target> {
         let helios_protocol::Address::Ip(ip) = target.address else {
-            return target;
+            return Ok(target);
         };
-        self.fake_ips
-            .as_ref()
-            .and_then(|pool| pool.lookup_ip(ip))
-            .and_then(|domain| {
-                Target::new(helios_protocol::Address::Domain(domain), target.port).ok()
-            })
-            .unwrap_or(target)
+        if let Some(domain) = self.fake_ips.as_ref().and_then(|pool| pool.lookup_ip(ip)) {
+            return Target::new(helios_protocol::Address::Domain(domain), target.port)
+                .map_err(std::io::Error::other);
+        }
+        if helios_dns::is_fake_ip(ip) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Fake-IP mapping is missing or expired",
+            ));
+        }
+        Ok(target)
     }
 
     async fn open(&self, target: Target) -> Result<RemoteStream, RemoteError> {
-        let target = self.restore_target(target);
+        let target = self.restore_target(target).map_err(RemoteError::Direct)?;
         if self.is_protected_listener(&target) {
             return Err(RemoteError::Rejected);
         }
@@ -1849,14 +1913,7 @@ impl Remote {
     }
 
     async fn open_direct(&self, target: &Target) -> Result<RemoteStream, RemoteError> {
-        let connect = async {
-            match &target.address {
-                helios_protocol::Address::Ip(ip) => TcpStream::connect((*ip, target.port)).await,
-                helios_protocol::Address::Domain(domain) => {
-                    TcpStream::connect((domain.as_str(), target.port)).await
-                }
-            }
-        };
+        let connect = self.outbound.connect(target, &self.protected_listeners);
         match timeout(
             Duration::from_millis(self.connect_milliseconds.into()),
             connect,
@@ -1887,7 +1944,7 @@ impl Remote {
             async {
                 let stage = std::time::Instant::now();
                 debug!(event = "node_connect_stage", stage = "tcp");
-                let tcp = helios_transport::connect_node_tcp(self.server).await?;
+                let tcp = self.outbound.node_tcp(self.server).await?;
                 debug!(
                     event = "node_tcp_connected",
                     elapsed_ms = stage.elapsed().as_millis() as u64
@@ -2447,7 +2504,9 @@ mod tests {
     fn fake_ip_targets_restore_the_original_domain() {
         let pool = FakeIpPool::new(4, Duration::from_secs(60)).unwrap();
         let ip = pool.allocate("blocked.example").unwrap();
+        let ip6 = pool.allocate_v6("blocked.example").unwrap();
         let remote = Remote {
+            outbound: Default::default(),
             _monitors: None,
             tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
             quic: Arc::new(RwLock::new(None)),
@@ -2463,9 +2522,24 @@ mod tests {
             fake_ips: Some(pool),
         };
         assert_eq!(
-            remote.restore_target(Target::new(Address::Ip(IpAddr::V4(ip)), 443).unwrap()),
+            remote
+                .restore_target(Target::new(Address::Ip(IpAddr::V4(ip)), 443).unwrap())
+                .unwrap(),
             Target::new(Address::Domain("blocked.example".into()), 443).unwrap()
         );
+        assert_eq!(
+            remote
+                .restore_target(Target::new(Address::Ip(IpAddr::V6(ip6)), 443).unwrap())
+                .unwrap(),
+            Target::new(Address::Domain("blocked.example".into()), 443).unwrap()
+        );
+        for ip in ["198.18.0.0", "fdfe:dcba:9876::ffff", "::ffff:198.18.0.1"] {
+            assert!(
+                remote
+                    .restore_target(Target::new(Address::Ip(ip.parse().unwrap()), 443).unwrap())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2585,7 +2659,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
 
-        let config = QuicConnectConfig {
+        let config = NodeConnectConfig {
+            outbound: Default::default(),
             server: server_address,
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("desktop-main"),
@@ -2594,6 +2669,7 @@ mod tests {
         };
         let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Quic));
         let remote = Remote {
+            outbound: Default::default(),
             _monitors: None,
             tls: client_crypto.tls,
             quic: Arc::new(RwLock::new(None)),
@@ -2666,85 +2742,109 @@ mod tests {
     async fn direct_socks_udp_works_without_quic() {
         use helios_routing::{RouteAction, RuleConfig};
 
-        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let echo_address = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
-            let mut bytes = [0; 64];
-            let (length, peer) = echo.recv_from(&mut bytes).await.unwrap();
-            echo.send_to(&bytes[..length], peer).await.unwrap();
-        });
-        let remote = Remote {
-            _monitors: None,
-            tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
-            quic: Arc::new(RwLock::new(None)),
-            udp_config: None,
-            server: "127.0.0.1:9".parse().unwrap(),
-            server_name: ServerName::try_from("localhost").unwrap(),
-            credential_id: Arc::from("desktop-main"),
-            token: [0; 32],
-            connect_milliseconds: 100,
-            rules: Arc::new(RwLock::new(
-                RuleSet::new(&[
-                    RuleConfig::IpCidr {
-                        value: "127.0.0.0/8".into(),
-                        action: RouteAction::Direct,
-                    },
-                    RuleConfig::Final {
-                        action: RouteAction::Proxy,
-                    },
-                ])
+        for bind_source in [
+            None,
+            Some(
+                if cfg!(target_os = "linux") {
+                    "127.0.0.2"
+                } else {
+                    "127.0.0.1"
+                }
+                .parse::<IpAddr>()
                 .unwrap(),
-            )),
-            protected_listeners: ["127.0.0.1:1".parse().unwrap(); 3],
-            metrics: Arc::new(DaemonMetrics::new(TransportPreference::Tls)),
-            fake_ips: None,
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            serve_socks(stream, remote, 2, 60).await.unwrap();
-        });
-        let mut control = TcpStream::connect(address).await.unwrap();
-        control.write_all(&[5, 1, 0]).await.unwrap();
-        let mut method = [0; 2];
-        control.read_exact(&mut method).await.unwrap();
-        control
-            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
-            .await
+            ),
+        ] {
+            let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let echo_address = echo.local_addr().unwrap();
+            let echo_task = tokio::spawn(async move {
+                let mut bytes = [0; 64];
+                let (length, peer) = echo.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(
+                    peer.ip(),
+                    bind_source.unwrap_or("127.0.0.1".parse().unwrap())
+                );
+                echo.send_to(&bytes[..length], peer).await.unwrap();
+            });
+            let remote = Remote {
+                outbound: outbound::Outbound(bind_source.map(|source| {
+                    helios_config::OutboundConfig {
+                        source_bypass: vec![source],
+                        dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+                    }
+                })),
+                _monitors: None,
+                tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
+                quic: Arc::new(RwLock::new(None)),
+                udp_config: None,
+                server: "127.0.0.1:9".parse().unwrap(),
+                server_name: ServerName::try_from("localhost").unwrap(),
+                credential_id: Arc::from("desktop-main"),
+                token: [0; 32],
+                connect_milliseconds: 100,
+                rules: Arc::new(RwLock::new(
+                    RuleSet::new(&[
+                        RuleConfig::IpCidr {
+                            value: "127.0.0.0/8".into(),
+                            action: RouteAction::Direct,
+                        },
+                        RuleConfig::Final {
+                            action: RouteAction::Proxy,
+                        },
+                    ])
+                    .unwrap(),
+                )),
+                protected_listeners: ["127.0.0.1:1".parse().unwrap(); 3],
+                metrics: Arc::new(DaemonMetrics::new(TransportPreference::Tls)),
+                fake_ips: None,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_socks(stream, remote, 2, 60).await.unwrap();
+            });
+            let mut control = TcpStream::connect(address).await.unwrap();
+            control.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            control.read_exact(&mut method).await.unwrap();
+            control
+                .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut bound = [0; 10];
+            control.read_exact(&mut bound).await.unwrap();
+            assert_eq!(bound[1], Socks5Reply::Succeeded as u8);
+            let relay_address = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(bound[4], bound[5], bound[6], bound[7])),
+                u16::from_be_bytes([bound[8], bound[9]]),
+            );
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let packet = UdpDatagram {
+                target: Target::new(Address::Ip(echo_address.ip()), echo_address.port()).unwrap(),
+                payload: b"direct".to_vec(),
+            }
+            .encode()
             .unwrap();
-        let mut bound = [0; 10];
-        control.read_exact(&mut bound).await.unwrap();
-        assert_eq!(bound[1], Socks5Reply::Succeeded as u8);
-        let relay_address = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(bound[4], bound[5], bound[6], bound[7])),
-            u16::from_be_bytes([bound[8], bound[9]]),
-        );
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let packet = UdpDatagram {
-            target: Target::new(Address::Ip(echo_address.ip()), echo_address.port()).unwrap(),
-            payload: b"direct".to_vec(),
+            client.send_to(&packet, relay_address).await.unwrap();
+            let mut response = [0; 256];
+            let (length, _) = timeout(Duration::from_secs(2), client.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                UdpDatagram::decode(&response[..length]).unwrap().payload,
+                b"direct"
+            );
+            drop(control);
+            task.await.unwrap();
+            echo_task.await.unwrap();
         }
-        .encode()
-        .unwrap();
-        client.send_to(&packet, relay_address).await.unwrap();
-        let mut response = [0; 256];
-        let (length, _) = timeout(Duration::from_secs(2), client.recv_from(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            UdpDatagram::decode(&response[..length]).unwrap().payload,
-            b"direct"
-        );
-        drop(control);
-        task.await.unwrap();
-        echo_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn socks_udp_association_expires_when_idle() {
         let remote = Remote {
+            outbound: Default::default(),
             _monitors: None,
             tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
             quic: Arc::new(RwLock::new(None)),
@@ -2810,6 +2910,7 @@ mod tests {
                 .unwrap();
         });
         let remote = Remote {
+            outbound: Default::default(),
             _monitors: None,
             tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
             quic: Arc::new(RwLock::new(None)),
@@ -2876,6 +2977,13 @@ mod tests {
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_address = server_listener.local_addr().unwrap();
         let token = [7; 32];
+        let source: IpAddr = if cfg!(target_os = "linux") {
+            "127.0.0.2"
+        } else {
+            "127.0.0.1"
+        }
+        .parse()
+        .unwrap();
 
         let target = tokio::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
@@ -2886,7 +2994,8 @@ mod tests {
         });
         let server = tokio::spawn(async move {
             for _ in 0..2 {
-                let (tcp, _) = server_listener.accept().await.unwrap();
+                let (tcp, peer) = server_listener.accept().await.unwrap();
+                assert_eq!(peer.ip(), source);
                 let mut io = server_tls.accept(tcp).await.unwrap();
                 authenticate_server(&mut io, CAP_TCP_CONNECT, |id| {
                     (id == "desktop-main").then_some(token)
@@ -2908,6 +3017,10 @@ mod tests {
         });
 
         let args = Args {
+            outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+                source_bypass: vec![source],
+                dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+            })),
             transport: TransportPreference::Quic,
             listen: "127.0.0.1:0".parse().unwrap(),
             http_listen: "127.0.0.1:0".parse().unwrap(),
@@ -2988,6 +3101,7 @@ mod tests {
             .unwrap();
         });
         let remote = Remote {
+            outbound: Default::default(),
             _monitors: None,
             tls: client_tls,
             quic: Arc::new(RwLock::new(None)),
@@ -3032,7 +3146,18 @@ mod tests {
         let target_address = target_listener.local_addr().unwrap();
         let protected: SocketAddr = "127.0.0.1:1080".parse().unwrap();
         let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Tls));
+        let source: IpAddr = if cfg!(target_os = "linux") {
+            "127.0.0.2"
+        } else {
+            "127.0.0.1"
+        }
+        .parse()
+        .unwrap();
         let remote = Remote {
+            outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+                source_bypass: vec![source],
+                dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+            })),
             _monitors: None,
             tls: ClientCrypto::new(roots).unwrap().tls,
             quic: Arc::new(RwLock::new(None)),
@@ -3063,7 +3188,8 @@ mod tests {
             fake_ips: None,
         };
         let target = tokio::spawn(async move {
-            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let (mut stream, peer) = target_listener.accept().await.unwrap();
+            assert_eq!(peer.ip(), source);
             let mut request = [0; 6];
             stream.read_exact(&mut request).await.unwrap();
             assert_eq!(&request, b"direct");

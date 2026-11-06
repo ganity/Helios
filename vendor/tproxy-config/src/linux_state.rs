@@ -26,7 +26,7 @@ pub(super) mod routes {
     };
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
-    struct BoundedVec<T, const LIMIT: usize>(Vec<T>);
+    pub(super) struct BoundedVec<T, const LIMIT: usize>(pub(super) Vec<T>);
 
     impl<'de, T: Deserialize<'de>, const LIMIT: usize> Deserialize<'de> for BoundedVec<T, LIMIT> {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -110,6 +110,46 @@ pub(super) mod routes {
     }
 }
 
+#[cfg(any(feature = "unsafe-state-file", feature = "secure-state-file"))]
+pub(super) mod rules {
+    use super::routes::BoundedVec;
+    use rtnetlink::{
+        packet_core::{Emitable, Parseable},
+        packet_route::rule::RuleMessage,
+    };
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(
+        rules: &[RuleMessage],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if rules.len() > 32 || rules.iter().any(|rule| rule.buffer_len() > 4096) {
+            return Err(serde::ser::Error::custom(
+                "recovery rules exceed record limits",
+            ));
+        }
+        let encoded: Vec<Vec<u8>> = rules
+            .iter()
+            .map(|rule| {
+                let mut bytes = vec![0; rule.buffer_len()];
+                rule.emit(&mut bytes);
+                bytes
+            })
+            .collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<RuleMessage>, D::Error> {
+        BoundedVec::<BoundedVec<u8, 4096>, 32>::deserialize(deserializer)?
+            .0
+            .into_iter()
+            .map(|bytes| RuleMessage::parse(bytes.0.as_slice()).map_err(D::Error::custom))
+            .collect()
+    }
+}
+
 #[cfg(all(
     test,
     any(feature = "unsafe-state-file", feature = "secure-state-file")
@@ -133,6 +173,19 @@ mod tests {
         let state = TproxyStateInner {
             restore_routes: vec![route.clone()],
             remove_routes: vec![ipv6.clone()],
+            remove_rules: vec![{
+                use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
+                let mut rule = RuleMessage::default();
+                rule.header.family = rtnetlink::packet_route::AddressFamily::Inet6;
+                rule.header.action = RuleAction::ToTable;
+                rule.header.src_len = 128;
+                rule.attributes = vec![
+                    RuleAttribute::Source("2001:db8::1".parse().unwrap()),
+                    RuleAttribute::Priority(20220),
+                    RuleAttribute::Table(254),
+                ];
+                rule
+            }],
             restore_socket_fwmark: vec![
                 FwmarkRestore {
                     ip_version: IpVersion::V4,
@@ -151,7 +204,16 @@ mod tests {
         let restored: TproxyStateInner = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored.restore_routes, [route]);
         assert_eq!(restored.remove_routes, [ipv6]);
+        assert_eq!(restored.remove_rules, state.remove_rules);
         assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("remove_rules");
+        assert!(
+            serde_json::from_value::<TproxyStateInner>(legacy)
+                .unwrap()
+                .remove_rules
+                .is_empty()
+        );
         let mut corrupt = serde_json::to_value(&state).unwrap();
         corrupt["restore_routes"] = serde_json::json!([[1, 2, 3]]);
         assert!(serde_json::from_value::<TproxyStateInner>(corrupt).is_err());
@@ -161,6 +223,18 @@ mod tests {
         let mut corrupt = serde_json::to_value(&state).unwrap();
         corrupt["remove_routes"] = serde_json::json!([vec![0u8; 65537]]);
         assert!(serde_json::from_value::<TproxyStateInner>(corrupt).is_err());
+        let mut corrupt = serde_json::to_value(&state).unwrap();
+        corrupt["remove_rules"] = serde_json::json!([[1, 2, 3]]);
+        assert!(serde_json::from_value::<TproxyStateInner>(corrupt).is_err());
+        let mut corrupt = serde_json::to_value(&state).unwrap();
+        corrupt["remove_rules"] = serde_json::json!([vec![0u8; 4097]]);
+        assert!(serde_json::from_value::<TproxyStateInner>(corrupt).is_err());
+        let mut corrupt = serde_json::to_value(&state).unwrap();
+        corrupt["remove_rules"] = serde_json::json!(vec![Vec::<u8>::new(); 33]);
+        assert!(serde_json::from_value::<TproxyStateInner>(corrupt).is_err());
+        let mut oversized = state.clone();
+        oversized.remove_rules = vec![state.remove_rules[0].clone(); 33];
+        assert!(serde_json::to_vec(&oversized).is_err());
         let mut oversized = state.clone();
         oversized.restore_routes =
             vec![rtnetlink::packet_route::route::RouteMessage::default(); 4097];

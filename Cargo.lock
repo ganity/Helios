@@ -1980,6 +1980,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "tproxy-config",
  "tray-icon",
  "zbus",
 ]
@@ -2051,6 +2052,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "getrandom 0.4.3",
  "helios-config",
  "helios-control",
  "helios-dns",
@@ -2059,9 +2061,11 @@ dependencies = [
  "helios-routing",
  "helios-system-proxy",
  "helios-transport",
+ "hickory-proto",
  "quinn",
  "rcgen",
  "rustls",
+ "serde_json",
  "subtle",
  "thiserror 2.0.21",
  "tokio",
@@ -2085,10 +2089,16 @@ dependencies = [
 name = "helios-helper"
 version = "0.1.0"
 dependencies = [
+ "helios-config",
+ "helios-dns",
+ "hickory-proto",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tproxy-config",
+ "tracing-subscriber",
+ "tun",
  "tun2proxy",
 ]
 
@@ -4845,6 +4855,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]
@@ -4979,8 +4990,6 @@ dependencies = [
 [[package]]
 name = "tun2proxy"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c0c4cb74f5f7df1bdbe11ee8a8ec0202603e1caa5db51f0f757bc92c8886799"
 dependencies = [
  "android_logger",
  "async-trait",

@@ -170,16 +170,18 @@ impl Runtime {
             || config.control_socket != old.control_socket
             || config.control_pipe != old.control_pipe
             || config.control_token_file != old.control_token_file
+            || config.outbound != old.outbound
             || config.dns != old.dns
             || config.timeouts != old.timeouts
         {
             return Err(
-                "listener, DNS, control identity or timeout changes require a daemon restart"
+                "listener, DNS, outbound binding, control identity or timeout changes require a daemon restart"
                     .into(),
             );
         }
         let updated_rules = RuleSet::new(&config.rules)?;
         let args = Args {
+            outbound: outbound::Outbound(config.outbound.clone()),
             transport: config.node.preferred_transport,
             listen: config.listen,
             http_listen: config.http_listen,
@@ -207,6 +209,7 @@ impl Runtime {
                 &args.server_name,
                 &args.credential_id,
                 &args.token,
+                &args.outbound,
             ),
         )
         .await;
@@ -428,6 +431,7 @@ mod tests {
             control_token_file: None,
             proxy_bypass: vec![],
             dns: None,
+            outbound: None,
             node: first,
             backup_nodes: Vec::new(),
             rules: vec![RuleConfig::Final {
@@ -436,6 +440,7 @@ mod tests {
             timeouts: Default::default(),
         };
         let args = Args {
+            outbound: Default::default(),
             transport: TransportPreference::Tls,
             listen: config.listen,
             http_listen: config.http_listen,
@@ -512,6 +517,24 @@ mod tests {
         );
         assert_eq!(runtime.snapshot().await.config_revision, 2);
         assert_eq!(runtime.snapshot().await.active_server, Some(second.server));
+        #[cfg(target_os = "linux")]
+        {
+            let mut changed_binding = next.clone();
+            changed_binding.outbound = Some(helios_config::OutboundConfig {
+                source_bypass: vec!["192.0.2.1".parse().unwrap()],
+                dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
+            });
+            assert!(
+                runtime
+                    .apply(2, changed_binding)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("restart")
+            );
+            assert_eq!(runtime.snapshot().await.config_revision, 2);
+            assert_eq!(runtime.config().await.outbound, None);
+        }
         let mut changed_listener = next;
         changed_listener.listen.set_port(11080);
         assert!(

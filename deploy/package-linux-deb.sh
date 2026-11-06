@@ -22,9 +22,41 @@ trap cleanup 0
 trap 'exit 1' HUP INT TERM
 chmod 0755 "$stage"
 install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/512x512/apps"
-for name in helios-client helios-daemon helios-helper heliosctl; do
+for name in helios-client helios-daemon heliosctl; do
     install -m 0755 "$build_dir/$name" "$stage/usr/bin/$name"
 done
+install -d "$stage/usr/libexec" "$stage/usr/share/polkit-1/actions" "$stage/usr/lib/systemd/system"
+install -m 0755 "$build_dir/helios-helper" "$stage/usr/libexec/helios-helper"
+ln -s ../libexec/helios-helper "$stage/usr/bin/helios-helper"
+install -m 0644 "$script_dir/com.helios.tun.policy" "$stage/usr/share/polkit-1/actions/com.helios.tun.policy"
+install -m 0644 "$script_dir/helios-tun-recover.service" "$stage/usr/lib/systemd/system/helios-tun-recover.service"
+cat >"$stage/DEBIAN/postinst" <<'POSTINST'
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && command -v systemctl >/dev/null && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable helios-tun-recover.service
+fi
+POSTINST
+cat >"$stage/DEBIAN/prerm" <<'PRERM'
+#!/bin/sh
+set -e
+# An active helper may still own the routes. Refuse removing its recovery executable.
+if [ "$1" = remove ] && [ -f /var/lib/helios/tun-route-lease.json ]; then
+    /usr/libexec/helios-helper --desktop-recover
+fi
+if [ "$1" = remove ] && command -v systemctl >/dev/null && [ -d /run/systemd/system ]; then
+    systemctl disable helios-tun-recover.service
+fi
+PRERM
+cat >"$stage/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+if command -v systemctl >/dev/null && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi
+POSTRM
+chmod 0755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
 install -m 0644 "$script_dir/helios-client.desktop" "$stage/usr/share/applications/helios-client.desktop"
 install -m 0644 "$script_dir/../assets/helios-icon-512.png" "$stage/usr/share/icons/hicolor/512x512/apps/helios.png"
 {
@@ -35,7 +67,7 @@ install -m 0644 "$script_dir/../assets/helios-icon-512.png" "$stage/usr/share/ic
     echo 'Architecture: '"$architecture"
     echo 'Maintainer: Helios'
     echo 'Description: Helios encrypted network desktop client'
-    echo 'Depends: libc6, libgcc-s1, libegl1, libgl1, libwayland-client0, libx11-6, libxkbcommon0'
+    echo 'Depends: libc6, libgcc-s1, libegl1, libgl1, libwayland-client0, libx11-6, libxkbcommon0, polkitd, pkexec'
 } >"$stage/DEBIAN/control"
 package="$output_dir/helios_${architecture}.deb"
 if [ -e "$package" ]; then

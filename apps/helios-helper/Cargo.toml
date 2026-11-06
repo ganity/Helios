@@ -6,8 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+helios-config = { path = "../../crates/helios-config" }
+hickory-proto.workspace = true
+helios-dns = { path = "../../crates/helios-dns" }
 serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 toml.workspace = true
+tracing-subscriber.workspace = true
 tproxy-config = { workspace = true, features = ["secure-state-file"] }
 tun2proxy = { version = "=0.8.3", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun = { version = "=0.8.14", features = ["async"] }

@@ -10,7 +10,7 @@
 
 ## 当前阶段
 
-桌面客户端与数据面集成验证，进行中；Linux 基础客户端可构建和安装，尚非完整桌面 VPN/TUN 产品。
+Linux TUN 的桌面开关、提权、出口/DNS 同步、运行监视、异常恢复与系统组件分发已接通；真实 TUN、真实 pkexec/polkit 和桌面状态机在隔离容器通过，详见 [Linux TUN 实现与进度](15-linux-tun-implementation.md)。跨发行版与物理桌面环境验证继续进行。
 
 2026-11-02：已修复真实 VPS 链路在 TCP 半关闭后出现的 TLS `close_notify` 截断故障，
 更新服务端并验证 SOCKS5/HTTP CONNECT 的公网 HTTPS 请求。复现证据、修复边界与当前机器使用方法见
@@ -21,7 +21,7 @@
 系统写入及回读验证成功后显示开启，并定期检查外部改动，失败后保留恢复责任。
 Linux 真实 GNOME Lease + 全新 Chrome 配置已验证无浏览器代理参数的 Google HTTP 200、
 页面标题与原设置精确恢复；浏览器测试显式选择运行，普通测试默认忽略。中英文、较小窗口的
-Xvfb 截图检查和默认测试通过，Linux TUN 仍未实现，不将禁用开关计为可用功能。见
+Xvfb 截图检查和默认测试通过；后续 Linux TUN 已开放桌面开关并补齐授权接口、真实数据面与恢复检查。见
 [Linux 客户端日常使用](09-linux-client.md)。
 
 ## 已完成
@@ -121,4 +121,4 @@ Linux 客户端已加入正式 egui 构建：共用节点、规则和监控，�
 - Windows Named Pipe 尚缺 Windows 编译与真机 ACL 验证；本机交叉检查在 `ring` 构建脚本阶段停止。
 - TUN helper 的 Windows/macOS 真机授权、真实流量与强杀恢复验证；当前已具备受保护路由租约与陈旧心跳恢复命令，但尚未在真实平台证明所有系统版本的路由/DNS恢复行为。Windows GNU 交叉检查还受本机缺少 `x86_64-w64-mingw32-gcc` 阻塞。
 
-以上项目未完成前，Helios 不能作为完整桌面 VPN/TUN 产品使用。SOCKS5 UDP 已支持 QUIC datagram 和 TLS framed stream 回退；QUIC datagram 单包仍受路径 MTU 限制。Linux TUN 和 KDE 自动系统代理尚未实现。
+以上项目未完成前，Helios 不能作为完整桌面 VPN/TUN 产品使用。SOCKS5 UDP 已支持 QUIC datagram 和 TLS framed stream 回退；QUIC datagram 单包仍受路径 MTU 限制。Linux TUN 已接通，范围见当前阶段；KDE 自动系统代理尚未实现。

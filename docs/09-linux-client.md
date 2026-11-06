@@ -41,13 +41,18 @@ HELIOS_REAL_BROWSER_TEST=1 cargo test -p helios-system-proxy \
 和[根据系统实际状态显示开关](https://github.com/clash-verge-rev/clash-verge-rev/blob/dev/src/hooks/use-system-proxy-state.ts)的做法；
 未引入 Clash 内核。系统代理和 TUN 是不同的接管方式，不需要同时开启。
 
-**Linux 虚拟网卡尚未完成**：现有 helper 未接入 Linux 持久恢复，界面明确禁用该开关。
-这不是可用的 TUN 实现，不能把此次系统代理验收当成 TUN 验收；不应为了点亮开关绕过路由/DNS 恢复保护。
+**Linux 虚拟网卡已接入桌面**：固定的 root helper 通过 pkexec/polkit 授权，自动同步 daemon 出口与 DNS；真实 TUN 自检通过后显示开启。支持静态 resolver 和无竞争域的 systemd-resolved stub，关闭、退出、异常和网络变化会触发恢复。实现与验证范围见 [Linux TUN 实现与进度](15-linux-tun-implementation.md)。
+
+Debian 包已包含系统组件。源码或便携方式首次使用需安装固定 helper、授权策略和恢复服务；桌面仍以普通用户运行：
+
+```sh
+sudo sh deploy/install-linux-tun.sh target/release
+```
 
 ## 构建运行
 
 ```sh
-cargo build --release -p helios-client -p helios-daemon -p heliosctl
+cargo build --release -p helios-client -p helios-daemon -p helios-helper -p heliosctl
 ./target/release/helios-client
 ```
 
@@ -75,7 +80,7 @@ sh deploy/install-linux-client.sh target/release
 sh deploy/package-linux-client.sh target/release target/linux-package
 ```
 
-输出 `helios-linux-<架构>.tar.gz`，含三个二进制、安装脚本、说明和包内校验清单；已有同名包时拒绝覆盖。解包后先 `sha256sum -c SHA256SUMS`，再执行 `sh install-linux-client.sh .`。该包依赖构建机兼容的 glibc/图形运行库，不是跨发行版静态包；校验和不是签名，尚未提供正式签名发行。
+输出 `helios-linux-<架构>.tar.gz`，含四个二进制、用户安装/系统 TUN 安装脚本、授权策略、恢复服务、说明和包内校验清单；已有同名包时拒绝覆盖。解包后先 `sha256sum -c SHA256SUMS`，再执行 `sh install-linux-client.sh .`。该包依赖构建机兼容的 glibc/图形运行库，不是跨发行版静态包；校验和不是签名，尚未提供正式签名发行。
 
 ## 系统代理与边界
 
@@ -87,7 +92,7 @@ UI 运行期间每两秒检查自有 daemon；确认 daemon 退出且系统代�
 
 启用 Helios 时将 GNOME 模式改为 manual；关闭后恢复先前模式（包括 PAC/auto）及 HTTP 认证开关。PAC URL 和既有 SOCKS 端点不被改写，因此非 HTTP/HTTPS 应用仍可能使用既有 SOCKS；此开关不承诺接管它们。
 
-可在同一桌面用户会话运行 `helios-daemon recover-network` 恢复 Helios 持有的系统代理租约。Linux TUN 的授权、路由租约与恢复暂未接入桌面。GNOME 适配有单元检查，真实桌面应用与崩溃恢复仍需真机验证。
+可在同一桌面用户会话运行 `helios-daemon recover-network` 恢复 Helios 持有的系统代理租约。Linux TUN 由桌面管道停止并等待路由/DNS 恢复；残留状态可再次通过虚拟网卡开关请求授权恢复。GNOME 适配有单元检查，真实桌面应用与崩溃恢复仍需真机验证。
 
 ## 系统托盘
 
@@ -100,7 +105,7 @@ env HELIOS_ISOLATED_TRAY_TEST=1 dbus-run-session -- \
   cargo test -p helios-client isolated_sni_registration_activation_and_host_loss -- --ignored
 ```
 
-注意：`helios-helper --recover` 在 Linux 明确返回不支持并保留状态文件；上游 Linux 路由状态目前只驻内存，不能把该命令当作强杀后的恢复工具。桌面 TUN 开关在持久恢复能力补齐前保持禁用。
+注意：当前 `helios-helper --recover` 已接入 Linux 受保护日志恢复；旧版仅有内存状态的说明不再适用于当前源码。隔离测试已覆盖真实流量、桌面状态机、真实 pkexec/polkit、授权拒绝、退出与强杀恢复。不要把特定宿主的 DNS 管理模式或认证代理外观视为已经逐一验收。
 
 ## 隔离代理集成测试
 

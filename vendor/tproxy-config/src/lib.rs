@@ -17,6 +17,14 @@ pub use {private_ip::is_private_ip, tproxy_args::TproxyArgs};
 
 pub use cidr::IpCidr;
 
+#[cfg(target_os = "linux")]
+pub use linux::resolver::check_resolver as check_linux_resolver;
+#[cfg(all(target_os = "linux", feature = "secure-state-file"))]
+pub use linux::{
+    monitor::{check_active as check_linux_tun, uplink_snapshot as linux_uplink_snapshot},
+    resolver::upstreams as linux_dns_upstreams,
+};
+
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub use common::{tproxy_remove, tproxy_setup};
 
@@ -144,12 +152,21 @@ pub(crate) struct TproxyStateInner {
         serde(default)
     )]
     pub(crate) linux_context: Option<linux::recovery::Context>,
+    #[cfg(all(target_os = "linux", feature = "secure-state-file"))]
+    #[serde(default)]
+    pub(crate) linux_resolved: Option<linux::resolved::Lease>,
     #[cfg(target_os = "linux")]
     #[cfg_attr(
         any(feature = "unsafe-state-file", feature = "secure-state-file"),
         serde(default)
     )]
     pub(crate) applied_resolvconf_content: Option<Vec<u8>>,
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        any(feature = "unsafe-state-file", feature = "secure-state-file"),
+        serde(default, with = "linux_state::rules")
+    )]
+    pub(crate) remove_rules: Vec<rtnetlink::packet_route::rule::RuleMessage>,
     pub(crate) tproxy_args: Option<TproxyArgs>,
     pub(crate) original_dns_servers: Option<Vec<IpAddr>>,
     pub(crate) gateway: Option<IpAddr>,

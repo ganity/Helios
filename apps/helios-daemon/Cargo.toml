@@ -14,9 +14,12 @@ helios-proxy = { path = "../../crates/helios-proxy" }
 helios-routing = { path = "../../crates/helios-routing" }
 helios-system-proxy = { path = "../../crates/helios-system-proxy" }
 helios-transport = { path = "../../crates/helios-transport" }
+getrandom.workspace = true
+hickory-proto.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 subtle.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls.workspace = true
