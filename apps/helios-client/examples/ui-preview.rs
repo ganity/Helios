@@ -19,7 +19,7 @@ mod preview {
             }
         }
         let directory = std::env::temp_dir().join(format!("helios-preview-{}", std::process::id()));
-        let profile = DesktopProfile {
+        let mut profile = DesktopProfile {
             auto_start_daemon: false,
             daemon_binary: directory.join("missing-daemon"),
             daemon_config: directory.join("daemon.toml"),
@@ -27,21 +27,42 @@ mod preview {
             helper_config: directory.join("helper.toml"),
             ..Default::default()
         };
+        let mut ipv6 = profile.nodes[0].clone();
+        ipv6.name = "IPv6 VPS · Toronto".into();
+        ipv6.server = "[2a12:bec0:16e:6d0::]:24443".into();
+        profile.nodes.push(ipv6);
         eframe::run_native(
             "Helios UI preview",
             eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    .with_inner_size([660.0, 660.0])
-                    .with_min_inner_size([520.0, 540.0]),
+                    .with_inner_size([980.0, 760.0])
+                    .with_min_inner_size([760.0, 600.0]),
                 renderer: eframe::Renderer::Glow,
                 ..Default::default()
             },
             Box::new(move |cc| {
                 configure_style(&cc.egui_ctx);
-                Ok(Box::new(Preview(
-                    HeliosApp::from_profile(directory.join("desktop.json"), profile),
-                    Instant::now(),
-                )))
+                let mut app = HeliosApp::from_profile(directory.join("desktop.json"), profile);
+                match std::env::var("HELIOS_PREVIEW_PAGE").as_deref() {
+                    Ok("nodes") => app.page = Page::Node,
+                    Ok("rules") => app.page = Page::Rules,
+                    Ok("diagnostics") => app.page = Page::Diagnostics,
+                    Ok("settings") => app.page = Page::Settings,
+                    _ => {}
+                }
+                if std::env::var_os("HELIOS_PREVIEW_IMPORT").is_some() {
+                    app.page = Page::Node;
+                    app.open_node_import = true;
+                }
+                if std::env::var_os("HELIOS_PREVIEW_EDITOR").is_some() {
+                    app.page = Page::Node;
+                    app.node_editor = Some(NodeEditor {
+                        index: Some(0),
+                        node: app.profile.nodes[0].clone(),
+                        error: None,
+                    });
+                }
+                Ok(Box::new(Preview(app, Instant::now())))
             }),
         )
         .map_err(|error| std::io::Error::other(error.to_string()).into())

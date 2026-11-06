@@ -44,13 +44,15 @@ use helios_client_model::{
     parse_proxy_bypass, parse_rules, render_rules, save_profile, test_route_for_network,
     tun_status_file, tun_stop_file,
 };
-const BG: Color32 = Color32::from_rgb(11, 15, 18);
-const PANEL: Color32 = Color32::from_rgb(18, 24, 28);
-const PANEL_2: Color32 = Color32::from_rgb(24, 31, 36);
-const TEXT: Color32 = Color32::from_rgb(222, 230, 227);
-const MUTED: Color32 = Color32::from_rgb(126, 143, 143);
-const ACCENT: Color32 = Color32::from_rgb(224, 255, 86);
-const GOOD: Color32 = Color32::from_rgb(79, 214, 151);
+const BG: Color32 = Color32::from_rgb(16, 23, 21);
+const SIDEBAR: Color32 = Color32::from_rgb(11, 18, 16);
+const PANEL: Color32 = Color32::from_rgb(22, 32, 27);
+const PANEL_2: Color32 = Color32::from_rgb(28, 41, 31);
+const LINE: Color32 = Color32::from_rgb(41, 52, 44);
+const TEXT: Color32 = Color32::from_rgb(237, 241, 232);
+const MUTED: Color32 = Color32::from_rgb(152, 166, 155);
+const ACCENT: Color32 = Color32::from_rgb(212, 247, 130);
+const GOOD: Color32 = Color32::from_rgb(140, 214, 173);
 const WARN: Color32 = Color32::from_rgb(255, 177, 66);
 const BAD: Color32 = Color32::from_rgb(255, 94, 94);
 const TRAY_ICON: &[u8] = include_bytes!(concat!(
@@ -74,8 +76,8 @@ pub fn run() -> Result<(), AnyError> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(t("Helios · 曜光"))
-            .with_inner_size([660.0, 660.0])
-            .with_min_inner_size([520.0, 540.0])
+            .with_inner_size([980.0, 760.0])
+            .with_min_inner_size([760.0, 600.0])
             .with_icon(eframe::icon_data::from_png_bytes(APP_ICON)?),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -114,15 +116,20 @@ const TRAY_TOGGLE_DAEMON: &str = "toggle-daemon";
 #[cfg(any(windows, target_os = "macos"))]
 const TRAY_QUIT: &str = "quit";
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Overview,
     Node,
     Rules,
-    Dns,
-    Connections,
-    Logs,
+    Diagnostics,
     Settings,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DiagnosticTab {
+    Connections,
+    Dns,
+    Logs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,9 +171,15 @@ enum ProbeState {
     Failed(String),
 }
 
+struct NodeEditor {
+    index: Option<usize>,
+    node: NodeProfile,
+    error: Option<String>,
+}
+
 struct HeliosApp {
     page: Page,
-    advanced: bool,
+    diagnostic_tab: DiagnosticTab,
     connecting_since: Option<Instant>,
     profile_path: PathBuf,
     profile: DesktopProfile,
@@ -177,7 +190,9 @@ struct HeliosApp {
     rule_test_network: Network,
     connection_link_text: String,
     node_exchange_text: String,
-    open_node_editor: bool,
+    open_node_import: bool,
+    node_editor: Option<NodeEditor>,
+    node_filter: String,
     status: Option<StatusSnapshot>,
     status_error: Option<String>,
     last_traffic: Option<(Instant, u64, u64)>,
@@ -251,7 +266,7 @@ impl HeliosApp {
         let (event_tx, events) = mpsc::channel();
         Self {
             page: Page::Overview,
-            advanced: false,
+            diagnostic_tab: DiagnosticTab::Connections,
             connecting_since: None,
             profile_path,
             profile,
@@ -262,7 +277,9 @@ impl HeliosApp {
             rule_test_network: Network::Tcp,
             connection_link_text: String::new(),
             node_exchange_text: String::new(),
-            open_node_editor: false,
+            open_node_import: false,
+            node_editor: None,
+            node_filter: String::new(),
             status: None,
             status_error: None,
             last_traffic: None,
@@ -581,14 +598,13 @@ impl HeliosApp {
         };
         let mut profile = self.profile.clone();
         profile.nodes.push(node);
-        profile.active_node = profile.nodes.len() - 1;
         match save_profile(&self.profile_path, &profile) {
             Ok(()) => {
                 self.profile = profile;
                 self.probes.push(ProbeState::Untested);
                 self.connection_link_text.clear();
-                self.open_node_editor = false;
-                self.notice = Some((t("连接链接已导入，点击“应用配置”生效").into(), true));
+                self.node_editor = None;
+                self.notice = Some((t("节点链接已导入；选择“切换”后使用").into(), true));
             }
             Err(error) => self.notice = Some((error.to_string(), false)),
         }
@@ -1071,55 +1087,71 @@ impl HeliosApp {
     }
 
     fn content(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("navigation")
+            .exact_size(190.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(SIDEBAR)
+                    .inner_margin(Margin::symmetric(16, 26)),
+            )
+            .show(ui, |ui| self.navigation(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(24)))
+            .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| {
-                self.navigation(ui);
+                self.topbar(ui);
                 ui.separator();
                 if let Some((message, success)) = &self.notice {
                     let mut dismiss = false;
-                    ui.horizontal_top(|ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("notice")
-                            .max_height(64.0)
-                            .show(ui, |ui| {
-                                ui.set_width((ui.available_width() - 48.0).max(40.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(i18n::message(message)).color(if *success {
+                    egui::Frame::new()
+                        .fill(if *success {
+                            Color32::from_rgb(29, 49, 35)
+                        } else {
+                            Color32::from_rgb(55, 36, 29)
+                        })
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(14, 9))
+                        .outer_margin(Margin::symmetric(30, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [ui.available_width() - 36.0, 0.0],
+                                    egui::Label::new(RichText::new(i18n::message(message)).color(
+                                        if *success {
                                             GOOD
                                         } else {
-                                            BAD
-                                        }),
-                                    )
+                                            Color32::from_rgb(239, 184, 139)
+                                        },
+                                    ))
                                     .wrap(),
                                 );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    dismiss =
+                                        ui.small_button("×").on_hover_text(t("关闭提示")).clicked();
+                                });
                             });
-                        dismiss = ui.small_button("×").on_hover_text(t("关闭提示")).clicked();
-                    });
+                        });
                     if dismiss {
                         self.notice = None;
                     }
-                    ui.add_space(6.0);
                 }
                 egui::ScrollArea::vertical()
                     .id_salt(self.page as u8)
-                    .scroll_bar_visibility(if self.page == Page::Overview {
-                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-                    } else {
-                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
-                    })
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.page {
-                        Page::Overview => self.overview(ui),
-                        Page::Node => self.node(ui),
-                        Page::Rules => self.rules(ui),
-                        Page::Dns => self.dns(ui),
-                        Page::Connections => self.connections(ui),
-                        Page::Logs => self.logs(ui),
-                        Page::Settings => self.settings(ui),
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(Margin::symmetric(30, 26))
+                            .show(ui, |ui| match self.page {
+                                Page::Overview => self.overview(ui),
+                                Page::Node => self.node(ui),
+                                Page::Rules => self.rules(ui),
+                                Page::Diagnostics => self.diagnostics(ui),
+                                Page::Settings => self.settings(ui),
+                            });
                     });
             });
+        self.node_dialogs(ui.ctx());
     }
 }
 
@@ -1133,7 +1165,10 @@ impl eframe::App for HeliosApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.page == Page::Logs && self.last_log_refresh.elapsed() >= Duration::from_secs(2) {
+        if self.page == Page::Diagnostics
+            && self.diagnostic_tab == DiagnosticTab::Logs
+            && self.last_log_refresh.elapsed() >= Duration::from_secs(2)
+        {
             self.refresh_logs();
         }
         if ui.ctx().input(|input| input.viewport().close_requested()) && !self.exit_requested {
@@ -1167,9 +1202,8 @@ impl HeliosApp {
     fn update_tray_traffic(&self) {
         if let Some(tray) = &self._tray {
             let proxy = self.system_proxy_enabled && self.system_proxy_verified;
-            let connected = (proxy || self.tun_enabled)
-                && self.connecting_since.is_none()
-                && self.status.as_ref().is_some_and(node_ready);
+            let connected =
+                tray_connection_active(proxy, self.tun_enabled, self.connecting_since.is_some());
             tray_display::update(tray, connected, self.upload_rate, self.download_rate);
             let (label, _) = connection_label(
                 self.status.as_ref(),
@@ -1217,241 +1251,400 @@ impl HeliosApp {
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(t("Helios · 曜光"))
-                    .size(20.0)
-                    .strong()
-                    .color(ACCENT),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let previous = self.profile.language;
-                ui.selectable_value(&mut self.profile.language, Language::English, "English");
-                ui.selectable_value(&mut self.profile.language, Language::Chinese, "中文");
-                if previous != self.profile.language {
-                    i18n::set_language(self.profile.language);
-                    #[cfg(target_os = "linux")]
-                    if let Some(tray) = &self.linux_tray {
-                        tray.refresh_menu();
-                    }
-                    #[cfg(any(windows, target_os = "macos"))]
-                    {
-                        self._tray = create_tray().ok();
-                        #[cfg(target_os = "macos")]
-                        self.update_tray_traffic();
-                    }
-                    if let Err(error) = save_profile(&self.profile_path, &self.profile) {
-                        self.notice = Some((error.to_string(), false));
-                    }
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Title(t("Helios · 曜光").into()));
-                }
+            icon(ui, Icon::Sun, 29.0, ACCENT);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("helios").size(22.0).strong().color(TEXT));
+                ui.label(RichText::new(t("曜光 · 自由连接")).size(9.0).color(MUTED));
             });
         });
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(self.page == Page::Overview, t("连接"))
-                .clicked()
-            {
-                self.page = Page::Overview;
-                self.advanced = false;
-            }
-            if ui
-                .selectable_label(self.page == Page::Node, t("节点"))
-                .clicked()
-            {
-                self.page = Page::Node;
-                self.advanced = false;
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.selectable_label(self.advanced, t("高级设置")).clicked() {
-                    self.advanced = !self.advanced;
-                    self.page = if self.advanced {
-                        Page::Settings
-                    } else {
-                        Page::Overview
-                    };
-                }
-            });
-        });
-        if self.advanced {
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.page, Page::Settings, t("设置"));
-                ui.selectable_value(&mut self.page, Page::Rules, t("分流规则"));
-                ui.selectable_value(&mut self.page, Page::Dns, "DNS");
-                ui.selectable_value(&mut self.page, Page::Connections, t("连接记录"));
-                ui.selectable_value(&mut self.page, Page::Logs, t("日志"));
-            });
+        ui.add_space(34.0);
+        nav_group_label(ui, t("工作空间"));
+        if nav_button(ui, t("连接概览"), self.page == Page::Overview, Icon::Home) {
+            self.page = Page::Overview;
         }
+        if nav_button(ui, t("我的节点"), self.page == Page::Node, Icon::Nodes) {
+            self.page = Page::Node;
+        }
+        ui.add_space(22.0);
+        nav_group_label(ui, t("网络配置"));
+        if nav_button(ui, t("分流规则"), self.page == Page::Rules, Icon::Rules) {
+            self.page = Page::Rules;
+        }
+        ui.add_space(22.0);
+        nav_group_label(ui, t("运行与诊断"));
+        if nav_button(
+            ui,
+            t("诊断"),
+            self.page == Page::Diagnostics,
+            Icon::Activity,
+        ) {
+            self.page = Page::Diagnostics;
+        }
+        ui.add_space((ui.available_height() - 126.0).max(24.0));
+        if nav_button(ui, t("设置"), self.page == Page::Settings, Icon::Settings) {
+            self.page = Page::Settings;
+        }
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            dot(ui, if self.status.is_some() { GOOD } else { MUTED });
+            ui.label(
+                RichText::new(if self.status.is_some() {
+                    t("后台服务运行中")
+                } else {
+                    t("后台服务未运行")
+                })
+                .size(11.0)
+                .color(MUTED),
+            );
+        });
+        ui.label(
+            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+
+    fn topbar(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 58.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.add_space(28.0);
+                ui.label(RichText::new(t("工作空间")).size(11.0).color(MUTED));
+                ui.label(RichText::new("/").color(LINE));
+                ui.label(RichText::new(page_label(self.page)).size(12.0).color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(28.0);
+                    let previous = self.profile.language;
+                    ui.selectable_value(&mut self.profile.language, Language::English, "English");
+                    ui.selectable_value(&mut self.profile.language, Language::Chinese, "中文");
+                    if previous != self.profile.language {
+                        i18n::set_language(self.profile.language);
+                        #[cfg(target_os = "linux")]
+                        if let Some(tray) = &self.linux_tray {
+                            tray.refresh_menu();
+                        }
+                        #[cfg(any(windows, target_os = "macos"))]
+                        {
+                            self._tray = create_tray().ok();
+                            #[cfg(target_os = "macos")]
+                            self.update_tray_traffic();
+                        }
+                        if let Err(error) = save_profile(&self.profile_path, &self.profile) {
+                            self.notice = Some((error.to_string(), false));
+                        }
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(
+                            t("Helios · 曜光").into(),
+                        ));
+                    }
+                });
+            },
+        );
+    }
+
+    fn diagnostics(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut self.diagnostic_tab,
+                DiagnosticTab::Connections,
+                t("连接记录"),
+            );
+            ui.selectable_value(&mut self.diagnostic_tab, DiagnosticTab::Dns, "DNS");
+            ui.selectable_value(&mut self.diagnostic_tab, DiagnosticTab::Logs, t("日志"));
+        });
         ui.add_space(8.0);
+        ui.separator();
+        match self.diagnostic_tab {
+            DiagnosticTab::Connections => self.connections(ui),
+            DiagnosticTab::Dns => self.dns(ui),
+            DiagnosticTab::Logs => self.logs(ui),
+        }
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(18.0);
         let connected = self.system_proxy_enabled && self.system_proxy_verified;
         let pending = self.connecting_since.is_some();
         let (label, color) =
             connection_label(self.status.as_ref(), connected || self.tun_enabled, pending);
-        ui.horizontal(|ui| {
-            dot(ui, color);
-            ui.label(RichText::new(label).size(24.0).strong().color(color));
-            if pending {
-                ui.spinner();
-                if ui.small_button(t("取消连接")).clicked() {
-                    self.toggle_connection();
-                }
-            }
-        });
-        ui.label(
-            RichText::new(if self.tun_enabled {
-                t("虚拟网卡已开启")
-            } else if connected {
-                t("系统代理已开启")
-            } else if pending {
-                t("正在连接节点")
-            } else {
-                t("系统代理未开启")
-            })
-            .color(MUTED),
-        );
-        ui.add_space(12.0);
-        ui.columns(2, |columns| {
-            let mut proxy = connected;
-            if proxy_switch(&mut columns[0], t("系统代理"), &mut proxy, !pending) {
+        let hero_width = ui.available_width();
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new((hero_width - 170.0).max(170.0), 154.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width((hero_width - 170.0).max(170.0));
+                    ui.add_space(22.0);
+                    ui.horizontal(|ui| {
+                        dot(ui, color);
+                        ui.label(
+                            RichText::new(if pending {
+                                "CONNECTING"
+                            } else if connected || self.tun_enabled {
+                                "CONNECTION ACTIVE"
+                            } else {
+                                "CONNECTION IDLE"
+                            })
+                            .size(10.0)
+                            .color(MUTED),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(label).size(40.0).color(TEXT));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if self.tun_enabled {
+                            t("虚拟网卡已开启")
+                        } else if connected {
+                            t("系统代理已开启")
+                        } else if pending {
+                            t("正在连接节点")
+                        } else {
+                            t("系统代理未开启")
+                        })
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                },
+            );
+            if power_control(ui, connected || self.tun_enabled, pending, label) {
                 self.toggle_connection();
             }
-            #[cfg(any(windows, target_os = "macos"))]
-            {
-                let mut tun = self.tun_enabled;
-                if proxy_switch(&mut columns[1], t("虚拟网卡"), &mut tun, true) {
-                    if tun {
-                        self.start_tun();
-                    } else {
-                        self.stop_tun();
-                    }
-                }
-            }
-            #[cfg(not(any(windows, target_os = "macos")))]
-            {
-                let mut tun = false;
-                proxy_switch(&mut columns[1], t("虚拟网卡"), &mut tun, false);
-            }
         });
-        ui.add_space(20.0);
-        ui.label(RichText::new(t("当前节点")).color(MUTED));
-        let mut selected = self.profile.active_node;
-        ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("quick-node")
-                .selected_text(&self.profile.active_node().name)
-                .width((ui.available_width() - 128.0).max(160.0))
-                .show_ui(ui, |ui| {
-                    for (index, node) in self.profile.nodes.iter().enumerate() {
-                        if ui
-                            .add(egui::Button::selectable(selected == index, &node.name).wrap())
-                            .clicked()
-                        {
-                            selected = index;
-                        }
-                    }
-                });
-            let index = self.profile.active_node;
-            if ui
-                .add_enabled(
-                    !self.probes_pending(),
-                    secondary_button(if self.probes_pending() {
-                        t("测试中…")
-                    } else {
-                        t("测延迟")
-                    }),
-                )
-                .clicked()
-            {
-                self.probe_node(index);
-            }
-        });
-        self.select_node(selected);
+
         let node = self.profile.active_node();
         let latency = self.status.as_ref().and_then(|s| match s.transport {
             helios_control::ActiveTransport::Quic => s.quic_rtt_micros,
             _ => s.tls_rtt_micros,
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(&node.server).color(MUTED));
-            ui.label(RichText::new(format!("{} {}", t("延迟"), format_rtt(latency))).color(MUTED));
-            if let Some(probe) = self.probes.get(self.profile.active_node)
-                && !matches!(probe, ProbeState::Untested)
-            {
-                ui.label(probe_state_label(probe));
-            }
+        let node_name = node.name.clone();
+        let node_server = node.server.clone();
+        let family = if node_server.starts_with('[') {
+            "IPv6"
+        } else {
+            "IPv4"
+        };
+        let mode_before = self.profile.mode;
+        egui::Frame::new()
+            .fill(PANEL_2)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(61, 81, 53)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Globe, 29.0, ACCENT);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&node_name).strong().color(TEXT));
+                            ui.label(
+                                RichText::new(family)
+                                    .size(9.0)
+                                    .color(ACCENT)
+                                    .background_color(Color32::from_rgb(38, 53, 29)),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(&node_server)
+                                .monospace()
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(t("切换节点 ›")).clicked() {
+                            self.page = Page::Node;
+                        }
+                        ui.label(
+                            RichText::new(format_rtt(latency))
+                                .monospace()
+                                .color(if latency.is_some() { GOOD } else { MUTED }),
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(t("流量路由")).size(11.0).strong().color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(t("配置分流规则 ›")).clicked() {
+                    self.page = Page::Rules;
+                }
+            });
         });
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.columns(2, |columns| {
+        egui::Frame::new()
+            .fill(SIDEBAR)
+            .stroke(Stroke::new(1.0, LINE))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::same(3))
+            .show(ui, |ui| {
+                ui.columns(3, |columns| {
+                    columns[0].selectable_value(
+                        &mut self.profile.mode,
+                        RoutingMode::Rule,
+                        t("按规则分流"),
+                    );
+                    columns[1].selectable_value(
+                        &mut self.profile.mode,
+                        RoutingMode::GlobalProxy,
+                        t("全部代理"),
+                    );
+                    columns[2].selectable_value(
+                        &mut self.profile.mode,
+                        RoutingMode::GlobalDirect,
+                        t("全部直连"),
+                    );
+                });
+            });
+        if self.profile.mode != mode_before {
+            self.save_rules();
+        }
+        ui.label(
+            RichText::new(match self.profile.mode {
+                RoutingMode::Rule => t("匹配直连规则的流量直连，其余流量经过代理。"),
+                RoutingMode::GlobalProxy => t("所有流量都经过当前代理节点。"),
+                RoutingMode::GlobalDirect => t("所有流量直接连接，不经过代理节点。"),
+            })
+            .size(10.0)
+            .color(MUTED),
+        );
+
+        ui.add_space(15.0);
+        let mut proxy = connected;
+        let mut proxy_changed = false;
+        #[cfg(any(windows, target_os = "macos"))]
+        let mut tun_changed = false;
+        egui::Frame::new()
+            .stroke(Stroke::new(1.0, LINE))
+            .inner_margin(Margin::symmetric(0, 12))
+            .show(ui, |ui| {
+                ui.columns(2, |columns| {
+                    proxy_changed = takeover_item(
+                        &mut columns[0],
+                        Icon::Globe,
+                        t("系统代理"),
+                        t("浏览器与支持代理的应用"),
+                        &mut proxy,
+                        !pending,
+                    );
+                    #[cfg(any(windows, target_os = "macos"))]
+                    {
+                        let mut tun = self.tun_enabled;
+                        tun_changed = takeover_item(
+                            &mut columns[1],
+                            Icon::Adapter,
+                            t("虚拟网卡 TUN"),
+                            t("接管更多应用的流量"),
+                            &mut tun,
+                            true,
+                        );
+                    }
+                    #[cfg(not(any(windows, target_os = "macos")))]
+                    {
+                        let mut tun = false;
+                        takeover_item(
+                            &mut columns[1],
+                            Icon::Adapter,
+                            t("虚拟网卡 TUN"),
+                            t("Linux 暂未开放"),
+                            &mut tun,
+                            false,
+                        );
+                    }
+                });
+            });
+        if proxy_changed {
+            self.toggle_connection();
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        if tun_changed {
+            if self.tun_enabled {
+                self.stop_tun();
+            } else {
+                self.start_tun();
+            }
+        }
+
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(t("流量趋势")).size(11.0).strong().color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(t("最近 60 秒")).size(9.0).color(MUTED));
+            });
+        });
+        ui.columns(3, |columns| {
             metric(
                 &mut columns[0],
-                t("上传速度"),
-                &format!("{}/s", format_bytes(self.upload_rate as u64)),
-                TEXT,
+                t("下载速度"),
+                &format!("{}/s", format_bytes(self.download_rate as u64)),
+                ACCENT,
             );
             metric(
                 &mut columns[1],
-                t("下载速度"),
-                &format!("{}/s", format_bytes(self.download_rate as u64)),
+                t("上传速度"),
+                &format!("{}/s", format_bytes(self.upload_rate as u64)),
                 GOOD,
             );
+            let (uploaded, downloaded) = self
+                .status
+                .as_ref()
+                .map(|status| (status.uploaded_bytes, status.downloaded_bytes))
+                .unwrap_or_default();
+            columns[2].with_layout(Layout::right_to_left(Align::Min), |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} {}", t("累计下载"), format_bytes(downloaded)))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} {}", t("累计上传"), format_bytes(uploaded)))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
+            });
         });
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(t("代理模式")).color(MUTED));
-            let previous = self.profile.mode;
-            ui.selectable_value(&mut self.profile.mode, RoutingMode::Rule, t("按规则"));
-            ui.selectable_value(
-                &mut self.profile.mode,
-                RoutingMode::GlobalProxy,
-                t("全部代理"),
-            );
-            ui.selectable_value(
-                &mut self.profile.mode,
-                RoutingMode::GlobalDirect,
-                t("全部直连"),
-            );
-            if self.profile.mode != previous {
-                self.save_rules();
-            }
-        });
+        traffic_chart(ui, &self.traffic_history);
+
         if self.profile.mode == RoutingMode::GlobalDirect && connected {
             ui.colored_label(WARN, t("当前为全部直连模式，网页不会经过代理"));
+        }
+        if pending {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                if ui.small_button(t("取消连接")).clicked() {
+                    self.toggle_connection();
+                }
+            });
         }
     }
 
     fn node(&mut self, ui: &mut egui::Ui) {
-        heading(
-            ui,
-            t("节点"),
-            "Select the active server, edit credentials, and test authenticated RTT",
-        );
-        ui.label(RichText::new(t("连接链接")).color(MUTED));
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.connection_link_text)
-                    .password(true)
-                    .hint_text("helios://v1/...")
-                    .desired_width((ui.available_width() - 150.0).max(220.0)),
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| heading(ui, t("我的节点"), t("一条链接，就能开始连接。")));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(primary_button(t("添加节点"))).clicked() {
+                    self.open_node_import = true;
+                }
+            });
+        });
+        ui.add_space(24.0);
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [(ui.available_width() - 110.0).max(80.0), 34.0],
+                egui::TextEdit::singleline(&mut self.node_filter)
+                    .hint_text(t("搜索节点名称或地址")),
             );
             if ui
-                .add_enabled(
-                    !self.connection_link_text.trim().is_empty(),
-                    primary_button(t("解析并添加")),
-                )
+                .add_enabled(!self.probes_pending(), secondary_button(t("测试全部")))
                 .clicked()
             {
-                self.add_connection_link();
+                self.probe_all_nodes();
             }
         });
-        ui.add_space(20.0);
+        ui.add_space(8.0);
         let previous = self.profile.auto_failover;
         ui.checkbox(
             &mut self.profile.auto_failover,
@@ -1464,215 +1657,371 @@ impl HeliosApp {
                 self.save();
             }
         }
-        ui.add_space(20.0);
+        ui.add_space(14.0);
         let mut selected = None;
-        let mut add = false;
-        let mut remove = false;
-        ui.vertical(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(t("我的节点")).color(MUTED));
-                ui.add_space(6.0);
-                for (index, node) in self.profile.nodes.iter().enumerate() {
-                    let active = index == self.profile.active_node;
-                    let state = match &self.probes[index] {
+        let mut probe = None;
+        let mut edit = None;
+        let mut remove = None;
+        let can_change = !self.applying_config && !self.tun_enabled;
+        for (index, node) in self.profile.nodes.iter().enumerate() {
+            if !matches_filter(&self.node_filter, &[&node.name, &node.server]) {
+                continue;
+            }
+            let active = index == self.profile.active_node;
+            egui::Frame::new()
+                .fill(if active { PANEL_2 } else { BG })
+                .stroke(Stroke::new(
+                    1.0,
+                    if active {
+                        Color32::from_rgb(70, 90, 53)
+                    } else {
+                        LINE
+                    },
+                ))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        icon(ui, Icon::Globe, 28.0, if active { ACCENT } else { MUTED });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new((ui.available_width() - 236.0).max(70.0), 40.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width((ui.available_width()).max(70.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&node.name).size(13.0).color(TEXT),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&node.server)
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(MUTED),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    can_change && !active,
+                                    egui::Button::new(if active {
+                                        t("当前节点")
+                                    } else {
+                                        t("切换")
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                selected = Some(index);
+                            }
+                            if ui.button(t("编辑")).clicked() {
+                                edit = Some(index);
+                            }
+                            let pending = matches!(self.probes[index], ProbeState::Pending);
+                            if ui
+                                .add_enabled(
+                                    !pending,
+                                    egui::Button::new(if pending {
+                                        t("测试中…")
+                                    } else {
+                                        t("测试延迟")
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                probe = Some(index);
+                            }
+                        });
+                    });
+                    let result = match &self.probes[index] {
                         ProbeState::Failed(_) => t("测试失败").to_owned(),
                         state => probe_state_label(state),
                     };
-                    let label = format!("{}\n{} · {state}", node.name, node.server);
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 64.0],
-                            egui::Button::new(RichText::new(label).color(TEXT))
-                                .wrap()
-                                .fill(if active {
-                                    Color32::from_rgb(32, 43, 32)
-                                } else {
-                                    PANEL
-                                })
-                                .stroke(Stroke::new(1.0, if active { ACCENT } else { PANEL_2 })),
-                        )
-                        .on_hover_text(probe_state_label(&self.probes[index]))
-                        .clicked()
-                    {
-                        selected = Some(index);
-                    }
-                }
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(!self.probes_pending(), secondary_button(t("测试全部")))
-                        .clicked()
-                    {
-                        self.probe_all_nodes();
-                    }
-                    add = ui
-                        .add_enabled(!self.probes_pending(), secondary_button(t("添加节点")))
-                        .clicked();
-                    ui.add_enabled_ui(
-                        self.profile.nodes.len() > 1 && !self.probes_pending(),
-                        |ui| {
-                            ui.menu_button(t("删除"), |ui| {
-                                ui.label(t("确认删除此节点？"));
-                                ui.add(egui::Label::new(&self.profile.active_node().name).wrap());
-                                if ui.button(t("确认删除")).clicked() {
-                                    remove = true;
-                                    ui.close();
+                    ui.horizontal_wrapped(|ui| {
+                        dot(
+                            ui,
+                            match &self.probes[index] {
+                                ProbeState::Succeeded(report)
+                                    if report.quic.is_ok() || report.tls.is_ok() =>
+                                {
+                                    GOOD
+                                }
+                                ProbeState::Failed(_) => WARN,
+                                _ => MUTED,
+                            },
+                        );
+                        ui.label(RichText::new(result).size(10.0).color(MUTED))
+                            .on_hover_text(probe_state_label(&self.probes[index]));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_enabled_ui(
+                                !active && !self.probes_pending() && can_change,
+                                |ui| {
+                                    ui.menu_button(t("删除"), |ui| {
+                                        ui.label(t("确认删除此节点？"));
+                                        if ui.button(t("确认删除")).clicked() {
+                                            remove = Some(index);
+                                            ui.close();
+                                        }
+                                    });
+                                },
+                            )
+                            .response
+                            .on_hover_text(t("当前节点请先切换后再删除"));
+                        });
+                    });
+                    if let ProbeState::Succeeded(report) = &self.probes[index] {
+                        egui::CollapsingHeader::new(t("测试详情"))
+                            .id_salt(("probe", index))
+                            .show(ui, |ui| {
+                                for (name, result) in [("QUIC", &report.quic), ("TLS", &report.tls)]
+                                {
+                                    match result {
+                                        Ok(value) => {
+                                            ui.label(format!(
+                                                "{name} · RTT {:.1} ms · {} {:.1} ms",
+                                                value.rtt.as_secs_f64() * 1000.,
+                                                t("握手"),
+                                                value.handshake.as_secs_f64() * 1000.
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(format!("{name}: {error}"))
+                                                        .color(WARN),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    }
                                 }
                             });
-                        },
-                    );
+                    }
                 });
-            });
             ui.add_space(8.0);
-            if let ProbeState::Succeeded(report) = &self.probes[self.profile.active_node] {
-                for (name, result) in [("QUIC", &report.quic), ("TLS", &report.tls)] {
-                    match result {
-                        Ok(value) => {
-                            ui.label(format!(
-                                "{name} · RTT {:.1} ms · {} {:.1} ms",
-                                value.rtt.as_secs_f64() * 1000.0,
-                                t("握手"),
-                                value.handshake.as_secs_f64() * 1000.0
-                            ));
+        }
+        if let Some(index) = probe {
+            self.probe_node(index);
+        }
+        if let Some(index) = selected {
+            self.select_node(index);
+        }
+        if let Some(index) = edit {
+            self.node_editor = Some(NodeEditor {
+                index: Some(index),
+                node: self.profile.nodes[index].clone(),
+                error: None,
+            });
+        }
+        if let Some(index) = remove {
+            let mut profile = self.profile.clone();
+            profile.nodes.remove(index);
+            if profile.active_node > index {
+                profile.active_node -= 1;
+            }
+            match save_profile(&self.profile_path, &profile) {
+                Ok(()) => {
+                    self.profile = profile;
+                    self.probes.remove(index);
+                    self.notice = Some((t("配置已保存").into(), true));
+                }
+                Err(error) => self.notice = Some((error.to_string(), false)),
+            }
+        }
+    }
+
+    fn node_dialogs(&mut self, ctx: &egui::Context) {
+        let width = (ctx.content_rect().width() - 90.0).min(480.0);
+        if self.open_node_import {
+            let mut import = false;
+            let mut manual = false;
+            let modal = egui::Modal::new(egui::Id::unique("helios-node-import")).show(ctx, |ui| {
+                ui.set_width(width);
+                heading(
+                    ui,
+                    t("添加节点"),
+                    t("粘贴 helios:// 链接，证书和凭据会自动导入。"),
+                );
+                ui.add_space(18.0);
+                ui.label(RichText::new(t("节点链接")).color(MUTED).size(11.0));
+                ui.add_sized(
+                    [width, 38.0],
+                    egui::TextEdit::singleline(&mut self.connection_link_text)
+                        .password(true)
+                        .hint_text("helios://v1/..."),
+                );
+                let parsed = helios_config::ConnectionLink::decode(&self.connection_link_text);
+                if !self.connection_link_text.trim().is_empty() {
+                    ui.add_space(12.0);
+                    match &parsed {
+                        Ok(link) => {
+                            card(ui, |ui| {
+                                ui.label(RichText::new(&link.name).strong().color(ACCENT));
+                                ui.label(
+                                    RichText::new(link.server.to_string())
+                                        .monospace()
+                                        .color(MUTED),
+                                );
+                                ui.label(
+                                    RichText::new(t("证书与凭据已包含在链接中"))
+                                        .small()
+                                        .color(MUTED),
+                                );
+                            });
                         }
                         Err(error) => {
-                            ui.colored_label(WARN, format!("{name} · {}: {error}", t("测试失败")));
+                            ui.add(
+                                egui::Label::new(RichText::new(error.to_string()).color(WARN))
+                                    .wrap(),
+                            );
                         }
                     }
                 }
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                ui.label(
-                    RichText::new(format!(
-                        "{} {} {}",
-                        t("测试于"),
-                        now_ms.saturating_sub(report.checked_at_unix_ms) / 1000,
-                        t("秒前")
-                    ))
-                    .small()
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    manual = ui.button(t("手动添加节点")).clicked();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        import = ui
+                            .add_enabled(
+                                parsed.is_ok() && !self.probes_pending() && !self.applying_config,
+                                primary_button(t("解析并添加")),
+                            )
+                            .clicked();
+                        if ui.button(t("取消")).clicked() {
+                            ui.close();
+                        }
+                    });
+                });
+            });
+            if modal.should_close() {
+                self.open_node_import = false;
             }
-            if ui.add(primary_button(t("应用配置"))).clicked() {
-                if self.owns_running_daemon() {
-                    self.restart_daemon();
-                } else {
-                    self.save();
+            if import {
+                self.add_connection_link();
+                if self.notice.as_ref().is_some_and(|notice| notice.1) {
+                    self.open_node_import = false;
                 }
             }
-            ui.separator();
-            let open_editor = std::mem::take(&mut self.open_node_editor);
-            let editor = egui::CollapsingHeader::new(t("编辑节点配置"))
-                .id_salt(("node-editor", self.profile.active_node))
-                .open(open_editor.then_some(true))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(t("首次使用：从服务端安全复制证书 cert.pem 和凭据 token.hex 到本机，再填写两个文件的完整路径。不要复制服务端私钥 key.pem。所有输入框支持系统复制 / 粘贴快捷键。")).color(MUTED));
-                    let active = self.profile.active_node;
-                    let node = &mut self.profile.nodes[active];
-                    field(ui, t("节点名称"), &mut node.name);
-                    field(ui, t("服务器地址"), &mut node.server);
-                    field(ui, t("证书对应域名 / IP"), &mut node.server_name);
-                    path_field(ui, t("受信证书文件"), &mut node.ca_certificate);
-                    ui.label(RichText::new(t("填写本机 .pem 文件的完整路径，不是证书内容；证书对应域名 / IP 必须与证书匹配。")).small().color(MUTED));
-                    field(ui, t("凭据标识"), &mut node.credential_id);
-                    path_field(ui, t("凭据文件"), &mut node.token_file);
-                    ui.label(RichText::new(t("填写本机 token.hex 的完整路径，不是 token 内容；凭据标识须与服务端 auth.id 一致。完成后测试延迟，再点击应用配置。")).small().color(MUTED));
+            if manual {
+                self.open_node_import = false;
+                self.node_editor = Some(NodeEditor {
+                    index: None,
+                    node: NodeProfile {
+                        name: format!("{} {}", t("节点"), self.profile.nodes.len() + 1),
+                        server: String::new(),
+                        server_name: String::new(),
+                        ..Default::default()
+                    },
+                    error: None,
+                });
+            }
+        }
+        if let Some(mut editor) = self.node_editor.take() {
+            let mut save = false;
+            let mut connect = false;
+            let modal = egui::Modal::new(egui::Id::unique("helios-node-editor")).show(ctx, |ui| {
+                ui.set_width(width);
+                heading(ui, t("编辑节点配置"), t("先保存节点，需要时再连接。"));
+                ui.add_space(16.0);
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(240.0)).show(ui, |ui| {
+                    field(ui, t("节点名称"), &mut editor.node.name);
+                    field(ui, t("服务器地址"), &mut editor.node.server);
+                    ui.label(RichText::new(t("IPv6 地址格式：[IPv6]:端口")).size(10.0).color(MUTED));
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(t("传输方式")).size(10.0).color(MUTED));
-                        ui.selectable_value(
-                            &mut node.preferred_transport,
-                            TransportPreference::Quic,
-                            "QUIC",
-                        );
-                        ui.selectable_value(
-                            &mut node.preferred_transport,
-                            TransportPreference::Tls,
-                            "TLS",
-                        );
+                        ui.label(RichText::new(t("传输方式")).size(11.0).color(MUTED));
+                        ui.selectable_value(&mut editor.node.preferred_transport, TransportPreference::Quic, "QUIC");
+                        ui.selectable_value(&mut editor.node.preferred_transport, TransportPreference::Tls, "TLS");
                     });
-                    ui.add_space(14.0);
-                    let pending = matches!(self.probes[active], ProbeState::Pending);
-                    if ui
-                        .add_enabled(
-                            !pending,
-                            primary_button(if pending {
-                                t("测试中…")
-                            } else {
-                                t("测试延迟")
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.probe_node(active);
-                    }
-                    ui.add_space(14.0);
+                    egui::CollapsingHeader::new(t("证书与凭据")).default_open(editor.index.is_none()).show(ui, |ui| {
+                        field(ui, t("证书对应域名 / IP"), &mut editor.node.server_name);
+                        path_field(ui, t("受信证书文件"), &mut editor.node.ca_certificate);
+                        field(ui, t("凭据标识"), &mut editor.node.credential_id);
+                        path_field(ui, t("凭据文件"), &mut editor.node.token_file);
+                        ui.add(egui::Label::new(RichText::new(t("填写本机 .pem 文件的完整路径，不是证书内容；证书对应域名 / IP 必须与证书匹配。")).small().color(MUTED)).wrap());
+                    });
                     egui::CollapsingHeader::new(t("导入 / 导出")).show(ui, |ui| {
-                        ui.label(RichText::new(t("节点 JSON")).size(10.0).color(MUTED));
-                        ui.label(RichText::new(t("不包含证书和凭据内容")).color(MUTED));
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.node_exchange_text)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_rows(7)
-                                .desired_width(f32::INFINITY),
-                        );
+                        ui.label(RichText::new(t("不包含证书和凭据内容")).small().color(MUTED));
+                        ui.add(egui::TextEdit::multiline(&mut self.node_exchange_text).font(egui::TextStyle::Monospace).desired_rows(5).desired_width(f32::INFINITY));
                         ui.horizontal(|ui| {
                             if ui.button(t("导出节点")).clicked() {
-                                self.node_exchange_text = serde_json::to_string_pretty(
-                                    &self.profile.nodes[self.profile.active_node],
-                                )
-                                .unwrap_or_default();
+                                self.node_exchange_text = serde_json::to_string_pretty(&editor.node).unwrap_or_default();
                             }
                             if ui.button(t("导入节点")).clicked() {
                                 match import_node(&self.node_exchange_text) {
-                                    Ok(node) => {
-                                        self.profile.nodes.push(node);
-                                        self.probes.push(ProbeState::Untested);
-                                        self.profile.active_node = self.profile.nodes.len() - 1;
-                                        self.notice = Some((t("节点已导入").into(), true));
-                                    }
-                                    Err(error) => self.notice = Some((error, false)),
+                                    Ok(node) => { editor.node = node; editor.index = None; editor.error = None; }
+                                    Err(error) => editor.error = Some(error),
                                 }
                             }
                         });
                     });
+                    if let Some(error) = &editor.error { ui.add(egui::Label::new(RichText::new(error).color(WARN)).wrap()); }
                 });
-            if open_editor {
-                editor.header_response.scroll_to_me_animation(
-                    Some(Align::TOP),
-                    egui::style::ScrollAnimation::none(),
-                );
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("取消")).clicked() { ui.close(); }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let idle = !self.probes_pending() && !self.applying_config;
+                        connect = ui.add_enabled(idle && !self.tun_enabled, primary_button(t("保存并连接"))).clicked();
+                        save = ui.add_enabled(idle, secondary_button(t("仅保存"))).clicked();
+                    });
+                });
+            });
+            if save || connect {
+                match self.save_node_draft(&editor, connect) {
+                    Ok(()) => return,
+                    Err(error) => editor.error = Some(error),
+                }
             }
-        });
-        if let Some(index) = selected {
-            self.select_node(index);
+            if !modal.should_close() {
+                self.node_editor = Some(editor);
+            }
         }
-        if add {
-            let number = self.profile.nodes.len() + 1;
-            let node = NodeProfile {
-                name: format!("{} {number}", t("节点")),
-                ..Default::default()
-            };
-            self.profile.nodes.push(node);
-            self.probes.push(ProbeState::Untested);
-            self.profile.active_node = self.profile.nodes.len() - 1;
-            self.open_node_editor = true;
+    }
+
+    fn save_node_draft(&mut self, editor: &NodeEditor, connect: bool) -> Result<(), String> {
+        let node =
+            import_node(&serde_json::to_string(&editor.node).map_err(|error| error.to_string())?)?;
+        let mut candidate = self.profile.clone();
+        let index = editor.index.unwrap_or(candidate.nodes.len());
+        if index == candidate.nodes.len() {
+            candidate.nodes.push(node);
+        } else {
+            candidate.nodes[index] = node;
         }
-        if remove {
-            let index = self.profile.active_node;
-            self.profile.nodes.remove(index);
-            self.probes.remove(index);
-            self.profile.active_node = index.min(self.profile.nodes.len() - 1);
+        let original = candidate.active_node;
+        candidate.active_node = index;
+        candidate
+            .daemon_config()
+            .map_err(|error| error.to_string())?;
+        if !connect {
+            candidate.active_node = original;
         }
+        save_profile(&self.profile_path, &candidate).map_err(|error| error.to_string())?;
+        self.profile = candidate;
+        self.probes
+            .resize(self.profile.nodes.len(), ProbeState::Untested);
+        self.probes[index] = ProbeState::Untested;
+        self.notice = Some((t("节点已保存，运行中的连接未更改").into(), true));
+        if connect {
+            if self.owns_running_daemon() {
+                self.restart_daemon();
+            } else {
+                self.toggle_connection();
+            }
+        }
+        Ok(())
     }
 
     fn rules(&mut self, ui: &mut egui::Ui) {
         heading(
             ui,
             t("分流规则"),
-            "One rule per line · first match wins · final rule required",
+            t("每行一条规则，按顺序匹配，末尾需要最终规则。"),
         );
         ui.add_space(20.0);
         card(ui, |ui| {
@@ -1763,76 +2112,170 @@ impl HeliosApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
-        heading(
+        heading(ui, t("高级设置"), t("监听、路径与网络参数都可以直接编辑。"));
+        ui.add_space(24.0);
+
+        section_title(ui, t("常规"));
+        let auto_start = self.profile.auto_start_daemon;
+        setting_row(
             ui,
-            t("高级设置"),
-            "Daemon process, inbound listeners, and platform capabilities",
-        );
-        ui.add_space(20.0);
-        card(ui, |ui| {
-            path_field(ui, t("后台程序路径"), &mut self.profile.daemon_binary);
-            path_field(ui, t("后台配置文件"), &mut self.profile.daemon_config);
-            ui.checkbox(
-                &mut self.profile.auto_start_daemon,
-                t("打开软件时预启动后台（不自动开启系统代理）"),
-            );
-            path_field(ui, t("虚拟网卡辅助程序"), &mut self.profile.helper_binary);
-            path_field(ui, t("虚拟网卡配置文件"), &mut self.profile.helper_config);
-            field(ui, t("SOCKS5 监听地址"), &mut self.profile.socks_listen);
-            field(ui, t("HTTP 监听地址"), &mut self.profile.http_listen);
-            field(ui, t("本地控制地址"), &mut self.profile.control_listen);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(t("运行日志")).size(10.0).color(MUTED));
-                ui.label(
-                    RichText::new(daemon_log_path().display().to_string())
-                        .monospace()
-                        .color(TEXT),
+            t("打开软件时预启动后台"),
+            t("缩短连接等待时间；系统代理仍需手动开启。"),
+            |ui| {
+                toggle_switch(
+                    ui,
+                    &mut self.profile.auto_start_daemon,
+                    t("打开软件时预启动后台"),
+                    true,
                 );
-                if ui.button(t("打开目录")).clicked() {
-                    match open_log_directory() {
-                        Ok(()) => {
-                            self.notice = Some((t("已打开日志目录").into(), true));
-                        }
-                        Err(error) => {
-                            self.notice = Some((format!("打开日志目录失败：{error}"), false));
-                        }
-                    }
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut self.profile.udp_idle_seconds, 30..=300)
-                    .text(t("UDP 空闲超时（秒）")),
-            );
+            },
+        );
+        if auto_start != self.profile.auto_start_daemon {
+            self.save();
+        }
+        setting_row(
+            ui,
+            t("界面语言"),
+            t("可随时切换，设置会自动保存。"),
+            |ui| {
+                ui.label(match self.profile.language {
+                    Language::Chinese => "简体中文",
+                    Language::English => "English",
+                });
+            },
+        );
+        ui.add_space(24.0);
+
+        section_title(ui, t("网络"));
+        let ipv6_before = self.profile.tun_ipv6_enabled;
+        setting_row(
+            ui,
+            t("TUN 接管 IPv6"),
+            t("虚拟网卡开启时，同时接管 IPv6 流量。"),
+            |ui| {
+                toggle_switch(
+                    ui,
+                    &mut self.profile.tun_ipv6_enabled,
+                    t("TUN 接管 IPv6"),
+                    true,
+                );
+            },
+        );
+        if ipv6_before != self.profile.tun_ipv6_enabled {
+            self.save();
+        }
+        ui.add_space(18.0);
+        card(ui, |ui| {
+            ui.label(RichText::new(t("本地监听")).size(13.0).strong().color(TEXT));
             ui.label(
-                RichText::new(t("不使用系统代理的地址"))
+                RichText::new(t("只允许本机回环地址；IPv6 使用 [::1]:端口。"))
                     .size(10.0)
                     .color(MUTED),
             );
-            ui.label(RichText::new(t("每行一个域名、IP 或网段")).color(MUTED));
-            ui.add(
-                egui::TextEdit::multiline(&mut self.proxy_bypass_text)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_rows(6)
-                    .desired_width(f32::INFINITY),
+            ui.add_space(14.0);
+            ui.columns(2, |columns| {
+                field(
+                    &mut columns[0],
+                    t("SOCKS5 监听地址"),
+                    &mut self.profile.socks_listen,
+                );
+                field(
+                    &mut columns[1],
+                    t("HTTP 监听地址"),
+                    &mut self.profile.http_listen,
+                );
+            });
+            ui.add_space(8.0);
+            field(ui, t("本地控制地址"), &mut self.profile.control_listen);
+        });
+        ui.add_space(12.0);
+
+        egui::CollapsingHeader::new(t("后台与虚拟网卡程序"))
+            .id_salt("service-paths")
+            .show(ui, |ui| {
+                card(ui, |ui| {
+                    path_field(ui, t("后台程序路径"), &mut self.profile.daemon_binary);
+                    path_field(ui, t("后台配置文件"), &mut self.profile.daemon_config);
+                    path_field(ui, t("虚拟网卡辅助程序"), &mut self.profile.helper_binary);
+                    path_field(ui, t("虚拟网卡配置文件"), &mut self.profile.helper_config);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(t("运行日志")).size(10.0).color(MUTED));
+                        ui.label(
+                            RichText::new(daemon_log_path().display().to_string())
+                                .monospace()
+                                .color(TEXT),
+                        );
+                        if ui.button(t("打开目录")).clicked() {
+                            match open_log_directory() {
+                                Ok(()) => self.notice = Some((t("已打开日志目录").into(), true)),
+                                Err(error) => {
+                                    self.notice =
+                                        Some((format!("打开日志目录失败：{error}"), false))
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(t("代理绕过与传输参数"))
+            .id_salt("transport-settings")
+            .show(ui, |ui| {
+                card(ui, |ui| {
+                    ui.label(
+                        RichText::new(t("不使用系统代理的地址"))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.proxy_bypass_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(5)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new(t("每行一个域名、IP 或网段"))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.columns(2, |columns| {
+                        columns[0].add(
+                            egui::Slider::new(&mut self.profile.udp_idle_seconds, 30..=300)
+                                .text(t("UDP 空闲超时（秒）")),
+                        );
+                        columns[1].add(
+                            egui::Slider::new(&mut self.profile.tun_mtu, 576..=1500)
+                                .text("TUN MTU"),
+                        );
+                    });
+                });
+            });
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(t("平台控制"))
+            .id_salt("platform-controls")
+            .show(ui, |ui| {
+                card(ui, |ui| {
+                    self.system_proxy_control(ui);
+                    self.tun_control(ui);
+                });
+            });
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(t("保存设置不会自动切换当前节点。"))
+                    .size(10.0)
+                    .color(MUTED),
             );
-            ui.add_space(12.0);
-            self.system_proxy_control(ui);
-            self.tun_control(ui);
-            ui.add(egui::Slider::new(&mut self.profile.tun_mtu, 576..=1500).text("TUN MTU"));
-            ui.toggle_value(&mut self.profile.tun_ipv6_enabled, t("TUN 接管 IPv6"));
-            ui.add_space(12.0);
-            if ui.add(primary_button(t("保存设置"))).clicked() {
-                self.save();
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(primary_button(t("保存设置"))).clicked() {
+                    self.save();
+                }
+            });
         });
     }
 
     fn dns(&mut self, ui: &mut egui::Ui) {
-        heading(
-            ui,
-            t("DNS 设置"),
-            "Preserve domain routing without local resolver pollution",
-        );
+        heading(ui, t("DNS 设置"), t("保留域名分流，避免本地解析污染。"));
         ui.add_space(20.0);
         card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2512,19 +2955,24 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.window_fill = PANEL;
     style.visuals.widgets.inactive.bg_fill = PANEL_2;
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 46, 48);
+    style.visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 49, 38);
+    style.visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
     style.visuals.widgets.active.bg_fill = ACCENT;
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::BLACK);
-    style.visuals.selection.bg_fill = Color32::from_rgb(45, 66, 54);
+    style.visuals.widgets.active.corner_radius = CornerRadius::same(6);
+    style.visuals.selection.bg_fill = Color32::from_rgb(35, 48, 32);
     style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+    style.visuals.window_corner_radius = CornerRadius::same(10);
+    style.spacing.item_spacing = Vec2::new(9.0, 9.0);
+    style.spacing.button_padding = Vec2::new(12.0, 8.0);
     style.spacing.scroll.floating = false;
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(15.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(13.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(15.0));
+        .insert(egui::TextStyle::Button, FontId::proportional(12.0));
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
@@ -2565,20 +3013,349 @@ fn connection_label(
     }
 }
 
-fn heading(ui: &mut egui::Ui, title: &str, _subtitle: &str) {
+#[cfg(any(test, target_os = "macos"))]
+fn tray_connection_active(proxy: bool, tun: bool, connecting: bool) -> bool {
+    (proxy || tun) && !connecting
+}
+
+fn page_label(page: Page) -> &'static str {
+    match page {
+        Page::Overview => t("连接"),
+        Page::Node => t("节点"),
+        Page::Rules => t("分流规则"),
+        Page::Diagnostics => t("诊断"),
+        Page::Settings => t("设置"),
+    }
+}
+
+fn nav_group_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        RichText::new(label)
+            .size(9.0)
+            .color(Color32::from_rgb(117, 135, 121)),
+    );
+    ui.add_space(5.0);
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Sun,
+    Home,
+    Nodes,
+    Rules,
+    Activity,
+    Settings,
+    Globe,
+    Adapter,
+}
+
+fn icon(ui: &mut egui::Ui, symbol: Icon, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    paint_icon(ui.painter(), rect, symbol, color);
+}
+
+fn paint_icon(painter: &egui::Painter, rect: egui::Rect, symbol: Icon, color: Color32) {
+    let p = |x: f32, y: f32| rect.min + egui::vec2(x, y) * (rect.width() / 24.0);
+    let stroke = Stroke::new(1.4, color);
+    let line = |points: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(
+            points.iter().map(|&(x, y)| p(x, y)).collect(),
+            stroke,
+        ));
+    };
+    match symbol {
+        Icon::Sun => {
+            painter.circle_filled(p(12.0, 12.0), rect.width() * 0.18, color);
+            for n in 0..8 {
+                let direction = Vec2::angled(n as f32 * std::f32::consts::TAU / 8.0);
+                painter.line_segment(
+                    [
+                        rect.center() + direction * rect.width() * 0.32,
+                        rect.center() + direction * rect.width() * 0.47,
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Icon::Home => {
+            line(&[
+                (3., 10.),
+                (12., 3.),
+                (21., 10.),
+                (21., 21.),
+                (3., 21.),
+                (3., 10.),
+            ]);
+            line(&[(9., 21.), (9., 13.), (15., 13.), (15., 21.)]);
+        }
+        Icon::Nodes => {
+            for y in [3.0, 14.0] {
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(p(4., y), p(20., y + 7.)),
+                    2.0,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                painter.circle_filled(p(8., y + 3.5), 1.0, color);
+                line(&[(14., y + 3.5), (17., y + 3.5)]);
+            }
+        }
+        Icon::Rules => {
+            line(&[(5., 3.), (5., 21.)]);
+            line(&[(5., 7.), (13., 7.), (19., 3.)]);
+            line(&[(5., 12.), (20., 12.), (17., 9.)]);
+            line(&[(5., 17.), (13., 17.), (19., 21.)]);
+        }
+        Icon::Activity => {
+            line(&[
+                (2., 12.),
+                (6., 12.),
+                (9., 4.),
+                (14., 20.),
+                (18., 10.),
+                (22., 10.),
+            ]);
+        }
+        Icon::Settings => {
+            for (x, y) in [(8., 6.), (16., 12.), (10., 18.)] {
+                line(&[(3., y), (21., y)]);
+                painter.circle(p(x, y), 2.5, SIDEBAR, stroke);
+            }
+        }
+        Icon::Globe => {
+            painter.circle_stroke(rect.center(), rect.width() * 0.4, stroke);
+            line(&[(2.5, 12.), (21.5, 12.)]);
+            for sign in [-1., 1.] {
+                line(&[
+                    (12., 2.5),
+                    (12. + sign * 4., 6.),
+                    (12. + sign * 4.5, 12.),
+                    (12. + sign * 4., 18.),
+                    (12., 21.5),
+                ]);
+            }
+        }
+        Icon::Adapter => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(3., 4.), p(21., 16.)),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            line(&[(12., 16.), (12., 21.)]);
+            line(&[(8., 21.), (16., 21.)]);
+            line(&[(7., 9.), (17., 9.)]);
+            line(&[(7., 12.), (13., 12.)]);
+        }
+    }
+}
+
+fn nav_button(ui: &mut egui::Ui, label: &str, selected: bool, symbol: Icon) -> bool {
+    let response = ui.add_sized(
+        [ui.available_width(), 39.0],
+        egui::Button::new("")
+            .fill(if selected { PANEL_2 } else { SIDEBAR })
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(7)),
+    );
+    let color = if selected { ACCENT } else { MUTED };
+    paint_icon(
+        ui.painter(),
+        egui::Rect::from_min_size(
+            response.rect.left_center() + egui::vec2(12., -9.),
+            Vec2::splat(18.),
+        ),
+        symbol,
+        color,
+    );
+    ui.painter().text(
+        response.rect.left_center() + egui::vec2(42., 0.),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.),
+        color,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::accesskit::Role::Button,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    response.clicked()
+}
+
+fn power_control(ui: &mut egui::Ui, active: bool, pending: bool, state: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(150.0, 150.0), egui::Sense::click());
+    let center = rect.center();
+    let ring = if active {
+        Color32::from_rgb(64, 87, 49)
+    } else {
+        LINE
+    };
+    ui.painter()
+        .circle_stroke(center, 70.0, Stroke::new(1.0, ring));
+    ui.painter()
+        .circle_stroke(center, 58.0, Stroke::new(1.0, ring));
+    ui.painter().circle_filled(
+        center,
+        45.0,
+        if active {
+            ACCENT
+        } else {
+            Color32::from_rgb(37, 56, 43)
+        },
+    );
+    let icon_color = if active {
+        Color32::from_rgb(38, 59, 23)
+    } else {
+        ACCENT
+    };
+    if pending {
+        ui.painter().text(
+            center + egui::vec2(0.0, -8.0),
+            egui::Align2::CENTER_CENTER,
+            "...",
+            FontId::proportional(18.0),
+            icon_color,
+        );
+    } else {
+        let icon_center = center + egui::vec2(0.0, -9.0);
+        ui.painter()
+            .circle_stroke(icon_center, 10.0, Stroke::new(2.0, icon_color));
+        ui.painter().line_segment(
+            [
+                icon_center + egui::vec2(0.0, -13.0),
+                icon_center + egui::vec2(0.0, -2.0),
+            ],
+            Stroke::new(2.5, icon_color),
+        );
+    }
+    ui.painter().text(
+        center + egui::vec2(0.0, 18.0),
+        egui::Align2::CENTER_CENTER,
+        if pending {
+            t("连接中")
+        } else if active {
+            t("断开连接")
+        } else {
+            t("开始连接")
+        },
+        FontId::proportional(10.0),
+        if active {
+            Color32::from_rgb(38, 59, 23)
+        } else {
+            ACCENT
+        },
+    );
+    response.on_hover_text(state).clicked()
+}
+
+fn takeover_item(
+    ui: &mut egui::Ui,
+    symbol: Icon,
+    label: &str,
+    note: &str,
+    enabled: &mut bool,
+    available: bool,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_space(13.0);
+        icon(ui, symbol, 18.0, MUTED);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).size(11.0).color(TEXT));
+            ui.label(RichText::new(note).size(9.0).color(MUTED));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(13.0);
+            changed = toggle_switch(ui, enabled, label, available);
+        });
+    });
+    changed
+}
+
+fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool, label: &str, available: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(32.0, 19.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::accesskit::Role::Switch, available, *enabled, label)
+    });
+    let changed = available && response.clicked();
+    if changed {
+        *enabled = !*enabled;
+    }
+    ui.painter().rect_filled(
+        rect,
+        10.0,
+        if *enabled {
+            ACCENT
+        } else {
+            Color32::from_rgb(57, 69, 58)
+        },
+    );
+    ui.painter().circle_filled(
+        egui::pos2(
+            if *enabled {
+                rect.right() - 9.5
+            } else {
+                rect.left() + 9.5
+            },
+            rect.center().y,
+        ),
+        7.0,
+        if *enabled {
+            Color32::from_rgb(45, 66, 28)
+        } else {
+            MUTED
+        },
+    );
+    changed
+}
+
+fn heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.label(
         RichText::new(title)
-            .font(FontId::proportional(22.0))
-            .strong()
+            .font(FontId::proportional(21.0))
             .color(TEXT),
     );
+    if !subtitle.is_empty() {
+        ui.label(RichText::new(subtitle).size(11.0).color(MUTED));
+    }
+}
+
+fn section_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(RichText::new(title).size(13.0).strong().color(TEXT));
+    ui.add_space(8.0);
+}
+
+fn setting_row(ui: &mut egui::Ui, label: &str, note: &str, control: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, LINE))
+        .inner_margin(Margin::symmetric(16, 13))
+        .show(ui, |ui| {
+            let text_width = (ui.available_width() - 72.0).max(120.0);
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, 34.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.label(RichText::new(label).size(12.0).color(TEXT));
+                        ui.add(
+                            egui::Label::new(RichText::new(note).size(9.0).color(MUTED)).truncate(),
+                        );
+                    },
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), control);
+            });
+        });
 }
 
 fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(45, 55, 58)))
-        .corner_radius(CornerRadius::same(5))
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::same(18))
         .show(ui, body);
 }
@@ -2635,66 +3412,6 @@ fn dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
-fn proxy_switch(ui: &mut egui::Ui, label: &str, enabled: &mut bool, available: bool) -> bool {
-    let mut changed = false;
-    card(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.set_min_height(80.0);
-        ui.horizontal(|ui| {
-            dot(ui, if *enabled { GOOD } else { MUTED });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(48.0, 26.0), egui::Sense::click());
-                if available && response.clicked() {
-                    *enabled = !*enabled;
-                    changed = true;
-                }
-                let color = if *enabled {
-                    GOOD
-                } else {
-                    MUTED.gamma_multiply(0.35)
-                };
-                ui.painter().rect_filled(rect, 13.0, color);
-                let x = if *enabled {
-                    rect.right() - 13.0
-                } else {
-                    rect.left() + 13.0
-                };
-                ui.painter()
-                    .circle_filled(egui::pos2(x, rect.center().y), 10.0, TEXT);
-                response.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::Role::CheckBox, available, *enabled, label)
-                });
-                response.on_hover_text(if available {
-                    label
-                } else if label == t("虚拟网卡") {
-                    t("Linux 暂未开放")
-                } else {
-                    t("正在开启")
-                });
-            });
-        });
-        ui.label(
-            RichText::new(label)
-                .strong()
-                .size(17.0)
-                .color(if available { TEXT } else { MUTED }),
-        );
-        ui.label(
-            RichText::new(if !available && label == t("虚拟网卡") {
-                t("Linux 暂未开放")
-            } else if !available {
-                t("正在开启")
-            } else {
-                t(if *enabled { "已开启" } else { "已关闭" })
-            })
-            .small()
-            .color(MUTED),
-        );
-    });
-    changed
-}
-
 fn primary_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).strong().color(Color32::BLACK))
         .fill(ACCENT)
@@ -2739,20 +3456,21 @@ fn matches_filter(query: &str, fields: &[&str]) -> bool {
 }
 
 fn traffic_chart(ui: &mut egui::Ui, samples: &VecDeque<(f64, f64)>) {
-    ui.label(
-        RichText::new(t("流量趋势 · 上传 / 下载"))
-            .small()
-            .color(MUTED),
-    );
     let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, PANEL);
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 68.0), egui::Sense::hover());
+    for part in 0..=4 {
+        let y = egui::lerp(rect.y_range(), part as f32 / 4.0);
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            Stroke::new(0.5, LINE),
+        );
+    }
     let maximum = samples
         .iter()
         .flat_map(|(up, down)| [*up, *down])
         .fold(1.0_f64, f64::max);
-    for (download, color) in [(false, ACCENT), (true, GOOD)] {
-        let points = samples
+    for (download, color) in [(false, GOOD), (true, ACCENT)] {
+        let mut points = samples
             .iter()
             .enumerate()
             .map(|(index, (up, down))| {
@@ -2763,6 +3481,12 @@ fn traffic_chart(ui: &mut egui::Ui, samples: &VecDeque<(f64, f64)>) {
                 )
             })
             .collect::<Vec<_>>();
+        if points.is_empty() {
+            points = vec![
+                egui::pos2(rect.left(), rect.bottom() - 3.0),
+                egui::pos2(rect.right(), rect.bottom() - 3.0),
+            ];
+        }
         if points.len() > 1 {
             ui.painter()
                 .add(egui::Shape::line(points, Stroke::new(1.5, color)));
@@ -2931,18 +3655,18 @@ mod tests {
         configure_style(&ctx);
         let mut app = preview_app();
         app.notice = Some(("Example error: ".repeat(30), false));
-        for size in [Vec2::new(520.0, 540.0), Vec2::new(660.0, 660.0)] {
-            for page in [
-                Page::Overview,
-                Page::Node,
-                Page::Settings,
-                Page::Rules,
-                Page::Dns,
-                Page::Connections,
-                Page::Logs,
+        for size in [Vec2::new(760.0, 600.0), Vec2::new(980.0, 760.0)] {
+            for (page, diagnostic_tab) in [
+                (Page::Overview, DiagnosticTab::Connections),
+                (Page::Node, DiagnosticTab::Connections),
+                (Page::Rules, DiagnosticTab::Connections),
+                (Page::Diagnostics, DiagnosticTab::Connections),
+                (Page::Diagnostics, DiagnosticTab::Dns),
+                (Page::Diagnostics, DiagnosticTab::Logs),
+                (Page::Settings, DiagnosticTab::Connections),
             ] {
                 app.page = page;
-                app.advanced = !matches!(page, Page::Overview | Page::Node);
+                app.diagnostic_tab = diagnostic_tab;
                 let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -2950,16 +3674,24 @@ mod tests {
                     },
                     |ui| {
                         app.content(ui);
-                        assert!(
-                            ui.min_rect().right() <= size.x + 1.0,
-                            "page {} width {} exceeds {}",
-                            page as u8,
-                            ui.min_rect().right(),
-                            size.x
-                        );
                     },
                 );
                 assert!(!output.shapes.is_empty());
+                let bounds = output
+                    .shapes
+                    .iter()
+                    .fold(egui::Rect::NOTHING, |bounds, shape| {
+                        bounds.union(
+                            shape
+                                .shape
+                                .visual_bounding_rect()
+                                .intersect(shape.clip_rect),
+                        )
+                    });
+                assert!(
+                    bounds.left() >= -2.0 && bounds.right() <= size.x + 2.0,
+                    "{page:?}: {bounds:?}"
+                );
                 output.textures_delta.clear();
             }
         }
@@ -3061,7 +3793,7 @@ mod tests {
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        Vec2::new(660.0, 660.0),
+                        Vec2::new(980.0, 760.0),
                     )),
                     events,
                     ..Default::default()
@@ -3070,18 +3802,22 @@ mod tests {
             )
         }
         fn click(ctx: &egui::Context, app: &mut HeliosApp, label: &str) {
+            click_nth(ctx, app, label, 0);
+        }
+        fn click_nth(ctx: &egui::Context, app: &mut HeliosApp, label: &str, index: usize) {
             let mut output = draw(ctx, app, Vec::new());
             let pos = output
                 .shapes
                 .iter()
-                .find_map(|shape| match &shape.shape {
+                .filter_map(|shape| match &shape.shape {
                     egui::Shape::Text(text) if text.galley.text() == label => {
                         Some(text.pos + text.galley.rect.center().to_vec2())
                     }
                     _ => None,
                 })
-                .expect("control must be visible");
+                .nth(index);
             output.textures_delta.clear();
+            let pos = pos.expect("control must be visible");
             for pressed in [true, false] {
                 let mut output = draw(
                     ctx,
@@ -3104,13 +3840,28 @@ mod tests {
         ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.0);
         let mut app = preview_app();
         app.page = Page::Settings;
-        app.advanced = true;
-        click(&ctx, &mut app, t("节点"));
+        click(&ctx, &mut app, t("我的节点"));
         assert!(app.page == Page::Node);
-        assert!(!app.advanced);
+        click(&ctx, &mut app, t("诊断"));
+        assert!(app.page == Page::Diagnostics);
+        click(&ctx, &mut app, "DNS");
+        assert!(app.diagnostic_tab == DiagnosticTab::Dns);
+        click(&ctx, &mut app, t("我的节点"));
+        app.profile.nodes.push(NodeProfile {
+            server: String::new(),
+            ..Default::default()
+        });
+        app.probes.push(ProbeState::Untested);
+        click_nth(&ctx, &mut app, t("测试延迟"), 1);
+        assert_eq!(app.profile.active_node, 0);
+        assert_eq!(app.notice.as_ref().map(|notice| notice.1), Some(false));
+        app.profile.nodes.pop();
+        app.probes.pop();
         click(&ctx, &mut app, t("添加节点"));
-        assert_eq!(app.profile.nodes.len(), 2);
-        assert_eq!(app.profile.active_node, 1);
+        click(&ctx, &mut app, t("手动添加节点"));
+        assert_eq!(app.profile.nodes.len(), 1);
+        assert_eq!(app.profile.active_node, 0);
+        assert!(app.node_editor.is_some());
         let mut output = draw(&ctx, &mut app, Vec::new());
         output.textures_delta.clear();
         output = draw(&ctx, &mut app, Vec::new());
@@ -3129,6 +3880,9 @@ mod tests {
             "{labels:?}"
         );
         output.textures_delta.clear();
+        click(&ctx, &mut app, t("取消"));
+        assert!(app.node_editor.is_none());
+        assert_eq!(app.profile.nodes.len(), 1);
         assert!(!app.profile_path.exists());
     }
 
@@ -3178,7 +3932,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_link_adds_and_saves_a_selected_node() {
+    fn connection_link_adds_and_saves_without_switching_the_active_node() {
         let root =
             std::env::temp_dir().join(format!("helios-desktop-link-import-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3206,12 +3960,45 @@ mod tests {
         app.add_connection_link_at(&root);
 
         assert_eq!(app.profile.nodes.len(), 2);
-        assert_eq!(app.profile.active_node, 1);
-        assert_eq!(app.profile.active_node().name, "Imported VPS");
+        assert_eq!(app.profile.active_node, 0);
+        assert_eq!(app.profile.nodes[1].name, "Imported VPS");
         assert!(app.connection_link_text.is_empty());
         assert!(app.profile_path.is_file());
-        assert!(app.profile.active_node().ca_certificate.is_file());
-        assert!(app.profile.active_node().token_file.is_file());
+        assert!(app.profile.nodes[1].ca_certificate.is_file());
+        assert!(app.profile.nodes[1].token_file.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saving_a_node_draft_does_not_switch_the_active_node() {
+        let root = std::env::temp_dir().join(format!(
+            "helios-node-draft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = preview_app();
+        app.profile_path = root.join("desktop.json");
+        app.profile.daemon_config = root.join("daemon.toml");
+        let mut node = app.profile.nodes[0].clone();
+        node.name = "Saved draft".into();
+        node.server = "203.0.113.11:443".into();
+
+        app.save_node_draft(
+            &NodeEditor {
+                index: None,
+                node,
+                error: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(app.profile.active_node, 0);
+        assert_eq!(app.profile.nodes[1].name, "Saved draft");
+        assert!(app.child.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3240,6 +4027,7 @@ mod tests {
         assert_eq!(connection_label(Some(&status), false, true).0, t("连接中"));
         status.state = ConnectionState::Unavailable;
         assert!(!node_ready(&status));
+        assert!(tray_connection_active(true, false, false));
         assert_eq!(
             connection_label(Some(&status), true, false).0,
             t("节点暂不可用")

@@ -126,7 +126,10 @@ fn apply_proxy(service: &str, secure: bool, state: &ProxyState) -> Result<(), Sy
 }
 
 fn run(args: &[&str]) -> Result<String, SystemProxyError> {
-    let output = Command::new(NETWORKSETUP).args(args).output()?;
+    let output = Command::new(NETWORKSETUP)
+        .env("LC_ALL", "C")
+        .args(args)
+        .output()?;
     if !output.status.success() {
         return Err(SystemProxyError::Platform(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -160,19 +163,26 @@ fn parse_proxy(output: &str) -> Result<ProxyState, SystemProxyError> {
                 .map(|(_, value)| value.trim())
         })
     };
-    if value("Authenticated Proxy Enabled").is_some_and(|value| matches!(value, "1" | "Yes")) {
+    if value("Authenticated Proxy Enabled").is_some_and(parse_enabled) {
         return Err(SystemProxyError::Platform(
             "authenticated macOS proxy cannot be safely snapshotted".into(),
         ));
     }
     Ok(ProxyState {
-        enabled: matches!(value("Enabled"), Some("Yes")),
+        enabled: value("Enabled").is_some_and(parse_enabled),
         server: value("Server").unwrap_or_default().to_owned(),
         port: value("Port")
             .unwrap_or("0")
             .parse()
             .map_err(|_| SystemProxyError::Platform("invalid networksetup proxy port".into()))?,
     })
+}
+
+fn parse_enabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "yes" | "on" | "true"
+    )
 }
 
 fn parse_bypass(output: &str) -> Vec<String> {
@@ -214,6 +224,13 @@ mod tests {
                 "Enabled: Yes\nServer: proxy\nPort: 8080\nAuthenticated Proxy Enabled: 1\n"
             )
             .is_err()
+        );
+        assert!(
+            parse_proxy(
+                "Enabled: 1\nServer: 127.0.0.1\nPort: 8080\nAuthenticated Proxy Enabled: 0\n"
+            )
+            .unwrap()
+            .enabled
         );
     }
 

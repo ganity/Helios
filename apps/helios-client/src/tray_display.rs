@@ -5,24 +5,29 @@ pub fn traffic_title(upload: f64, download: f64) -> String {
         } else {
             0.0
         };
-        let mut unit = "B";
-        for next in ["KiB", "MiB", "GiB"] {
-            if value < 1024.0 {
-                break;
-            }
-            value /= 1024.0;
-            unit = next;
+        let units = ["B", "K", "M", "G"];
+        let mut unit = 0;
+        while unit < units.len() - 1 && value >= 999.5 {
+            value /= 1000.0;
+            unit += 1;
         }
-        if unit == "B" {
-            format!("{value:.0} B/s")
-        } else if value >= 10_000.0 {
-            format!(">9999 {unit}/s")
+        value = value.min(999.0);
+        let number = if value < 9.995 {
+            format!("{value:>4.2}")
+        } else if value < 99.95 {
+            format!("{value:>4.1}")
         } else {
-            format!("{value:.1} {unit}/s")
-        }
+            format!("{value:>4.0}")
+        };
+        format!("{number} {}", units[unit])
     }
     format!("↑ {}\n↓ {}", rate(upload), rate(download))
 }
+
+#[cfg(any(test, target_os = "macos"))]
+const STATUS_IMAGE_WIDTH: f64 = 64.0;
+#[cfg(any(test, target_os = "macos"))]
+const STATUS_ITEM_WIDTH: f64 = 68.0;
 
 #[cfg(target_os = "macos")]
 pub fn update(tray: &tray_icon::TrayIcon, connected: bool, upload: f64, download: f64) {
@@ -56,7 +61,7 @@ pub fn update(tray: &tray_icon::TrayIcon, connected: bool, upload: f64, download
         let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) else {
             return;
         };
-        let font = NSFont::monospacedSystemFontOfSize_weight(9.0, NSFontWeightMedium);
+        let font = NSFont::monospacedSystemFontOfSize_weight(8.5, NSFontWeightMedium);
         let color = NSColor::blackColor();
         let values: [&AnyObject; 2] = [&font, &color];
         let attributes = NSDictionary::from_slices(
@@ -81,7 +86,7 @@ pub fn update(tray: &tray_icon::TrayIcon, connected: bool, upload: f64, download
         // One resolution-independent image keeps the icon and both rows inside the menu bar.
         let draw = RcBlock::new(move |_rect: NSRect| -> Bool {
             icon.drawInRect_fromRect_operation_fraction(
-                NSRect::new(NSPoint::new(1.0, 2.0), NSSize::new(18.0, 18.0)),
+                NSRect::new(NSPoint::new(1.0, 3.0), NSSize::new(16.0, 16.0)),
                 NSRect::ZERO,
                 NSCompositingOperation::SourceOver,
                 if connected { 1.0 } else { 0.35 },
@@ -91,21 +96,24 @@ pub fn update(tray: &tray_icon::TrayIcon, connected: bool, upload: f64, download
                 let slash = NSBezierPath::bezierPath();
                 slash.setLineWidth(1.8);
                 slash.moveToPoint(NSPoint::new(2.0, 3.0));
-                slash.lineToPoint(NSPoint::new(18.0, 19.0));
+                slash.lineToPoint(NSPoint::new(17.0, 18.0));
                 slash.stroke();
             }
-            rows[0].drawAtPoint(NSPoint::new(24.0, 11.0));
-            rows[1].drawAtPoint(NSPoint::new(24.0, 1.0));
+            rows[0].drawAtPoint(NSPoint::new(20.0, 11.0));
+            rows[1].drawAtPoint(NSPoint::new(20.0, 1.0));
             Bool::YES
         });
-        let image =
-            NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(100.0, 22.0), false, &draw);
+        let image = NSImage::imageWithSize_flipped_drawingHandler(
+            NSSize::new(STATUS_IMAGE_WIDTH, 22.0),
+            false,
+            &draw,
+        );
         image.setTemplate(true);
         button.setTitle(&NSString::from_str(""));
         button.setImagePosition(NSCellImagePosition::ImageOnly);
         button.setImageScaling(NSImageScaling::ScaleNone);
         button.setImage(Some(&image));
-        item.setLength(110.0);
+        item.setLength(STATUS_ITEM_WIDTH);
     }
 }
 
@@ -115,18 +123,23 @@ mod tests {
 
     #[test]
     fn rates_use_two_compact_rows_that_fit_the_status_image() {
-        let title = traffic_title(0.0, 1024.0 * 1024.0 * 12.5);
+        let title = traffic_title(0.0, 12_500_000.0);
         let rows: Vec<_> = title.lines().collect();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows, ["↑ 0 B/s", "↓ 12.5 MiB/s"]);
-        assert!(traffic_title(1024.0 * 1023.9, 0.0).contains("1023.9 KiB/s"));
+        assert_eq!(rows, ["↑ 0.00 B", "↓ 12.5 M"]);
+        assert_eq!(
+            traffic_title(128_400.0, 0.0).lines().next(),
+            Some("↑  128 K")
+        );
         assert_eq!(traffic_title(f64::NAN, -1.0), traffic_title(0.0, 0.0));
         for rate in [0.0, 1023.0, 1024.0, 1024.0 * 1023.9, f64::MAX] {
             assert!(
                 traffic_title(rate, rate)
                     .lines()
-                    .all(|row| row.chars().count() <= 14)
+                    .all(|row| row.chars().count() == 8)
             );
         }
+        assert_eq!(STATUS_IMAGE_WIDTH, 64.0);
+        assert_eq!(STATUS_ITEM_WIDTH, 68.0);
     }
 }
