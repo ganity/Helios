@@ -215,6 +215,7 @@ struct HeliosApp {
     node_filter: String,
     status: Option<StatusSnapshot>,
     status_error: Option<String>,
+    last_status_success: Option<Instant>,
     last_traffic: Option<(Instant, u64, u64)>,
     upload_rate: f64,
     download_rate: f64,
@@ -312,6 +313,7 @@ impl HeliosApp {
             node_filter: String::new(),
             status: None,
             status_error: None,
+            last_status_success: None,
             last_traffic: None,
             upload_rate: 0.0,
             download_rate: 0.0,
@@ -460,8 +462,10 @@ impl HeliosApp {
                             });
                         }
                         Err(error) => {
-                            self.notice =
-                                Some((format!("配置未生效，原节点继续运行：{error}"), false));
+                            self.notice = Some((
+                                format!("{}：{error}", t("配置更新失败或超时，请刷新状态确认")),
+                                false,
+                            ));
                         }
                     }
                     self.last_poll = Instant::now() - Duration::from_secs(5);
@@ -529,6 +533,7 @@ impl HeliosApp {
                         self.traffic_history.pop_front();
                     }
                     self.last_traffic = Some((now, status.uploaded_bytes, status.downloaded_bytes));
+                    self.last_status_success = Some(now);
                     self.status = Some(status);
                     self.status_error = None;
                     #[cfg(target_os = "macos")]
@@ -540,8 +545,6 @@ impl HeliosApp {
                     }
                 }
                 Event::Status(_, Err(error)) => {
-                    self.status = None;
-                    self.system_proxy_verified = false;
                     self.status_error = Some(error);
                     self.upload_rate = 0.0;
                     self.download_rate = 0.0;
@@ -1670,11 +1673,22 @@ impl HeliosApp {
         }
     }
 
+    fn status_is_stale(&self) -> bool {
+        self.status_error.is_some()
+            && self
+                .last_status_success
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+    }
+
     fn overview(&mut self, ui: &mut egui::Ui) {
         let connected = self.system_proxy_enabled && self.system_proxy_verified;
         let pending = self.connecting_since.is_some();
-        let (label, color) =
-            connection_label(self.status.as_ref(), connected || self.tun_enabled, pending);
+        let stale = self.status_is_stale();
+        let (label, color) = if stale && !pending {
+            (t("状态未知"), WARN)
+        } else {
+            connection_label(self.status.as_ref(), connected || self.tun_enabled, pending)
+        };
         let hero_width = ui.available_width();
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -1686,7 +1700,9 @@ impl HeliosApp {
                     ui.horizontal(|ui| {
                         dot(ui, color);
                         ui.label(
-                            RichText::new(if pending {
+                            RichText::new(if stale {
+                                "STATUS UNKNOWN"
+                            } else if pending {
                                 "CONNECTING"
                             } else if connected || self.tun_enabled {
                                 "CONNECTION ACTIVE"
@@ -1701,7 +1717,9 @@ impl HeliosApp {
                     ui.label(RichText::new(label).size(40.0).color(TEXT));
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(if self.tun_enabled {
+                        RichText::new(if stale {
+                            t("无法确认当前连接状态")
+                        } else if self.tun_enabled {
                             t("虚拟网卡已开启")
                         } else if connected {
                             t("系统代理已开启")
@@ -1720,6 +1738,12 @@ impl HeliosApp {
             }
         });
 
+        if let Some(error) = &self.status_error {
+            ui.colored_label(
+                WARN,
+                format!("{}：{error}", t("状态刷新失败，显示上次结果")),
+            );
+        }
         let node = self.profile.active_node();
         let latency = self.status.as_ref().and_then(|s| match s.transport {
             helios_control::ActiveTransport::Quic => s.quic_rtt_micros,
@@ -4054,6 +4078,47 @@ mod tests {
             .unwrap();
         app.poll_events(&ctx);
         assert_eq!(app.status_request_revision, None);
+    }
+
+    #[test]
+    fn failed_status_expires_and_success_restores_freshness() {
+        let mut app = preview_app();
+        app.status_error = Some("timeout".into());
+        app.last_status_success = Some(Instant::now());
+        assert!(!app.status_is_stale());
+        app.last_status_success = Some(Instant::now() - Duration::from_secs(11));
+        assert!(app.status_is_stale());
+        app.status_error = None;
+        assert!(!app.status_is_stale());
+    }
+
+    #[test]
+    fn failed_status_poll_preserves_the_last_verified_connection() {
+        let mut app = preview_app();
+        let ctx = egui::Context::default();
+        let status: StatusSnapshot = serde_json::from_value(serde_json::json!({
+            "state": "connected", "transport": "quic",
+            "quic_rtt_micros": 100, "tls_rtt_micros": null,
+            "active_flows": 0, "uploaded_bytes": 100, "downloaded_bytes": 200,
+            "udp_dropped_packets": 0, "system_proxy_enabled": true,
+            "system_proxy_verified": true
+        }))
+        .unwrap();
+        app.event_tx
+            .send(Event::Status(0, Ok(status.clone())))
+            .unwrap();
+        app.poll_events(&ctx);
+        app.event_tx
+            .send(Event::Status(0, Err("control request timed out".into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert_eq!(app.status, Some(status.clone()));
+        assert!(app.system_proxy_enabled && app.system_proxy_verified);
+        assert!(app.status_error.is_some());
+        assert!(app.last_traffic.is_none());
+        app.event_tx.send(Event::Status(0, Ok(status))).unwrap();
+        app.poll_events(&ctx);
+        assert!(app.status_error.is_none());
     }
 
     #[test]

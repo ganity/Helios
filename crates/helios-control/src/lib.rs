@@ -1,10 +1,12 @@
 use helios_routing::RuleConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const CONTROL_VERSION: u16 = 5;
+pub const CONTROL_VERSION: u16 = 6;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
+pub const MAX_CONTROL_REQUEST: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +19,9 @@ pub struct ControlRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlCommand {
+    LargeRequest {
+        length: u32,
+    },
     TestRoute {
         rules: Vec<RuleConfig>,
         host: String,
@@ -144,6 +149,73 @@ where
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Authenticate the small envelope before allocating a large request body.
+pub async fn read_request<S>(
+    stream: &mut S,
+    token: &[u8; 32],
+) -> Result<ControlRequest, ControlError>
+where
+    S: AsyncRead + Unpin,
+{
+    let envelope: ControlRequest = read_message(stream).await?;
+    let ControlCommand::LargeRequest { length } = envelope.command else {
+        return Ok(envelope);
+    };
+    if !bool::from(envelope.token.ct_eq(token)) || envelope.version != CONTROL_VERSION {
+        return Err(ControlError::InvalidRequest("unauthorized large request"));
+    }
+    let length = length as usize;
+    if length > MAX_CONTROL_REQUEST {
+        return Err(ControlError::MessageTooLarge(length));
+    }
+    if length <= MAX_CONTROL_MESSAGE {
+        return Err(ControlError::InvalidRequest("invalid large request length"));
+    }
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await?;
+    let request: ControlRequest = serde_json::from_slice(&bytes)?;
+    if request.version != envelope.version
+        || !bool::from(request.token.ct_eq(token))
+        || !matches!(
+            request.command,
+            ControlCommand::UpdateRules { .. }
+                | ControlCommand::TestRoute { .. }
+                | ControlCommand::ApplyConfig { .. }
+        )
+    {
+        return Err(ControlError::InvalidRequest("invalid large request body"));
+    }
+    Ok(request)
+}
+
+pub async fn write_request<S>(stream: &mut S, request: &ControlRequest) -> Result<(), ControlError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let bytes = serde_json::to_vec(request)?;
+    if bytes.len() > MAX_CONTROL_REQUEST {
+        return Err(ControlError::MessageTooLarge(bytes.len()));
+    }
+    if bytes.len() > MAX_CONTROL_MESSAGE {
+        write_message(
+            stream,
+            &ControlRequest {
+                version: request.version,
+                token: request.token,
+                command: ControlCommand::LargeRequest {
+                    length: bytes.len() as u32,
+                },
+            },
+        )
+        .await?;
+    } else {
+        stream.write_u32(bytes.len() as u32).await?;
+    }
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 pub async fn write_message<T, S>(stream: &mut S, value: &T) -> Result<(), ControlError>
 where
     T: Serialize,
@@ -161,6 +233,8 @@ where
 
 #[derive(Debug, Error)]
 pub enum ControlError {
+    #[error("invalid control request: {0}")]
+    InvalidRequest(&'static str),
     #[error("control I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("control JSON is invalid: {0}")]
@@ -230,6 +304,117 @@ mod tests {
             read_message::<ControlRequest, _>(&mut reader).await,
             Err(ControlError::MessageTooLarge(length)) if length == MAX_CONTROL_MESSAGE + 1
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_large_envelopes_before_reading_the_body() {
+        for (token, version, length) in [
+            ([8; 32], CONTROL_VERSION, MAX_CONTROL_MESSAGE + 1),
+            ([7; 32], CONTROL_VERSION - 1, MAX_CONTROL_MESSAGE + 1),
+            ([7; 32], CONTROL_VERSION, MAX_CONTROL_REQUEST + 1),
+            ([7; 32], CONTROL_VERSION, MAX_CONTROL_MESSAGE),
+        ] {
+            let (mut writer, mut reader) = duplex(1024);
+            write_message(
+                &mut writer,
+                &ControlRequest {
+                    token,
+                    version,
+                    command: ControlCommand::LargeRequest {
+                        length: length as u32,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            assert!(read_request(&mut reader, &[7; 32]).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_large_body() {
+        let (mut writer, mut reader) = duplex(1024);
+        write_message(
+            &mut writer,
+            &ControlRequest {
+                token: [7; 32],
+                version: CONTROL_VERSION,
+                command: ControlCommand::LargeRequest {
+                    length: (MAX_CONTROL_MESSAGE + 1) as u32,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        writer.write_all(b"{\"version\":").await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(matches!(read_request(&mut reader, &[7; 32]).await,
+            Err(ControlError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    }
+
+    #[tokio::test]
+    async fn rejects_nested_or_mismatched_large_body() {
+        for (token, version, command) in [
+            (
+                [7; 32],
+                CONTROL_VERSION,
+                ControlCommand::LargeRequest { length: 100_000 },
+            ),
+            (
+                [8; 32],
+                CONTROL_VERSION,
+                ControlCommand::UpdateRules { rules: vec![] },
+            ),
+            (
+                [7; 32],
+                CONTROL_VERSION - 1,
+                ControlCommand::UpdateRules { rules: vec![] },
+            ),
+        ] {
+            let mut body = serde_json::to_vec(&ControlRequest {
+                token,
+                version,
+                command,
+            })
+            .unwrap();
+            body.resize(MAX_CONTROL_MESSAGE + 1, b' ');
+            let (mut writer, mut reader) = duplex(1024);
+            let send = async {
+                write_message(
+                    &mut writer,
+                    &ControlRequest {
+                        token: [7; 32],
+                        version: CONTROL_VERSION,
+                        command: ControlCommand::LargeRequest {
+                            length: body.len() as u32,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+                writer.write_all(&body).await.unwrap();
+            };
+            let (_, result) = tokio::join!(send, read_request(&mut reader, &[7; 32]));
+            assert!(matches!(result, Err(ControlError::InvalidRequest(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_before_writing() {
+        let request = ControlRequest {
+            token: [7; 32],
+            version: CONTROL_VERSION,
+            command: ControlCommand::TestRoute {
+                rules: vec![],
+                host: "x".repeat(MAX_CONTROL_REQUEST),
+                port: 443,
+                network: helios_routing::Network::Tcp,
+            },
+        };
+        assert!(
+            matches!(write_request(&mut tokio::io::sink(), &request).await,
+            Err(ControlError::MessageTooLarge(length)) if length > MAX_CONTROL_REQUEST)
+        );
     }
 
     #[tokio::test]

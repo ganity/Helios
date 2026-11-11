@@ -2042,6 +2042,7 @@ dependencies = [
  "helios-routing",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -2053,6 +2054,8 @@ dependencies = [
  "base64",
  "bytes",
  "getrandom 0.4.3",
+ "helios-client-control",
+ "helios-client-model",
  "helios-config",
  "helios-control",
  "helios-dns",

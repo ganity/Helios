@@ -31,6 +31,8 @@ tracing-subscriber.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
 
 [dev-dependencies]
+helios-client-control = { path = "../../crates/helios-client-control" }
+helios-client-model = { path = "../../crates/helios-client-model" }
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 base64 = "0.22.1"

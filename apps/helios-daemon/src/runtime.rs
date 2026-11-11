@@ -10,7 +10,7 @@ struct State {
 pub struct Runtime {
     state: RwLock<State>,
     apply: tokio::sync::Mutex<()>,
-    metrics: Arc<DaemonMetrics>,
+    pub(super) metrics: Arc<DaemonMetrics>,
     closing: AtomicBool,
     config_path: Option<PathBuf>,
 }
@@ -44,7 +44,7 @@ impl Runtime {
         self.closing.load(Ordering::SeqCst)
     }
 
-    async fn failover(&self) -> Result<bool, AnyError> {
+    async fn failover(self: &Arc<Self>) -> Result<bool, AnyError> {
         let state = self.state.read().await;
         let mut config = state.config.clone();
         let revision = state.revision;
@@ -126,6 +126,15 @@ impl Runtime {
     }
 
     pub async fn update_rules(
+        self: &Arc<Self>,
+        configs: &[helios_routing::RuleConfig],
+    ) -> Result<(), AnyError> {
+        let runtime = self.clone();
+        let configs = configs.to_vec();
+        tokio::spawn(async move { runtime.update_rules_inner(&configs).await }).await?
+    }
+
+    async fn update_rules_inner(
         &self,
         configs: &[helios_routing::RuleConfig],
     ) -> Result<(), AnyError> {
@@ -134,19 +143,34 @@ impl Runtime {
         if self.closing.load(Ordering::SeqCst) {
             return Err("daemon is shutting down".into());
         }
-        let mut state = self.state.write().await;
-        let mut config = state.config.clone();
+        let mut config = self.config().await;
         config.rules = configs.to_vec();
-        if let Some(path) = &self.config_path {
-            config.save(path)?;
-        }
+        let path = self.config_path.clone();
+        let config = tokio::task::spawn_blocking(move || -> Result<_, AnyError> {
+            if let Some(path) = path {
+                config.save(&path)?;
+            }
+            Ok(config)
+        })
+        .await??;
+        let mut state = self.state.write().await;
         *state.remote.rules.write().await = updated;
         state.config = config;
         state.revision += 1;
         Ok(())
     }
 
-    pub async fn apply(&self, revision: u64, config: DaemonConfig) -> Result<u64, AnyError> {
+    pub async fn apply(
+        self: &Arc<Self>,
+        revision: u64,
+        config: DaemonConfig,
+    ) -> Result<u64, AnyError> {
+        let runtime = self.clone();
+        // Complete persistence and commit even if the IPC caller times out or disconnects.
+        tokio::spawn(async move { runtime.apply_inner(revision, config).await }).await?
+    }
+
+    async fn apply_inner(&self, revision: u64, config: DaemonConfig) -> Result<u64, AnyError> {
         config.validate()?;
         let _apply = self.apply.lock().await;
         if self.closing.load(Ordering::SeqCst) {
@@ -234,31 +258,13 @@ impl Runtime {
         remote.metrics = self.metrics.clone();
         remote.rules = rules.clone();
         remote.connect_milliseconds = config.timeouts.connect_milliseconds;
-        let mut state = self.state.write().await;
-        let mut rule_guard = rules.write().await;
         if self.closing.load(Ordering::SeqCst) {
             return Err("daemon is shutting down".into());
         }
-        if let Some(proxy) = self
-            .metrics
-            .proxy
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_mut()
-        {
-            proxy.update_settings(helios_system_proxy::ProxySettings {
-                endpoint: helios_system_proxy::ProxyEndpoint::new(
-                    config.http_listen.ip().to_string(),
-                    config.http_listen.port(),
-                )?,
-                bypass: config.proxy_bypass.clone(),
-            })?;
-        }
-        if let Some(path) = &self.config_path
-            && let Err(error) = config.save(path)
-        {
-            if let Some(proxy) = self
-                .metrics
+        let metrics = self.metrics.clone();
+        let path = self.config_path.clone();
+        let config = tokio::task::spawn_blocking(move || -> Result<_, AnyError> {
+            if let Some(proxy) = metrics
                 .proxy
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -266,14 +272,36 @@ impl Runtime {
             {
                 proxy.update_settings(helios_system_proxy::ProxySettings {
                     endpoint: helios_system_proxy::ProxyEndpoint::new(
-                        old.http_listen.ip().to_string(),
-                        old.http_listen.port(),
+                        config.http_listen.ip().to_string(),
+                        config.http_listen.port(),
                     )?,
-                    bypass: old.proxy_bypass,
+                    bypass: config.proxy_bypass.clone(),
                 })?;
             }
-            return Err(error.into());
-        }
+            if let Some(path) = &path
+                && let Err(error) = config.save(path)
+            {
+                if let Some(proxy) = metrics
+                    .proxy
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_mut()
+                {
+                    proxy.update_settings(helios_system_proxy::ProxySettings {
+                        endpoint: helios_system_proxy::ProxyEndpoint::new(
+                            old.http_listen.ip().to_string(),
+                            old.http_listen.port(),
+                        )?,
+                        bypass: old.proxy_bypass,
+                    })?;
+                }
+                return Err(error.into());
+            }
+            Ok(config)
+        })
+        .await??;
+        let mut state = self.state.write().await;
+        let mut rule_guard = rules.write().await;
         *rule_guard = updated_rules;
         state.remote = remote;
         state.health = health;
@@ -597,10 +625,126 @@ mod tests {
         assert_eq!(runtime.snapshot().await.config_revision, 3);
         runtime.update_rules(&config.rules).await.unwrap();
         assert_eq!(runtime.snapshot().await.config_revision, 4);
+
+        #[cfg(not(windows))]
+        {
+            // Exercise every large-rule operation through the desktop's real client and IPC server.
+            let full_rules = helios_client_model::parse_rules(include_str!(
+                "../../../config/china-direct-full.rules"
+            ))
+            .unwrap();
+            let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = helios_client_control::DaemonClient::new(
+                control.local_addr().unwrap(),
+                None,
+                config.node.token_file.clone(),
+            );
+            let token = load_token(&config.node.token_file).unwrap();
+            let control_runtime = runtime.clone();
+            let control_task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = control.accept().await.unwrap();
+                    let runtime = control_runtime.clone();
+                    tokio::spawn(async move {
+                        let (shutdown, _) = watch::channel(false);
+                        serve_control_connection(
+                            stream,
+                            runtime.metrics.clone(),
+                            runtime.remote().await.rules,
+                            token,
+                            shutdown,
+                        )
+                        .await
+                        .unwrap();
+                    });
+                }
+            });
+            client.update_rules(full_rules.clone()).await.unwrap();
+            assert_eq!(runtime.snapshot().await.config_revision, 5);
+            assert_eq!(
+                DaemonConfig::load(directory1.join("daemon.toml"))
+                    .unwrap()
+                    .rules,
+                full_rules
+            );
+            let target = Target::new(Address::Domain("baidu.com".into()), 443).unwrap();
+            let report = client
+                .test_route(full_rules.clone(), target, Network::Tcp)
+                .await
+                .unwrap();
+            assert_eq!(report.action, RouteAction::Direct);
+            assert_eq!(runtime.snapshot().await.config_revision, 5);
+            let mut large_config = runtime.config().await;
+            large_config.node = second.clone();
+            large_config.backup_nodes = vec![config.node.clone()];
+            assert_eq!(
+                client.apply_config(5, large_config.clone()).await.unwrap(),
+                6
+            );
+            assert_eq!(runtime.snapshot().await.active_server, Some(second.server));
+            assert_eq!(
+                DaemonConfig::load(directory1.join("daemon.toml")).unwrap(),
+                large_config
+            );
+            assert!(
+                client
+                    .apply_config(5, large_config)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("configuration changed")
+            );
+            assert_eq!(runtime.snapshot().await.config_revision, 6);
+            let mut invalid_rules = full_rules;
+            invalid_rules.pop();
+            assert!(client.update_rules(invalid_rules).await.is_err());
+            assert_eq!(runtime.snapshot().await.config_revision, 6);
+            control_task.abort();
+        }
+
+        // A slow platform operation must not block status or leave a half-committed update
+        // when the control caller goes away.
+        let revision = runtime.snapshot().await.config_revision;
+        let current = runtime.config().await;
+        let metrics = runtime.metrics.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_platform = tokio::task::spawn_blocking(move || {
+            let _proxy = metrics.proxy.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let applying = runtime.clone();
+        let caller = tokio::spawn(async move { applying.apply(revision, current).await });
+        timeout(Duration::from_secs(2), async {
+            while runtime.apply.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = timeout(Duration::from_millis(500), runtime.snapshot()).await;
+        caller.abort();
+        release_tx.send(()).unwrap();
+        slow_platform.await.unwrap();
+        assert_eq!(snapshot.unwrap().config_revision, revision);
+        timeout(Duration::from_secs(10), async {
+            while runtime.snapshot().await.config_revision == revision {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            DaemonConfig::load(directory1.join("daemon.toml")).unwrap(),
+            runtime.config().await
+        );
+        let revision = runtime.snapshot().await.config_revision;
         runtime.close();
         assert!(
             runtime
-                .apply(4, config)
+                .apply(revision, config)
                 .await
                 .unwrap_err()
                 .to_string()

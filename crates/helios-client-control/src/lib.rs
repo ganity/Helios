@@ -8,7 +8,7 @@ use std::{
 use helios_config::{ConfigError, NodeConfig, TransportPreference, load_roots, load_token};
 use helios_control::{
     CONTROL_VERSION, ControlCommand, ControlError, ControlRequest, ControlResponse, ControlResult,
-    StatusSnapshot, read_message, write_message,
+    StatusSnapshot, read_message, write_message, write_request,
 };
 use helios_protocol::CAP_TCP_CONNECT;
 use helios_routing::RuleConfig;
@@ -266,7 +266,9 @@ impl DaemonClient {
 
     async fn request(&self, command: ControlCommand) -> Result<ControlResult, ClientControlError> {
         let deadline = match &command {
-            ControlCommand::TestRoute { .. } => Duration::from_secs(5),
+            ControlCommand::TestRoute { .. } | ControlCommand::UpdateRules { .. } => {
+                Duration::from_secs(10)
+            }
             ControlCommand::ApplyConfig { .. } => Duration::from_secs(30),
             ControlCommand::SetSystemProxy { .. } => Duration::from_secs(15),
             _ => Duration::from_secs(2),
@@ -275,15 +277,19 @@ impl DaemonClient {
         let mut stream = tokio::time::timeout(Duration::from_secs(1), self.connect())
             .await
             .map_err(|_| ClientControlError::Timeout)??;
-        write_message(
-            &mut stream,
-            &ControlRequest {
-                version: CONTROL_VERSION,
-                token,
-                command,
-            },
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            write_request(
+                &mut stream,
+                &ControlRequest {
+                    version: CONTROL_VERSION,
+                    token,
+                    command,
+                },
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ClientControlError::Timeout)??;
         let response: ControlResponse = tokio::time::timeout(deadline, read_message(&mut stream))
             .await
             .map_err(|_| ClientControlError::Timeout)??;

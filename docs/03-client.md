@@ -83,7 +83,9 @@ Kind: u16
 Payload: postcard/CBOR bytes
 ```
 
-当前使用 `serde_json`，control schema version 为 5，单条消息最大 64 KiB。支持对未保存规则进行真实 DNS 分类的 `TestRoute`（最长 3 秒解析预算）、`GetStatus`、`UpdateRules`、`CloseFlow`、`SetSystemProxy`、带 revision 的 `ApplyConfig`、过期 DNS 映射清理及 `Shutdown`。IPC 与公网 Helios Protocol 完全分离。
+当前使用 `serde_json`，control schema version 为 6。普通帧与响应最大 64 KiB；`UpdateRules`、`TestRoute` 和 `ApplyConfig` 的大请求先发送带版本、token 和正文长度的 `LargeRequest` 小帧，再在同一连接发送 JSON 正文。daemon 在分配正文前以常量时间校验 token、检查版本和长度，正文最大 32 MiB，接收总期限 10 秒；正文必须具有相同身份与版本，不能嵌套大请求。传输不完整或规则校验失败不更改生效配置。客户端发送期限 10 秒，规则更新与测试的响应期限 10 秒，配置切换保持 30 秒。客户端、daemon 与 heliosctl 应一起升级并重启后台。
+
+支持对未保存规则进行真实 DNS 分类的 `TestRoute`（最长 3 秒解析预算）、`GetStatus`、`UpdateRules`、`CloseFlow`、`SetSystemProxy`、带 revision 的 `ApplyConfig`、过期 DNS 映射清理及 `Shutdown`。IPC 与公网 Helios Protocol 完全分离。
 
 ### 命令
 
@@ -175,7 +177,7 @@ DNS
 ### 连接
 
 - 当前 Connections 页通过认证 IPC 展示活跃 Flow 的 ID、Inbound、Target、路由决策、实际传输、持续时间与独立上下行字节。
-- daemon 最多返回 256 条明细，但活跃总数始终准确，避免突破 64 KiB IPC 消息上限。
+- daemon 最多返回 256 条明细，且按完整状态响应的实际 JSON 字节数截断到 64 KiB 内；连接总数和流量计数不受明细截断影响。
 - Flow 结束即从内存注册表移除，不落盘、不保留访问历史；历史只保留聚合流量指标。
 - UDP association 可能同时承载 Direct 与 Proxy 数据包，因此决策显示为 `mixed`，传输显示 association 建立时可用的 QUIC、TLS 或 Direct。
 - 节点名称和绝对开始时间尚未实现。

@@ -11,5 +11,6 @@ helios-config = { path = "../helios-config" }
 helios-routing = { path = "../helios-routing" }
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

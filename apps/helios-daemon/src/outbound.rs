@@ -524,6 +524,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_geoip_dns_does_not_block_control_status() {
+        use crate::{DaemonMetrics, TransportPreference, serve_control_connection};
+        use helios_control::{
+            CONTROL_VERSION, ControlCommand, ControlRequest, ControlResponse, ControlResult,
+            read_message, write_request,
+        };
+        use helios_routing::{Network, RouteAction, RuleConfig, RuleSet};
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", server.local_addr().unwrap());
+        let rules = RuleSet::new(&[
+            RuleConfig::Geoip {
+                value: "cn".into(),
+                action: RouteAction::Direct,
+                no_resolve: false,
+            },
+            RuleConfig::Final {
+                action: RouteAction::Proxy,
+            },
+        ])
+        .unwrap();
+        let dns_rules = rules.clone();
+        let lookup = tokio::spawn(async move {
+            outbound
+                .evaluate_route(&dns_rules, &domain_target("unlisted.example"), Network::Tcp)
+                .await
+        });
+        let mut bytes = [0; 1024];
+        timeout(Duration::from_secs(1), server.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Tls));
+        metrics
+            .tls_checked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .tls_healthy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let (shutdown, _) = tokio::sync::watch::channel(false);
+            let worker = tokio::spawn(serve_control_connection(
+                stream,
+                metrics.clone(),
+                Arc::new(tokio::sync::RwLock::new(rules.clone())),
+                [7; 32],
+                shutdown,
+            ));
+            write_request(
+                &mut client,
+                &ControlRequest {
+                    version: CONTROL_VERSION,
+                    token: [7; 32],
+                    command: ControlCommand::GetStatus,
+                },
+            )
+            .await
+            .unwrap();
+            let response: ControlResponse =
+                timeout(Duration::from_millis(500), read_message(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(response.result, ControlResult::Status { snapshot }
+                if snapshot.state == helios_control::ConnectionState::Connected));
+            worker.await.unwrap().unwrap();
+        }
+        assert!(!lookup.is_finished());
+        lookup.abort();
+    }
+
+    #[tokio::test]
     async fn dns_cache_coalesces_and_expires_and_is_scoped_to_policy() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let outbound = bound("127.0.0.1", server.local_addr().unwrap());

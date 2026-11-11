@@ -149,6 +149,19 @@ const TEXT: &[(&str, &str)] = &[
     ("节点暂不可用", "Node unavailable"),
     ("系统代理已开启", "System proxy enabled"),
     ("系统代理未开启", "System proxy disabled"),
+    ("状态未知", "Status unknown"),
+    (
+        "配置更新失败或超时，请刷新状态确认",
+        "Configuration update failed or timed out; refresh status to confirm",
+    ),
+    (
+        "无法确认当前连接状态",
+        "Cannot verify the current connection status",
+    ),
+    (
+        "状态刷新失败，显示上次结果",
+        "Status refresh failed; showing last result",
+    ),
     ("正在连接节点", "Connecting to node"),
     ("断开连接", "Disconnect"),
     ("开始连接", "Connect"),

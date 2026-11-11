@@ -1,6 +1,10 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use std::process::Command;
+use std::{
+    io::Read,
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,16 +130,62 @@ fn apply_proxy(service: &str, secure: bool, state: &ProxyState) -> Result<(), Sy
 }
 
 fn run(args: &[&str]) -> Result<String, SystemProxyError> {
-    let output = Command::new(NETWORKSETUP)
-        .env("LC_ALL", "C")
-        .args(args)
-        .output()?;
+    let output = command_output(
+        Command::new(NETWORKSETUP).env("LC_ALL", "C").args(args),
+        Duration::from_secs(3),
+    )?;
     if !output.status.success() {
         return Err(SystemProxyError::Platform(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
     String::from_utf8(output.stdout).map_err(|error| SystemProxyError::Platform(error.to_string()))
+}
+
+fn command_output(command: &mut Command, limit: Duration) -> Result<Output, SystemProxyError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(match result {
+                    Err(error) => error,
+                    _ => std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "networksetup command timed out",
+                    ),
+                });
+            }
+        }
+    };
+    let stdout = out
+        .join()
+        .map_err(|_| SystemProxyError::Platform("stdout reader failed".into()))??;
+    let stderr = err
+        .join()
+        .map_err(|_| SystemProxyError::Platform("stderr reader failed".into()))??;
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
 }
 
 fn parse_services(output: &str) -> Result<Vec<String>, SystemProxyError> {
@@ -197,6 +247,23 @@ fn parse_bypass(output: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_deadline_kills_and_reaps_the_child_and_drains_pipes() {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("/bin/sleep").arg("30"),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let output =
+            command_output(Command::new("/bin/echo").arg("ok"), Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok\n");
+    }
 
     #[test]
     fn parses_services_proxies_and_bypass_output() {

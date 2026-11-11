@@ -23,7 +23,7 @@ mod quic_tests;
 use helios_config::{DaemonConfig, TransportPreference, load_roots, load_token};
 use helios_control::{
     ActiveFlowSnapshot, ActiveTransport, CONTROL_VERSION, ConnectionState, ControlCommand,
-    ControlRequest, ControlResponse, ControlResult, StatusSnapshot, read_message, write_message,
+    ControlRequest, ControlResponse, ControlResult, StatusSnapshot, read_request, write_message,
 };
 use helios_dns::FakeIpPool;
 use helios_protocol::{
@@ -139,6 +139,7 @@ struct NodeConnectConfig {
 struct DaemonMetrics {
     runtime: Mutex<Option<std::sync::Weak<runtime::Runtime>>>,
     proxy: Mutex<Option<managed_proxy::NativeProxy>>,
+    proxy_status: Mutex<(bool, bool, Option<String>)>,
     desktop_managed: AtomicBool,
     prefers_quic: bool,
     quic_healthy: AtomicBool,
@@ -159,6 +160,7 @@ impl DaemonMetrics {
         Self {
             runtime: Mutex::new(None),
             proxy: Mutex::new(None),
+            proxy_status: Mutex::new((false, false, None)),
             desktop_managed: AtomicBool::new(false),
             prefers_quic: preference == TransportPreference::Quic,
             quic_healthy: AtomicBool::new(false),
@@ -177,12 +179,10 @@ impl DaemonMetrics {
 
     fn snapshot(&self) -> StatusSnapshot {
         let (proxy_enabled, proxy_verified, proxy_error) = self
-            .proxy
+            .proxy_status
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|proxy| proxy.status())
-            .unwrap_or((false, false, None));
+            .clone();
         let quic_healthy = self.quic_healthy.load(Ordering::Relaxed);
         let tls_checked = self.tls_checked.load(Ordering::Relaxed);
         let tls_healthy = self.tls_healthy.load(Ordering::Relaxed);
@@ -647,6 +647,7 @@ async fn main() -> Result<(), AnyError> {
             run_dns_listener(dns_socket, fake_ips, shutdown.subscribe()),
             runtime.clone().monitor(shutdown.subscribe()),
             runtime::restore_proxy_after_wake(metrics.clone(), shutdown.subscribe()),
+            monitor_proxy_status(metrics.clone(), shutdown.subscribe()),
         )
     };
     #[cfg(target_os = "linux")]
@@ -859,8 +860,9 @@ async fn serve_control_connection(
     shutdown: watch::Sender<bool>,
 ) -> Result<(), AnyError> {
     let request: ControlRequest =
-        timeout(Duration::from_secs(5), read_message(&mut stream)).await??;
-    let (result, should_shutdown) = control_result(&request, &token, &metrics, &rules).await;
+        timeout(Duration::from_secs(10), read_request(&mut stream, &token)).await??;
+    let (mut result, should_shutdown) = control_result(&request, &token, &metrics, &rules).await;
+    bound_status_response(&mut result)?;
     let response = write_message(
         &mut stream,
         &ControlResponse {
@@ -874,6 +876,61 @@ async fn serve_control_connection(
     }
     response?;
     Ok(())
+}
+
+// Bound bytes as well as count: legal long domains can overflow a 256-flow response.
+fn bound_status_response(result: &mut ControlResult) -> Result<(), serde_json::Error> {
+    if let ControlResult::Status { snapshot } = result {
+        let mut details = std::mem::take(&mut snapshot.active_flow_details);
+        let base = serde_json::to_vec(&ControlResponse {
+            version: CONTROL_VERSION,
+            result: ControlResult::Status {
+                snapshot: snapshot.clone(),
+            },
+        })?
+        .len();
+        let mut size = base;
+        for detail in details.drain(..) {
+            let extra = serde_json::to_vec(&detail)?.len()
+                + usize::from(!snapshot.active_flow_details.is_empty());
+            if size + extra > helios_control::MAX_CONTROL_MESSAGE {
+                break;
+            }
+            size += extra;
+            snapshot.active_flow_details.push(detail);
+        }
+    }
+    Ok(())
+}
+
+async fn monitor_proxy_status(
+    metrics: Arc<DaemonMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), AnyError> {
+    let mut ticks = interval(Duration::from_secs(2));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticks.tick() => {},
+            changed = shutdown.changed() => { changed?; return Ok(()); }
+        }
+        let metrics = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let proxy = metrics
+                .proxy
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let status = proxy
+                .as_ref()
+                .map(|proxy| proxy.status())
+                .unwrap_or((false, false, None));
+            *metrics
+                .proxy_status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = status;
+        })
+        .await?;
+    }
 }
 
 #[cfg(unix)]
@@ -1083,6 +1140,9 @@ async fn control_result(
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
         let result = match &request.command {
+            ControlCommand::LargeRequest { .. } => ControlResult::Error {
+                message: "large request envelope must be handled by the control transport".into(),
+            },
             ControlCommand::TestRoute {
                 rules,
                 host,
@@ -1157,7 +1217,7 @@ async fn control_result(
                         message: error.to_string(),
                     },
                     Err(_) => ControlResult::Error {
-                        message: "configuration prepare timed out; active node preserved".into(),
+                        message: "configuration update is still pending; refresh status to confirm the result".into(),
                     },
                 },
                 None => ControlResult::Error {
@@ -1196,19 +1256,46 @@ async fn control_result(
                         false,
                     );
                 }
-                let mut proxy = metrics
-                    .proxy
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                match proxy.as_mut() {
-                    Some(proxy) => match proxy.set(*enabled) {
-                        Ok(enabled) => ControlResult::SystemProxyUpdated { enabled },
-                        Err(error) => ControlResult::Error {
-                            message: error.to_string(),
+                let metrics = runtime.as_ref().map(|runtime| runtime.metrics.clone());
+                let Some(metrics) = metrics else {
+                    return (
+                        ControlResult::Error {
+                            message: "runtime configuration is unavailable".into(),
                         },
-                    },
-                    None => ControlResult::Error {
-                        message: "system proxy requires a desktop-managed daemon".into(),
+                        false,
+                    );
+                };
+                let enabled = *enabled;
+                match tokio::task::spawn_blocking(move || {
+                    let mut proxy = metrics
+                        .proxy
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let result = match proxy.as_mut() {
+                        Some(proxy) => match proxy.set(enabled) {
+                            Ok(enabled) => ControlResult::SystemProxyUpdated { enabled },
+                            Err(error) => ControlResult::Error {
+                                message: error.to_string(),
+                            },
+                        },
+                        None => ControlResult::Error {
+                            message: "system proxy requires a desktop-managed daemon".into(),
+                        },
+                    };
+                    *metrics
+                        .proxy_status
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = proxy
+                        .as_ref()
+                        .map(|proxy| proxy.status())
+                        .unwrap_or((false, false, None));
+                    result
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => ControlResult::Error {
+                        message: error.to_string(),
                     },
                 }
             }
@@ -2396,6 +2483,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_flow_details_fit_the_status_frame_without_losing_totals() {
+        let metrics = DaemonMetrics::new(TransportPreference::Tls);
+        let host = format!(
+            "{}.{}.{}.example.com:443",
+            "a".repeat(60),
+            "b".repeat(60),
+            "c".repeat(60)
+        );
+        let flows: Vec<_> = (0..256)
+            .map(|_| {
+                ActiveFlow::start(
+                    Arc::new(DaemonMetrics::new(TransportPreference::Tls)),
+                    "http",
+                    host.clone(),
+                    "direct",
+                    "direct",
+                )
+            })
+            .collect();
+        let mut snapshot = metrics.snapshot();
+        snapshot.active_flows = 999;
+        snapshot.uploaded_bytes = 12345;
+        snapshot.active_flow_details = flows.iter().map(|flow| flow.record.snapshot()).collect();
+        let mut result = ControlResult::Status { snapshot };
+        bound_status_response(&mut result).unwrap();
+        let ControlResult::Status { snapshot } = &result else {
+            unreachable!()
+        };
+        assert_eq!(snapshot.active_flows, 999);
+        assert_eq!(snapshot.uploaded_bytes, 12345);
+        assert!(!snapshot.active_flow_details.is_empty());
+        assert!(snapshot.active_flow_details.len() < 256);
+        write_message(
+            &mut tokio::io::sink(),
+            &ControlResponse {
+                version: CONTROL_VERSION,
+                result,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn status_snapshot_does_not_wait_for_system_proxy_io() {
+        let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Quic));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = metrics.clone();
+        let owner = std::thread::spawn(move || {
+            let _proxy = owner.proxy.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || snapshot_tx.send(metrics.snapshot()).unwrap());
+        let result = snapshot_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        reader.join().unwrap();
+        assert!(result.is_ok(), "status blocked on platform proxy I/O");
+    }
+
+    #[tokio::test]
     async fn shutdown_drain_finishes_early_or_at_deadline() {
         let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Tls));
         assert!(wait_for_flows(&metrics, Duration::from_secs(1)).await);
@@ -2452,6 +2604,75 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.active_flows, 0);
         assert!(snapshot.active_flow_details.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_china_rules_apply_over_control_connection() {
+        let configs = helios_client_model::parse_rules(include_str!(
+            "../../../config/china-direct-full.rules"
+        ))
+        .unwrap();
+        let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Quic));
+        let rules = Arc::new(RwLock::new(RuleSet::new(&[]).unwrap()));
+        let token = [4; 32];
+        let request = ControlRequest {
+            version: CONTROL_VERSION,
+            token,
+            command: ControlCommand::UpdateRules { rules: configs },
+        };
+        assert!(serde_json::to_vec(&request).unwrap().len() > 7_000_000);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (shutdown, _) = watch::channel(false);
+        let server_rules = rules.clone();
+        let server = tokio::spawn(async move {
+            serve_control_connection(server, metrics, server_rules, token, shutdown).await
+        });
+        helios_control::write_request(&mut client, &request)
+            .await
+            .unwrap();
+        let response: ControlResponse = helios_control::read_message(&mut client).await.unwrap();
+        assert_eq!(response.result, ControlResult::RulesUpdated);
+        server.await.unwrap().unwrap();
+        let target = Target::new(Address::Domain("baidu.com".into()), 443).unwrap();
+        assert_eq!(rules.read().await.decide(&target), RouteAction::Direct);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_large_request_times_out_without_changing_rules() {
+        let metrics = Arc::new(DaemonMetrics::new(TransportPreference::Quic));
+        let rules = Arc::new(RwLock::new(
+            RuleSet::new(&[RuleConfig::Final {
+                action: RouteAction::Direct,
+            }])
+            .unwrap(),
+        ));
+        let (mut client, stream) = tokio::io::duplex(1024);
+        let (shutdown, _) = watch::channel(false);
+        let server_rules = rules.clone();
+        let server = tokio::spawn(async move {
+            serve_control_connection(stream, metrics, server_rules, [4; 32], shutdown).await
+        });
+        write_message(
+            &mut client,
+            &ControlRequest {
+                version: CONTROL_VERSION,
+                token: [4; 32],
+                command: ControlCommand::LargeRequest { length: 1_000_000 },
+            },
+        )
+        .await
+        .unwrap();
+        client.write_all(b"{").await.unwrap();
+        assert!(
+            server
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        let target = Target::new(Address::Domain("example.com".into()), 443).unwrap();
+        assert_eq!(rules.read().await.decide(&target), RouteAction::Direct);
     }
 
     #[tokio::test]
