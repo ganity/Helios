@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const CONTROL_VERSION: u16 = 4;
+pub const CONTROL_VERSION: u16 = 5;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -17,6 +17,12 @@ pub struct ControlRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlCommand {
+    TestRoute {
+        rules: Vec<RuleConfig>,
+        host: String,
+        port: u16,
+        network: helios_routing::Network,
+    },
     GetStatus,
     UpdateRules {
         rules: Vec<RuleConfig>,
@@ -45,6 +51,7 @@ pub struct ControlResponse {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlResult {
+    RouteTest { report: RouteTestReport },
     Status { snapshot: StatusSnapshot },
     RulesUpdated,
     FlowClosed { id: u64 },
@@ -53,6 +60,16 @@ pub enum ControlResult {
     DnsCachePruned { stats: helios_dns::CacheStats },
     ShutdownAccepted,
     Error { message: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTestReport {
+    pub action: helios_routing::RouteAction,
+    pub rule_index: Option<usize>,
+    pub resolved_ips: Vec<std::net::IpAddr>,
+    pub selected_ips: Vec<std::net::IpAddr>,
+    pub dns_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

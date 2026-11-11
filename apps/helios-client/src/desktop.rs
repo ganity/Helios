@@ -145,6 +145,7 @@ struct LogEntry {
 }
 
 enum Event {
+    RouteTest(u64, Result<helios_control::RouteTestReport, String>),
     #[cfg(target_os = "linux")]
     LinuxTunPrepared(u64, Result<helios_config::OutboundConfig, String>),
     #[cfg(target_os = "linux")]
@@ -203,6 +204,10 @@ struct HeliosApp {
     rule_test_host: String,
     rule_test_port: String,
     rule_test_network: Network,
+    rule_test_generation: u64,
+    rule_test_pending: bool,
+    rule_test_input: Option<(RoutingMode, String, String, String, Network, u64)>,
+    rule_test_result: Option<Result<helios_control::RouteTestReport, String>>,
     connection_link_text: String,
     node_exchange_text: String,
     open_node_import: bool,
@@ -296,6 +301,10 @@ impl HeliosApp {
             rule_test_host: "example.com".into(),
             rule_test_port: "443".into(),
             rule_test_network: Network::Tcp,
+            rule_test_generation: 0,
+            rule_test_pending: false,
+            rule_test_input: None,
+            rule_test_result: None,
             connection_link_text: String::new(),
             node_exchange_text: String::new(),
             open_node_import: false,
@@ -356,6 +365,12 @@ impl HeliosApp {
                 self.status_request_revision = None;
             }
             match event {
+                Event::RouteTest(generation, result) => {
+                    if generation == self.rule_test_generation {
+                        self.rule_test_pending = false;
+                        self.rule_test_result = Some(result);
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 Event::LinuxTunPrepared(id, result) => {
                     if self
@@ -591,7 +606,10 @@ impl HeliosApp {
                 }
                 Event::DnsPruned(result) => {
                     self.notice = Some(match result {
-                        Ok(()) => (t("已清理过期 DNS 记录，保留有效映射").into(), true),
+                        Ok(()) => (
+                            t("已清理真实 DNS 缓存及过期映射，保留有效 Fake-IP 映射").into(),
+                            true,
+                        ),
                         Err(error) => (format!("DNS 清理失败：{error}"), false),
                     });
                     self.last_poll = Instant::now() - Duration::from_secs(5);
@@ -739,6 +757,58 @@ impl HeliosApp {
             let result = run_async(async move { Ok(client.update_rules(rules).await?) })
                 .map_err(|error| error.to_string());
             let _ = tx.send(Event::RulesUpdated(result));
+        });
+    }
+
+    fn request_route_test(&mut self) {
+        let prepared = (|| -> Result<_, String> {
+            let rules = match self.profile.mode {
+                RoutingMode::Rule => {
+                    parse_rules(&self.rule_text).map_err(|error| error.to_string())?
+                }
+                RoutingMode::GlobalProxy => vec![helios_routing::RuleConfig::Final {
+                    action: helios_routing::RouteAction::Proxy,
+                }],
+                RoutingMode::GlobalDirect => vec![helios_routing::RuleConfig::Final {
+                    action: helios_routing::RouteAction::Direct,
+                }],
+            };
+            let host = self.rule_test_host.trim().trim_matches(['[', ']']);
+            let address = host
+                .parse()
+                .map(helios_protocol::Address::Ip)
+                .unwrap_or_else(|_| helios_protocol::Address::Domain(host.into()));
+            let port = self
+                .rule_test_port
+                .parse::<u16>()
+                .map_err(|_| "端口无效".to_string())?;
+            let target =
+                helios_protocol::Target::new(address, port).map_err(|error| error.to_string())?;
+            let address = self
+                .control_profile()
+                .control_listen
+                .parse()
+                .map_err(|_| "控制地址无效".to_string())?;
+            Ok((rules, target, address))
+        })();
+        let (rules, target, address) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                self.rule_test_result = Some(Err(error));
+                return;
+            }
+        };
+        self.rule_test_pending = true;
+        self.rule_test_result = None;
+        let generation = self.rule_test_generation;
+        let network = self.rule_test_network;
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let client = DaemonClient::new(address, default_control_socket(), control_token_file());
+            let result =
+                run_async(async move { Ok(client.test_route(rules, target, network).await?) })
+                    .map_err(|error| error.to_string());
+            let _ = tx.send(Event::RouteTest(generation, result));
         });
     }
 
@@ -2329,6 +2399,32 @@ impl HeliosApp {
                 );
                 ui.selectable_value(&mut self.rule_test_network, Network::Tcp, "TCP");
                 ui.selectable_value(&mut self.rule_test_network, Network::Udp, "UDP");
+                let input = (
+                    self.profile.mode,
+                    self.rule_text.clone(),
+                    self.rule_test_host.clone(),
+                    self.rule_test_port.clone(),
+                    self.rule_test_network,
+                    self.daemon_revision,
+                );
+                if self.rule_test_input.as_ref() != Some(&input) {
+                    self.rule_test_input = Some(input);
+                    self.rule_test_generation += 1;
+                    self.rule_test_pending = false;
+                    self.rule_test_result = None;
+                }
+                if ui
+                    .add_enabled(
+                        !self.rule_test_pending && self.status.is_some(),
+                        egui::Button::new(t("后台测试")),
+                    )
+                    .clicked()
+                {
+                    self.request_route_test();
+                }
+                if self.rule_test_pending {
+                    ui.spinner();
+                }
                 match test_route_for_network(
                     self.profile.mode,
                     &self.rule_text,
@@ -2343,9 +2439,49 @@ impl HeliosApp {
                         );
                         ui.label(RichText::new(result.rule).color(MUTED).monospace())
                     }
+                    Err(error) if error.contains("runtime DNS") => ui.colored_label(
+                        MUTED,
+                        if self.rule_test_result.is_some() {
+                            ""
+                        } else {
+                            t("需要启动后台并点击后台测试")
+                        },
+                    ),
                     Err(error) => ui.colored_label(BAD, error),
                 };
             });
+            if let Some(result) = &self.rule_test_result {
+                match result {
+                    Ok(report) => {
+                        ui.colored_label(
+                            action_color(report.action),
+                            format!(
+                                "{} · {}",
+                                action_name(report.action).to_uppercase(),
+                                report
+                                    .rule_index
+                                    .map(|index| format!("rule {}", index + 1))
+                                    .unwrap_or_else(|| "implicit final".into())
+                            ),
+                        );
+                        if !report.resolved_ips.is_empty() {
+                            ui.label(format!("{}: {:?}", t("解析地址"), report.resolved_ips));
+                        }
+                        if !report.selected_ips.is_empty() {
+                            ui.label(format!("{}: {:?}", t("规则匹配地址"), report.selected_ips));
+                        }
+                        if let Some(error) = &report.dns_error {
+                            ui.colored_label(
+                                WARN,
+                                format!("{}: {error}", t("DNS 解析失败，已继续匹配后续规则")),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        ui.colored_label(BAD, error);
+                    }
+                }
+            }
         });
     }
 
@@ -2567,24 +2703,23 @@ impl HeliosApp {
                     t("已过期"),
                     stats.expired
                 ));
-                if ui.button(t("清理过期记录")).clicked()
-                    && let Ok(address) = self.control_profile().control_listen.parse()
-                {
-                    let tx = self.event_tx.clone();
-                    thread::spawn(move || {
-                        let client = DaemonClient::new(
-                            address,
-                            default_control_socket(),
-                            control_token_file(),
-                        );
-                        let result = run_async(async move {
-                            client.prune_dns_cache().await?;
-                            Ok(())
-                        })
-                        .map_err(|error| error.to_string());
-                        let _ = tx.send(Event::DnsPruned(result));
-                    });
-                }
+            }
+            if ui
+                .add_enabled(self.status.is_some(), egui::Button::new(t("清理 DNS 缓存")))
+                .clicked()
+                && let Ok(address) = self.control_profile().control_listen.parse()
+            {
+                let tx = self.event_tx.clone();
+                thread::spawn(move || {
+                    let client =
+                        DaemonClient::new(address, default_control_socket(), control_token_file());
+                    let result = run_async(async move {
+                        client.prune_dns_cache().await?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(Event::DnsPruned(result));
+                });
             }
             ui.add_space(12.0);
             if ui.add(primary_button(t("保存 DNS 设置"))).clicked() {
@@ -3809,6 +3944,26 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_runtime_rule_test_cannot_replace_the_current_result() {
+        let ctx = egui::Context::default();
+        let mut app = preview_app();
+        app.rule_test_generation = 2;
+        app.rule_test_pending = true;
+        app.event_tx
+            .send(Event::RouteTest(1, Err("old result".into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert!(app.rule_test_pending);
+        assert!(app.rule_test_result.is_none());
+        app.event_tx
+            .send(Event::RouteTest(2, Err("current result".into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        assert!(!app.rule_test_pending);
+        assert_eq!(app.rule_test_result, Some(Err("current result".into())));
+    }
 
     fn preview_app() -> HeliosApp {
         let directory = std::env::temp_dir().join(format!("helios-ui-test-{}", std::process::id()));

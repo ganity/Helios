@@ -37,6 +37,12 @@ type = "ip-cidr"
 value = "192.168.0.0/16"
 action = "direct"
 
+# Resolves unmatched domains on demand; checks bundled mainland IPv4/IPv6 data.
+[[rules]]
+type = "geoip"
+value = "cn"
+action = "direct"
+
 [[rules]]
 type = "final"
 action = "proxy"

@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use helios_config::OutboundConfig;
@@ -18,11 +20,124 @@ use tokio::{
 
 /// One immutable policy shared by every outbound path, including node health probes.
 #[derive(Clone, Default)]
-pub(super) struct Outbound(pub Option<OutboundConfig>);
+pub(super) struct Outbound {
+    pub(super) config: Option<OutboundConfig>,
+    cache: Arc<Mutex<HashMap<DnsKey, DnsSlot>>>,
+}
+
+type DnsKey = (String, Option<RecordType>);
+type DnsSlot = Arc<tokio::sync::Mutex<Option<CacheEntry>>>;
+
+struct CacheEntry {
+    expires: Instant,
+    result: Result<Vec<IpAddr>, (io::ErrorKind, String)>,
+}
+
+impl CacheEntry {
+    fn result(&self) -> io::Result<Vec<IpAddr>> {
+        self.result
+            .clone()
+            .map_err(|(kind, message)| io::Error::new(kind, message))
+    }
+}
 
 impl Outbound {
+    pub async fn evaluate_route(
+        &self,
+        rules: &helios_routing::RuleSet,
+        target: &Target,
+        network: helios_routing::Network,
+    ) -> helios_control::RouteTestReport {
+        let mut resolved_ips = Vec::new();
+        let mut dns_error = None;
+        let (action, rule_index, selected_ips) = match rules.evaluate_from(target, network, None, 0)
+        {
+            Ok(decision) => decision,
+            Err(cursor) => {
+                match self.resolve(target).await {
+                    Ok(ips) => resolved_ips = ips,
+                    Err(error) => dns_error = Some(error.to_string()),
+                }
+                rules
+                    .evaluate_from(target, network, Some(&resolved_ips), cursor)
+                    .expect("resolved route evaluation")
+            }
+        };
+        helios_control::RouteTestReport {
+            action,
+            rule_index,
+            selected_ips,
+            resolved_ips,
+            dns_error,
+        }
+    }
+    pub fn new(config: Option<OutboundConfig>) -> Self {
+        Self {
+            config,
+            ..Self::default()
+        }
+    }
+
+    pub fn clear_cache(&self) {
+        self.cache.lock().expect("DNS cache poisoned").clear();
+    }
+
+    async fn cached_lookup(&self, host: &str, kind: Option<RecordType>) -> io::Result<Vec<IpAddr>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let key = (host.trim_end_matches('.').to_ascii_lowercase(), kind);
+        let slot = {
+            let mut cache = self.cache.lock().expect("DNS cache poisoned");
+            if !cache.contains_key(&key) && cache.len() >= 1024 {
+                // In-flight slots must not be evicted, or concurrent callers would duplicate DNS.
+                let victim = cache
+                    .iter()
+                    .find(|(_, slot)| Arc::strong_count(slot) == 1)
+                    .map(|(key, _)| key.clone());
+                if let Some(victim) = victim {
+                    cache.remove(&victim);
+                } else {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+            }
+            cache.entry(key.clone()).or_default().clone()
+        };
+        let mut entry = tokio::time::timeout_at(deadline, slot.lock())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+        if let Some(value) = entry
+            .as_ref()
+            .filter(|value| value.expires > Instant::now())
+        {
+            return value.result();
+        }
+        let result = tokio::time::timeout_at(deadline, async {
+            match kind {
+                Some(kind) => self.lookup(&key.0, kind).await,
+                None => Ok((
+                    tokio::net::lookup_host((key.0.as_str(), 0))
+                        .await?
+                        .map(|address| address.ip())
+                        .collect(),
+                    30,
+                )),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
+        let ttl = match &result {
+            Ok((ips, ttl)) if !ips.is_empty() => (*ttl).min(300),
+            _ => 2,
+        };
+        *entry = Some(CacheEntry {
+            expires: Instant::now() + Duration::from_secs(ttl.into()),
+            result: result
+                .map(|(ips, _)| ips)
+                .map_err(|error| (error.kind(), error.to_string())),
+        });
+        entry.as_ref().unwrap().result()
+    }
     pub fn source(&self, destination: SocketAddr) -> io::Result<Option<IpAddr>> {
-        match &self.0 {
+        match &self.config {
             None => Ok(None),
             Some(config) => config
                 .source_bypass
@@ -63,11 +178,20 @@ impl Outbound {
         protected: &[SocketAddr],
     ) -> io::Result<TcpStream> {
         let mut ips = self.resolve(target).await?;
-        ips.retain(|ip| !protected.contains(&SocketAddr::new(*ip, target.port)));
+        self.connect_ips(target.port, &mut ips, protected).await
+    }
+
+    pub async fn connect_ips(
+        &self,
+        port: u16,
+        ips: &mut Vec<IpAddr>,
+        protected: &[SocketAddr],
+    ) -> io::Result<TcpStream> {
+        ips.retain(|ip| !protected.contains(&SocketAddr::new(*ip, port)));
         helios_transport::connect_tcp_ips(
-            ips,
-            target.port,
-            self.0
+            ips.clone(),
+            port,
+            self.config
                 .as_ref()
                 .map(|config| config.source_bypass.as_slice()),
         )
@@ -77,24 +201,24 @@ impl Outbound {
     pub async fn resolve(&self, target: &Target) -> io::Result<Vec<IpAddr>> {
         let ips = match &target.address {
             Address::Ip(ip) => vec![*ip],
-            Address::Domain(host) => match &self.0 {
-                None => tokio::net::lookup_host((host.as_str(), target.port))
-                    .await?
-                    .map(|address| address.ip())
-                    .collect(),
+            Address::Domain(host) => match &self.config {
+                None => self.cached_lookup(host, None).await?,
                 Some(config) => {
-                    // ponytail: resolve per flow/UDP packet; add a bounded TTL cache if lookup cost matters.
                     let (a, aaaa) = tokio::join!(
-                        self.lookup(
-                            host,
-                            RecordType::A,
-                            config.source_bypass.iter().any(IpAddr::is_ipv4)
-                        ),
-                        self.lookup(
-                            host,
-                            RecordType::AAAA,
-                            config.source_bypass.iter().any(IpAddr::is_ipv6)
-                        ),
+                        async {
+                            if config.source_bypass.iter().any(IpAddr::is_ipv4) {
+                                self.cached_lookup(host, Some(RecordType::A)).await
+                            } else {
+                                Ok(Vec::new())
+                            }
+                        },
+                        async {
+                            if config.source_bypass.iter().any(IpAddr::is_ipv6) {
+                                self.cached_lookup(host, Some(RecordType::AAAA)).await
+                            } else {
+                                Ok(Vec::new())
+                            }
+                        },
                     );
                     match (a, aaaa) {
                         (Ok(mut a), Ok(aaaa)) => {
@@ -141,12 +265,9 @@ impl Outbound {
         Ok(result)
     }
 
-    async fn lookup(&self, host: &str, kind: RecordType, enabled: bool) -> io::Result<Vec<IpAddr>> {
-        if !enabled {
-            return Ok(Vec::new());
-        }
+    async fn lookup(&self, host: &str, kind: RecordType) -> io::Result<(Vec<IpAddr>, u32)> {
         let config = self
-            .0
+            .config
             .as_ref()
             .expect("explicit resolver requires outbound config");
         let mut last = io::Error::new(io::ErrorKind::NotFound, "no real DNS servers");
@@ -172,7 +293,8 @@ impl Outbound {
         host: &str,
         kind: RecordType,
         server: SocketAddr,
-    ) -> io::Result<Vec<IpAddr>> {
+    ) -> io::Result<(Vec<IpAddr>, u32)> {
+        let mut ttl = u32::MAX;
         let mut name = Name::from_ascii(host).map_err(io::Error::other)?;
         name.set_fqdn(true);
         let mut visited = Vec::new();
@@ -204,6 +326,14 @@ impl Outbound {
             let start = name.clone();
             // Accept only IN records belonging to the query or its CNAME chain, never unrelated glue.
             for _ in 0..8 {
+                for record in response.answers.iter().filter(|record| {
+                    record.name == name
+                        && record.dns_class == DNSClass::IN
+                        && (record.record_type() == kind
+                            || record.record_type() == RecordType::CNAME)
+                }) {
+                    ttl = ttl.min(record.ttl);
+                }
                 let ips: Vec<_> = response
                     .answers
                     .iter()
@@ -215,7 +345,7 @@ impl Outbound {
                     })
                     .collect();
                 if !ips.is_empty() {
-                    return Ok(ips);
+                    return Ok((ips, ttl));
                 }
                 let alias = response
                     .answers
@@ -238,7 +368,7 @@ impl Outbound {
                 name = alias;
             }
             if name == start {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 2));
             }
         }
         Err(io::Error::new(
@@ -310,8 +440,301 @@ mod tests {
     };
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn cancelled_lookup_releases_waiters_and_cache_capacity_is_bounded() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", server.local_addr().unwrap());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut bytes = [0; 1024];
+            server.recv_from(&mut bytes).await.unwrap();
+            started.send(()).unwrap();
+            let (length, peer) = server.recv_from(&mut bytes).await.unwrap();
+            let request = Message::from_vec(&bytes[..length]).unwrap();
+            server
+                .send_to(&answer(&request, "182.92.244.55").to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let clone = outbound.clone();
+        let first =
+            tokio::spawn(async move { clone.resolve(&domain_target("cancel.example")).await });
+        ready.await.unwrap();
+        first.abort();
+        let _ = first.await;
+        assert!(
+            timeout(
+                Duration::from_secs(2),
+                outbound.resolve(&domain_target("cancel.example"))
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        worker.await.unwrap();
+        outbound.clear_cache();
+        let mut active = Vec::new();
+        {
+            let mut cache = outbound.cache.lock().unwrap();
+            for index in 0..1024 {
+                let slot: DnsSlot = Arc::default();
+                cache.insert(
+                    (format!("{index}.example"), Some(RecordType::A)),
+                    slot.clone(),
+                );
+                active.push(slot);
+            }
+        }
+        assert_eq!(
+            outbound
+                .cached_lookup("overflow.example", Some(RecordType::A))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(outbound.cache.lock().unwrap().len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn stalled_dns_has_a_total_deadline_and_caches_the_failure() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", server.local_addr().unwrap());
+        let started = Instant::now();
+        assert_eq!(
+            outbound
+                .resolve(&domain_target("timeout.example"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let started = Instant::now();
+        assert_eq!(
+            outbound
+                .resolve(&domain_target("timeout.example"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_coalesces_and_expires_and_is_scoped_to_policy() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", server.local_addr().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let worker = tokio::spawn(async move {
+            let mut buffer = [0; 1024];
+            loop {
+                let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request = Message::from_vec(&buffer[..length]).unwrap();
+                let mut response = answer(&request, "182.92.244.55");
+                if request.queries[0].name().to_ascii().starts_with("missing.") {
+                    response.answers.clear();
+                    response.metadata.response_code = ResponseCode::NXDomain;
+                }
+                server
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut jobs = Vec::new();
+        for _ in 0..16 {
+            let outbound = outbound.clone();
+            jobs.push(tokio::spawn(async move {
+                outbound
+                    .cached_lookup("Cache.Example.", Some(RecordType::A))
+                    .await
+                    .unwrap()
+            }));
+        }
+        for job in jobs {
+            assert_eq!(
+                job.await.unwrap(),
+                vec!["182.92.244.55".parse::<IpAddr>().unwrap()]
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let slot = outbound
+            .cache
+            .lock()
+            .unwrap()
+            .get(&("cache.example".into(), Some(RecordType::A)))
+            .unwrap()
+            .clone();
+        slot.lock().await.as_mut().unwrap().expires = Instant::now();
+        outbound
+            .resolve(&domain_target("cache.example"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for _ in 0..2 {
+            assert!(
+                outbound
+                    .resolve(&domain_target("missing.example"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let replacement = Outbound::new(outbound.config.clone());
+        replacement
+            .resolve(&domain_target("cache.example"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        outbound.clear_cache();
+        outbound
+            .resolve(&domain_target("cache.example"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn cname_ttl_zero_prevents_caching_and_failed_dns_keeps_final_policy() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", server.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            let mut bytes = [0; 1024];
+            for _ in 0..2 {
+                let (length, peer) = timeout(Duration::from_secs(2), server.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request = Message::from_vec(&bytes[..length]).unwrap();
+                let alias = Name::from_ascii("alias.example.").unwrap();
+                let mut response = Message::response(request.id, OpCode::Query);
+                response.add_queries(request.queries.clone());
+                response.add_answer(Record::from_rdata(
+                    request.queries[0].name().clone(),
+                    0,
+                    RData::CNAME(CNAME(alias.clone())),
+                ));
+                response.add_answer(Record::from_rdata(
+                    alias,
+                    60,
+                    RData::A(A("182.92.244.55".parse().unwrap())),
+                ));
+                server
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        for _ in 0..2 {
+            outbound
+                .resolve(&domain_target("ttl.example"))
+                .await
+                .unwrap();
+        }
+        worker.await.unwrap();
+        // The now-closed local DNS port fails deterministically, without a production DNS dependency.
+        let rules = helios_routing::RuleSet::new(&[
+            helios_routing::RuleConfig::Geoip {
+                value: "cn".into(),
+                action: helios_routing::RouteAction::Direct,
+                no_resolve: false,
+            },
+            helios_routing::RuleConfig::Final {
+                action: helios_routing::RouteAction::Proxy,
+            },
+        ])
+        .unwrap();
+        let report = outbound
+            .evaluate_route(
+                &rules,
+                &domain_target("failure.example"),
+                helios_routing::Network::Tcp,
+            )
+            .await;
+        assert_eq!(report.action, helios_routing::RouteAction::Proxy);
+        assert!(report.dns_error.is_some());
+        assert!(report.selected_ips.is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_classification_connects_only_to_matching_ips_for_tcp_and_udp() {
+        use helios_routing::{Network, RouteAction, RuleConfig, RuleSet};
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = bound("127.0.0.1", dns.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            let mut bytes = [0; 1024];
+            let (length, peer) = dns.recv_from(&mut bytes).await.unwrap();
+            let request = Message::from_vec(&bytes[..length]).unwrap();
+            let mut response = answer(&request, "192.0.2.1");
+            response.add_answer(Record::from_rdata(
+                request.queries[0].name().clone(),
+                60,
+                RData::A(A("127.0.0.1".parse().unwrap())),
+            ));
+            dns.send_to(&response.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let rules = RuleSet::new(&[
+            RuleConfig::IpCidr {
+                value: "127.0.0.1/32".into(),
+                action: RouteAction::Direct,
+                resolve: true,
+            },
+            RuleConfig::Final {
+                action: RouteAction::Reject,
+            },
+        ])
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::new(
+            Address::Domain("mixed.example".into()),
+            listener.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        for network in [Network::Tcp, Network::Udp] {
+            let mut report = outbound.evaluate_route(&rules, &target, network).await;
+            assert_eq!(report.action, RouteAction::Direct);
+            assert_eq!(
+                report.selected_ips,
+                vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+            );
+            assert_eq!(report.resolved_ips.len(), 2);
+            if network == Network::Tcp {
+                let stream = outbound
+                    .connect_ips(target.port, &mut report.selected_ips, &[])
+                    .await
+                    .unwrap();
+                assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+            } else {
+                let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let sender = outbound.udp(false).await.unwrap();
+                sender
+                    .send_to(
+                        b"classified",
+                        SocketAddr::new(
+                            report.selected_ips[0],
+                            receiver.local_addr().unwrap().port(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 32];
+                let (length, _) = receiver.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..length], b"classified");
+            }
+        }
+        worker.await.unwrap();
+    }
+
     fn bound(source: &str, server: SocketAddr) -> Outbound {
-        Outbound(Some(OutboundConfig {
+        Outbound::new(Some(OutboundConfig {
             source_bypass: vec![source.parse().unwrap()],
             dns_servers: vec![server],
         }))
@@ -525,7 +948,7 @@ mod tests {
             response.add_answer(Record::from_rdata(
                 request.queries[0].name().clone(),
                 60,
-                RData::AAAA(AAAA("2001:db8::8".parse().unwrap())),
+                RData::AAAA(AAAA("2400:1040::8".parse().unwrap())),
             ));
             server
                 .send_to(&response.to_vec().unwrap(), peer)
@@ -537,9 +960,33 @@ mod tests {
                 .resolve(&domain_target("ipv6.invalid"))
                 .await
                 .unwrap(),
-            vec!["2001:db8::8".parse::<IpAddr>().unwrap()]
+            vec!["2400:1040::8".parse::<IpAddr>().unwrap()]
         );
         worker.await.unwrap();
+        let rules = helios_routing::RuleSet::new(&[
+            helios_routing::RuleConfig::Geoip {
+                value: "cn".into(),
+                action: helios_routing::RouteAction::Direct,
+                no_resolve: false,
+            },
+            helios_routing::RuleConfig::Final {
+                action: helios_routing::RouteAction::Proxy,
+            },
+        ])
+        .unwrap();
+        let report = outbound
+            .evaluate_route(
+                &rules,
+                &domain_target("ipv6.invalid"),
+                helios_routing::Network::Udp,
+            )
+            .await;
+        assert_eq!(report.action, helios_routing::RouteAction::Direct);
+        assert_eq!(
+            report.selected_ips,
+            vec!["2400:1040::8".parse::<IpAddr>().unwrap()]
+        );
+
         let listener = TcpListener::bind("[::1]:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let target = Target::new(Address::Ip(address.ip()), address.port()).unwrap();

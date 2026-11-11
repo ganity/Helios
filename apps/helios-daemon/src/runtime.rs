@@ -181,7 +181,7 @@ impl Runtime {
         }
         let updated_rules = RuleSet::new(&config.rules)?;
         let args = Args {
-            outbound: outbound::Outbound(config.outbound.clone()),
+            outbound: outbound::Outbound::new(config.outbound.clone()),
             transport: config.node.preferred_transport,
             listen: config.listen,
             http_listen: config.http_listen,
@@ -466,6 +466,50 @@ mod tests {
         .await
         .unwrap();
         let runtime = Runtime::new(remote, config.clone(), Some(directory1.join("daemon.toml")));
+        *runtime.metrics.runtime.lock().unwrap() = Some(Arc::downgrade(&runtime));
+        let draft_rules = vec![
+            RuleConfig::IpCidr {
+                value: "127.0.0.0/8".into(),
+                action: RouteAction::Direct,
+                resolve: true,
+            },
+            RuleConfig::IpCidr6 {
+                value: "::1/128".into(),
+                action: RouteAction::Direct,
+                resolve: true,
+            },
+            RuleConfig::Final {
+                action: RouteAction::Reject,
+            },
+        ];
+        let request = ControlRequest {
+            version: CONTROL_VERSION,
+            token: [9; 32],
+            command: ControlCommand::TestRoute {
+                rules: draft_rules,
+                host: "localhost".into(),
+                port: 443,
+                network: Network::Tcp,
+            },
+        };
+        let (result, shutdown) = control_result(
+            &request,
+            &[9; 32],
+            &runtime.metrics,
+            &runtime.remote().await.rules,
+        )
+        .await;
+        let ControlResult::RouteTest { report } = result else {
+            panic!("expected runtime route report: {result:?}");
+        };
+        assert_eq!(report.action, RouteAction::Direct);
+        assert!(!report.selected_ips.is_empty());
+        assert!(!shutdown);
+        assert_eq!(
+            runtime.config().await.rules,
+            config.rules,
+            "testing a draft must not apply it"
+        );
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = target.local_addr().unwrap();
         let echo = tokio::spawn(async move {

@@ -44,13 +44,15 @@ NETWORK
 FINAL
 ```
 
-后续按真实需求增加 `PROCESS-NAME` 和 `PROCESS-PATH`。不在首版加入 GEO 数据库、脚本或远程订阅。
+后续按真实需求增加 `PROCESS-NAME` 和 `PROCESS-PATH`。仅增加内置 CN IP 快照；其他 GEO 国家、脚本和远程订阅不在本次范围。
 
 当前阶段已实现 TCP Target 和 SOCKS5 UDP Target 的 `DOMAIN`、`DOMAIN-SUFFIX`、`IP-CIDR`、`IP-CIDR6`、`DST-PORT`、`NETWORK` 和 `FINAL`，以及 Direct、Proxy、Reject 三种动作。`NETWORK` 的值严格为 `tcp` 或 `udp`，与其他规则一样按顺序匹配；HTTP/SOCKS CONNECT 使用 TCP，SOCKS UDP 使用 UDP。SOCKS5、HTTP CONNECT 与 SOCKS5 UDP 共用可热更新的规则决策；新规则完整验证后原子替换。TUN 平台支持范围见实施状态。
 
 桌面文本规则示例：`network,udp,reject`。规则测试器可选择 TCP/UDP，使用与实际转发相同的决策入口。旧版 `decide(Target)` API 默认 TCP。
 
-规则从上到下匹配，第一个命中生效。当前域名执行去尾点、ASCII 小写；IDNA 规范化尚未实现。`DOMAIN-SUFFIX,example.com` 匹配 `example.com` 和 `a.example.com`，但不匹配 `badexample.com`。
+规则从上到下匹配，第一个命中生效。新增 `geoip,cn,direct`（可加 `no-resolve`）、`ip-cidr,...,direct,resolve` 和 `ip-cidr6,...,direct,resolve`。原有三字段 CIDR 不主动解析域名。遇到允许解析的 IP 规则时，daemon 按需解析并从原规则位置继续，后续 IP 规则可使用结果。规则引擎本身不执行网络 I/O；同步旧 API 只做无解析匹配。运行时测试与实际转发使用同一异步入口。具体语义、缓存和启用步骤见 [域名与国内 IP 分流](16-domain-ip-routing.md)。
+
+当前域名执行去尾点、ASCII 小写；IDNA 规范化尚未实现。`DOMAIN-SUFFIX,example.com` 匹配 `example.com` 和 `a.example.com`，但不匹配 `badexample.com`。
 
 示例：
 

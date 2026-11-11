@@ -58,7 +58,7 @@ async fn peer(stream_limit: u32) -> Peer {
         server_name: "localhost".try_into().unwrap(),
         credential_id: Arc::from("test"),
         token: [7; 32],
-        outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+        outbound: outbound::Outbound::new(Some(helios_config::OutboundConfig {
             source_bypass: vec![source],
             dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         })),

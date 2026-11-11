@@ -42,6 +42,22 @@ fn translate_message(source: &str, english: bool) -> String {
 }
 
 const TEXT: &[(&str, &str)] = &[
+    ("后台测试", "Test with daemon"),
+    (
+        "需要启动后台并点击后台测试",
+        "Start the daemon and run a runtime test",
+    ),
+    ("解析地址", "Resolved addresses"),
+    ("规则匹配地址", "Addresses matching the rule"),
+    (
+        "DNS 解析失败，已继续匹配后续规则",
+        "DNS failed; evaluation continued with later rules",
+    ),
+    ("清理 DNS 缓存", "Clear DNS cache"),
+    (
+        "已清理真实 DNS 缓存及过期映射，保留有效 Fake-IP 映射",
+        "Real DNS cache and expired mappings cleared; active Fake-IP mappings preserved",
+    ),
     (
         "节点故障时自动切换备用节点",
         "Switch to a backup node when the current node fails",

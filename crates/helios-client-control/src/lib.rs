@@ -119,6 +119,30 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    pub async fn test_route(
+        &self,
+        rules: Vec<RuleConfig>,
+        target: helios_protocol::Target,
+        network: helios_routing::Network,
+    ) -> Result<helios_control::RouteTestReport, ClientControlError> {
+        let host = match target.address {
+            helios_protocol::Address::Ip(ip) => ip.to_string(),
+            helios_protocol::Address::Domain(domain) => domain,
+        };
+        match self
+            .request(ControlCommand::TestRoute {
+                rules,
+                host,
+                port: target.port,
+                network,
+            })
+            .await?
+        {
+            ControlResult::RouteTest { report } => Ok(report),
+            ControlResult::Error { message } => Err(ClientControlError::Remote(message)),
+            _ => Err(ClientControlError::UnexpectedResponse),
+        }
+    }
     pub fn new(address: SocketAddr, local_socket: Option<PathBuf>, token_file: PathBuf) -> Self {
         #[cfg(windows)]
         let _ = address;
@@ -242,6 +266,7 @@ impl DaemonClient {
 
     async fn request(&self, command: ControlCommand) -> Result<ControlResult, ClientControlError> {
         let deadline = match &command {
+            ControlCommand::TestRoute { .. } => Duration::from_secs(5),
             ControlCommand::ApplyConfig { .. } => Duration::from_secs(30),
             ControlCommand::SetSystemProxy { .. } => Duration::from_secs(15),
             _ => Duration::from_secs(2),

@@ -513,7 +513,7 @@ async fn main() -> Result<(), AnyError> {
     let roots = load_roots(&config.node.ca_certificate)?;
     let crypto = ClientCrypto::new(roots)?;
     let args = Args {
-        outbound: outbound::Outbound(config.outbound.clone()),
+        outbound: outbound::Outbound::new(config.outbound.clone()),
         transport: config.node.preferred_transport,
         listen: config.listen,
         http_listen: config.http_listen,
@@ -1083,15 +1083,55 @@ async fn control_result(
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
         let result = match &request.command {
-            ControlCommand::PruneDnsCache => match &runtime {
-                Some(runtime) => match runtime.remote().await.fake_ips {
-                    Some(pool) => ControlResult::DnsCachePruned {
-                        stats: pool.stats(),
-                    },
+            ControlCommand::TestRoute {
+                rules,
+                host,
+                port,
+                network,
+            } => match RuleSet::new(rules) {
+                Ok(rules) => match &runtime {
+                    Some(runtime) => {
+                        let remote = runtime.remote().await;
+                        let address = host
+                            .parse()
+                            .map(helios_protocol::Address::Ip)
+                            .unwrap_or_else(|_| helios_protocol::Address::Domain(host.clone()));
+                        match Target::new(address, *port)
+                            .map_err(std::io::Error::other)
+                            .and_then(|target| remote.restore_target(target))
+                        {
+                            Ok(target) => ControlResult::RouteTest {
+                                report: remote
+                                    .outbound
+                                    .evaluate_route(&rules, &target, *network)
+                                    .await,
+                            },
+                            Err(error) => ControlResult::Error {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
                     None => ControlResult::Error {
-                        message: "Fake-IP DNS is disabled".into(),
+                        message: "DNS runtime is unavailable".into(),
                     },
                 },
+                Err(error) => ControlResult::Error {
+                    message: error.to_string(),
+                },
+            },
+            ControlCommand::PruneDnsCache => match &runtime {
+                Some(runtime) => {
+                    let remote = runtime.remote().await;
+                    remote.outbound.clear_cache();
+                    match remote.fake_ips {
+                        Some(pool) => ControlResult::DnsCachePruned {
+                            stats: pool.stats(),
+                        },
+                        None => ControlResult::DnsCachePruned {
+                            stats: helios_dns::CacheStats::default(),
+                        },
+                    }
+                }
                 None => ControlResult::Error {
                     message: "DNS runtime is unavailable".into(),
                 },
@@ -1554,10 +1594,10 @@ async fn serve_socks_udp(
                     Ok(target) => target,
                     Err(_) => { remote.metrics.record_udp_drop(); continue; },
                 };
-                let action = remote.rules.read().await.decide_for_network(&target, Network::Udp);
+                let (action, classified_ips) = remote.route(&target, Network::Udp).await;
                 if action == RouteAction::Reject { remote.metrics.record_udp_drop(); continue; }
                 if action == RouteAction::Direct {
-                    let destination = match timeout(Duration::from_millis(remote.connect_milliseconds.into()), remote.outbound.resolve(&target)).await {
+                    let destination = match timeout(Duration::from_millis(remote.connect_milliseconds.into()), async { if classified_ips.is_empty() { remote.outbound.resolve(&target).await } else { Ok(classified_ips) } }).await {
                         Ok(Ok(ips)) => SocketAddr::new(ips[0], target.port),
                         _ => { remote.metrics.record_udp_drop(); continue; },
                     };
@@ -1738,7 +1778,7 @@ async fn serve_socks(
     if target.port == 54
         && target.address == helios_protocol::Address::Ip(helios_dns::TUN_DNS)
         && remote.fake_ips.is_some()
-        && let Some(outbound) = &remote.outbound.0
+        && let Some(outbound) = &remote.outbound.config
     {
         socks.reply(Socks5Reply::Succeeded).await?;
         let bytes = serde_json::to_vec(&helios_config::TunDaemonInfo {
@@ -1750,7 +1790,7 @@ async fn serve_socks(
         stream.write_all(&bytes).await?;
         return Ok(());
     }
-    if remote.outbound.0.is_some()
+    if remote.outbound.config.is_some()
         && target.port == 53
         && target.address == helios_protocol::Address::Ip(helios_dns::TUN_DNS)
         && let Some(pool) = &remote.fake_ips
@@ -1847,6 +1887,16 @@ fn target_label(target: &Target) -> String {
 }
 
 impl Remote {
+    async fn route(
+        &self,
+        target: &Target,
+        network: Network,
+    ) -> (RouteAction, Vec<std::net::IpAddr>) {
+        let rules = self.rules.read().await.clone();
+        let report = self.outbound.evaluate_route(&rules, target, network).await;
+        (report.action, report.selected_ips)
+    }
+
     fn restore_target(&self, target: Target) -> std::io::Result<Target> {
         let helios_protocol::Address::Ip(ip) = target.address else {
             return Ok(target);
@@ -1869,8 +1919,25 @@ impl Remote {
         if self.is_protected_listener(&target) {
             return Err(RemoteError::Rejected);
         }
-        match self.rules.read().await.decide(&target) {
-            RouteAction::Direct => return self.open_direct(&target).await,
+        let (action, mut ips) = self.route(&target, Network::Tcp).await;
+        match action {
+            RouteAction::Direct => {
+                if ips.is_empty() {
+                    return self.open_direct(&target).await;
+                }
+                return match timeout(
+                    Duration::from_millis(self.connect_milliseconds.into()),
+                    self.outbound
+                        .connect_ips(target.port, &mut ips, &self.protected_listeners),
+                )
+                .await
+                {
+                    Ok(result) => result
+                        .map(RemoteStream::Direct)
+                        .map_err(RemoteError::Direct),
+                    Err(_) => Err(RemoteError::Direct(std::io::ErrorKind::TimedOut.into())),
+                };
+            }
             RouteAction::Reject => return Err(RemoteError::Rejected),
             RouteAction::Proxy => {}
         }
@@ -2742,17 +2809,21 @@ mod tests {
     async fn direct_socks_udp_works_without_quic() {
         use helios_routing::{RouteAction, RuleConfig};
 
-        for bind_source in [
-            None,
-            Some(
-                if cfg!(target_os = "linux") {
-                    "127.0.0.2"
-                } else {
-                    "127.0.0.1"
-                }
-                .parse::<IpAddr>()
-                .unwrap(),
+        for (bind_source, resolve_domain) in [
+            (None, false),
+            (
+                Some(
+                    if cfg!(target_os = "linux") {
+                        "127.0.0.2"
+                    } else {
+                        "127.0.0.1"
+                    }
+                    .parse::<IpAddr>()
+                    .unwrap(),
+                ),
+                false,
             ),
+            (None, true),
         ] {
             let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let echo_address = echo.local_addr().unwrap();
@@ -2765,13 +2836,40 @@ mod tests {
                 );
                 echo.send_to(&bytes[..length], peer).await.unwrap();
             });
+            let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let dns_address = dns.local_addr().unwrap();
+            let dns_task = tokio::spawn(async move {
+                let mut bytes = [0; 1024];
+                let (length, peer) = dns.recv_from(&mut bytes).await.unwrap();
+                let request = hickory_proto::op::Message::from_vec(&bytes[..length]).unwrap();
+                let mut response = hickory_proto::op::Message::response(
+                    request.id,
+                    hickory_proto::op::OpCode::Query,
+                );
+                response.add_queries(request.queries.clone());
+                response.add_answer(hickory_proto::rr::Record::from_rdata(
+                    request.queries[0].name().clone(),
+                    60,
+                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
+                        std::net::Ipv4Addr::LOCALHOST,
+                    )),
+                ));
+                dns.send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            });
             let remote = Remote {
-                outbound: outbound::Outbound(bind_source.map(|source| {
-                    helios_config::OutboundConfig {
+                outbound: outbound::Outbound::new(if resolve_domain {
+                    Some(helios_config::OutboundConfig {
+                        source_bypass: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+                        dns_servers: vec![dns_address],
+                    })
+                } else {
+                    bind_source.map(|source| helios_config::OutboundConfig {
                         source_bypass: vec![source],
                         dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
-                    }
-                })),
+                    })
+                }),
                 _monitors: None,
                 tls: ClientCrypto::new(RootCertStore::empty()).unwrap().tls,
                 quic: Arc::new(RwLock::new(None)),
@@ -2786,6 +2884,7 @@ mod tests {
                         RuleConfig::IpCidr {
                             value: "127.0.0.0/8".into(),
                             action: RouteAction::Direct,
+                            resolve: resolve_domain,
                         },
                         RuleConfig::Final {
                             action: RouteAction::Proxy,
@@ -2820,7 +2919,15 @@ mod tests {
             );
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let packet = UdpDatagram {
-                target: Target::new(Address::Ip(echo_address.ip()), echo_address.port()).unwrap(),
+                target: Target::new(
+                    if resolve_domain {
+                        Address::Domain("udp.example".into())
+                    } else {
+                        Address::Ip(echo_address.ip())
+                    },
+                    echo_address.port(),
+                )
+                .unwrap(),
                 payload: b"direct".to_vec(),
             }
             .encode()
@@ -2838,6 +2945,7 @@ mod tests {
             drop(control);
             task.await.unwrap();
             echo_task.await.unwrap();
+            dns_task.abort();
         }
     }
 
@@ -2925,6 +3033,7 @@ mod tests {
                     RuleConfig::IpCidr {
                         value: "127.0.0.0/8".into(),
                         action: RouteAction::Direct,
+                        resolve: false,
                     },
                     RuleConfig::Final {
                         action: RouteAction::Proxy,
@@ -3017,7 +3126,7 @@ mod tests {
         });
 
         let args = Args {
-            outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+            outbound: outbound::Outbound::new(Some(helios_config::OutboundConfig {
                 source_bypass: vec![source],
                 dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
             })),
@@ -3154,7 +3263,7 @@ mod tests {
         .parse()
         .unwrap();
         let remote = Remote {
-            outbound: outbound::Outbound(Some(helios_config::OutboundConfig {
+            outbound: outbound::Outbound::new(Some(helios_config::OutboundConfig {
                 source_bypass: vec![source],
                 dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
             })),
@@ -3172,6 +3281,7 @@ mod tests {
                     RuleConfig::IpCidr {
                         value: "127.0.0.0/8".into(),
                         action: RouteAction::Direct,
+                        resolve: false,
                     },
                     RuleConfig::Final {
                         action: RouteAction::Proxy,

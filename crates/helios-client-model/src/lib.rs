@@ -211,6 +211,7 @@ impl Default for DesktopProfile {
                 RuleConfig::IpCidr {
                     value: "192.168.0.0/16".into(),
                     action: RouteAction::Direct,
+                    resolve: false,
                 },
                 RuleConfig::Final {
                     action: RouteAction::Proxy,
@@ -342,6 +343,13 @@ pub fn parse_rules(text: &str) -> Result<Vec<RuleConfig>, ModelError> {
             })
         };
         let rule = match parts.as_slice() {
+            ["geoip", value, result] | ["geoip", value, result, "no-resolve"] => {
+                RuleConfig::Geoip {
+                    value: (*value).into(),
+                    action: action(result)?,
+                    no_resolve: parts.len() == 4,
+                }
+            }
             ["domain", value, result] => RuleConfig::Domain {
                 value: (*value).into(),
                 action: action(result)?,
@@ -350,14 +358,20 @@ pub fn parse_rules(text: &str) -> Result<Vec<RuleConfig>, ModelError> {
                 value: (*value).into(),
                 action: action(result)?,
             },
-            ["ip-cidr", value, result] => RuleConfig::IpCidr {
-                value: (*value).into(),
-                action: action(result)?,
-            },
-            ["ip-cidr6", value, result] => RuleConfig::IpCidr6 {
-                value: (*value).into(),
-                action: action(result)?,
-            },
+            ["ip-cidr", value, result] | ["ip-cidr", value, result, "resolve"] => {
+                RuleConfig::IpCidr {
+                    value: (*value).into(),
+                    action: action(result)?,
+                    resolve: parts.len() == 4,
+                }
+            }
+            ["ip-cidr6", value, result] | ["ip-cidr6", value, result, "resolve"] => {
+                RuleConfig::IpCidr6 {
+                    value: (*value).into(),
+                    action: action(result)?,
+                    resolve: parts.len() == 4,
+                }
+            }
             ["dst-port", value, result] => RuleConfig::DstPort {
                 value: value.parse()?,
                 action: action(result)?,
@@ -389,17 +403,42 @@ pub fn render_rules(rules: &[RuleConfig]) -> String {
     rules
         .iter()
         .map(|rule| match rule {
+            RuleConfig::Geoip {
+                value,
+                action,
+                no_resolve,
+            } => format!(
+                "geoip,{value},{}{}",
+                action_name(*action),
+                if *no_resolve { ",no-resolve" } else { "" }
+            ),
             RuleConfig::Domain { value, action } => {
                 format!("domain,{value},{}", action_name(*action))
             }
             RuleConfig::DomainSuffix { value, action } => {
                 format!("domain-suffix,{value},{}", action_name(*action))
             }
-            RuleConfig::IpCidr { value, action } => {
-                format!("ip-cidr,{value},{}", action_name(*action))
+            RuleConfig::IpCidr {
+                value,
+                action,
+                resolve,
+            } => {
+                format!(
+                    "ip-cidr,{value},{}{}",
+                    action_name(*action),
+                    if *resolve { ",resolve" } else { "" }
+                )
             }
-            RuleConfig::IpCidr6 { value, action } => {
-                format!("ip-cidr6,{value},{}", action_name(*action))
+            RuleConfig::IpCidr6 {
+                value,
+                action,
+                resolve,
+            } => {
+                format!(
+                    "ip-cidr6,{value},{}{}",
+                    action_name(*action),
+                    if *resolve { ",resolve" } else { "" }
+                )
             }
             RuleConfig::DstPort { value, action } => {
                 format!("dst-port,{value},{}", action_name(*action))
@@ -448,9 +487,13 @@ fn test_route(
         .map(Address::Ip)
         .unwrap_or_else(|_| Address::Domain(host.to_string()));
     let target = Target::new(address, port).map_err(|error| error.to_string())?;
-    let (action, index) = RuleSet::new(&rules)
+    let (action, index, _) = RuleSet::new(&rules)
         .map_err(|error| error.to_string())?
-        .decide_with_network_index(&target, network);
+        .evaluate(&target, network, None)
+        .ok_or_else(|| {
+            "This rule requires runtime DNS resolution; offline test cannot determine the route"
+                .to_string()
+        })?;
     Ok(RouteTestResult {
         action,
         rule: index
@@ -712,6 +755,20 @@ fn sibling_binary(name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolved_rules_round_trip_and_keep_legacy_defaults() {
+        let text = "ip-cidr,192.168.0.0/16,direct\nip-cidr,182.92.0.0/16,direct,resolve\nip-cidr6,2400::/12,direct,resolve\ngeoip,cn,direct,no-resolve\ngeoip,cn,direct\nfinal,proxy";
+        let rules = super::parse_rules(text).unwrap();
+        assert_eq!(super::render_rules(&rules), text);
+        assert!(super::parse_rules("geoip,us,direct\nfinal,proxy").is_err());
+        assert!(super::parse_rules("domain,example.com,direct,resolve\nfinal,proxy").is_err());
+        let legacy: helios_routing::RuleConfig = serde_json::from_str(
+            r#"{"type":"ip-cidr","value":"192.168.0.0/16","action":"direct"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy, rules[0]);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("resolve"));
+    }
     use super::*;
 
     #[test]

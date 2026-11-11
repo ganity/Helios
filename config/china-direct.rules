@@ -337,5 +337,7 @@ ip-cidr,119.29.29.29/32,direct
 ip-cidr,114.114.114.114/32,direct
 ip-cidr,114.114.115.115/32,direct
 ip-cidr,180.76.76.76/32,direct
-# Unknown domains and public IP targets use the proxy.
+# Resolve otherwise unmatched domains for mainland IPv4/IPv6 classification.
+geoip,cn,direct
+# Other domains and public IP targets use the proxy.
 final,proxy

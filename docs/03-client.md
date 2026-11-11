@@ -83,7 +83,7 @@ Kind: u16
 Payload: postcard/CBOR bytes
 ```
 
-当前使用 `serde_json`，control schema version 为 4，单条消息最大 64 KiB。支持 `GetStatus`、`UpdateRules`、`CloseFlow`、`SetSystemProxy`、带 revision 的 `ApplyConfig`、过期 DNS 映射清理及 `Shutdown`。IPC 与公网 Helios Protocol 完全分离。
+当前使用 `serde_json`，control schema version 为 5，单条消息最大 64 KiB。支持对未保存规则进行真实 DNS 分类的 `TestRoute`（最长 3 秒解析预算）、`GetStatus`、`UpdateRules`、`CloseFlow`、`SetSystemProxy`、带 revision 的 `ApplyConfig`、过期 DNS 映射清理及 `Shutdown`。IPC 与公网 Helios Protocol 完全分离。
 
 ### 命令
 

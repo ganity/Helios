@@ -4,6 +4,12 @@ use helios_protocol::{Address, Target};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod china_ip;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteAction {
@@ -23,36 +29,118 @@ pub enum Network {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RuleConfig {
-    Domain { value: String, action: RouteAction },
-    DomainSuffix { value: String, action: RouteAction },
-    IpCidr { value: String, action: RouteAction },
-    IpCidr6 { value: String, action: RouteAction },
-    DstPort { value: u16, action: RouteAction },
-    Network { value: Network, action: RouteAction },
-    Final { action: RouteAction },
+    Domain {
+        value: String,
+        action: RouteAction,
+    },
+    DomainSuffix {
+        value: String,
+        action: RouteAction,
+    },
+    IpCidr {
+        value: String,
+        action: RouteAction,
+        #[serde(default, skip_serializing_if = "is_false")]
+        resolve: bool,
+    },
+    IpCidr6 {
+        value: String,
+        action: RouteAction,
+        #[serde(default, skip_serializing_if = "is_false")]
+        resolve: bool,
+    },
+    Geoip {
+        value: String,
+        action: RouteAction,
+        #[serde(default)]
+        no_resolve: bool,
+    },
+    DstPort {
+        value: u16,
+        action: RouteAction,
+    },
+    Network {
+        value: Network,
+        action: RouteAction,
+    },
+    Final {
+        action: RouteAction,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct RuleSet {
-    rules: Vec<Rule>,
+    rules: std::sync::Arc<[Rule]>,
     implicit_final: bool,
 }
 
 #[derive(Clone, Debug)]
 enum Rule {
+    China(RouteAction, bool),
     Domain(String, RouteAction),
     DomainSuffix(String, RouteAction),
-    Cidr(IpAddr, u8, RouteAction),
+    Cidr(IpAddr, u8, RouteAction, bool),
     DstPort(u16, RouteAction),
     Network(Network, RouteAction),
     Final(RouteAction),
 }
 
 impl RuleSet {
+    /// None requests DNS once; Some(empty) means resolution failed or returned no addresses.
+    pub fn evaluate(
+        &self,
+        target: &Target,
+        network: Network,
+        resolved: Option<&[IpAddr]>,
+    ) -> Option<(RouteAction, Option<usize>, Vec<IpAddr>)> {
+        self.evaluate_from(target, network, resolved, 0).ok()
+    }
+
+    /// The error is the rule cursor at which the caller must resolve and resume.
+    pub fn evaluate_from(
+        &self,
+        target: &Target,
+        network: Network,
+        resolved: Option<&[IpAddr]>,
+        start: usize,
+    ) -> Result<(RouteAction, Option<usize>, Vec<IpAddr>), usize> {
+        let domain = match &target.address {
+            Address::Domain(value) => Some(value.trim_end_matches('.').to_ascii_lowercase()),
+            _ => None,
+        };
+        for (index, rule) in self.rules.iter().enumerate().skip(start) {
+            if domain.is_some() {
+                let ip_rule = match rule {
+                    Rule::China(action, no_resolve) => Some((*action, !no_resolve)),
+                    Rule::Cidr(_, _, action, resolve) => Some((*action, *resolve)),
+                    _ => None,
+                };
+                if let Some((action, resolve)) = ip_rule {
+                    if resolved.is_none() && resolve {
+                        return Err(index);
+                    }
+                    let ips: Vec<_> = resolved
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|ip| rule.matches_ip(*ip))
+                        .collect();
+                    if !ips.is_empty() {
+                        return Ok((action, Some(index), ips));
+                    }
+                    continue;
+                }
+            }
+            if let Some(action) = rule.matches(target, domain.as_deref(), network) {
+                return Ok((action, (!self.implicit_final).then_some(index), vec![]));
+            }
+        }
+        unreachable!("validated rule sets end with FINAL")
+    }
     pub fn new(configs: &[RuleConfig]) -> Result<Self, RuleError> {
         if configs.is_empty() {
             return Ok(Self {
-                rules: vec![Rule::Final(RouteAction::Proxy)],
+                rules: vec![Rule::Final(RouteAction::Proxy)].into(),
                 implicit_final: true,
             });
         }
@@ -67,11 +155,12 @@ impl RuleSet {
             return Err(RuleError::MissingFinal);
         }
         Ok(Self {
-            rules,
+            rules: rules.into(),
             implicit_final: false,
         })
     }
 
+    /// Offline matching only; callers requiring DNS must use evaluate_from and resume its cursor.
     pub fn decide(&self, target: &Target) -> RouteAction {
         self.decide_for_network(target, Network::Tcp)
     }
@@ -107,23 +196,41 @@ impl TryFrom<&RuleConfig> for Rule {
 
     fn try_from(config: &RuleConfig) -> Result<Self, Self::Error> {
         Ok(match config {
+            RuleConfig::Geoip {
+                value,
+                action,
+                no_resolve,
+            } => {
+                if !value.eq_ignore_ascii_case("cn") {
+                    return Err(RuleError::InvalidGeoip);
+                }
+                Rule::China(*action, *no_resolve)
+            }
             RuleConfig::Domain { value, action } => Rule::Domain(normalize_domain(value)?, *action),
             RuleConfig::DomainSuffix { value, action } => {
                 Rule::DomainSuffix(normalize_domain(value)?, *action)
             }
-            RuleConfig::IpCidr { value, action } => {
+            RuleConfig::IpCidr {
+                value,
+                action,
+                resolve,
+            } => {
                 let (ip, prefix) = parse_cidr(value)?;
                 if !ip.is_ipv4() {
                     return Err(RuleError::AddressFamily);
                 }
-                Rule::Cidr(ip, prefix, *action)
+                Rule::Cidr(ip, prefix, *action, *resolve)
             }
-            RuleConfig::IpCidr6 { value, action } => {
+            RuleConfig::IpCidr6 {
+                value,
+                action,
+                resolve,
+            } => {
                 let (ip, prefix) = parse_cidr(value)?;
                 if !ip.is_ipv6() {
                     return Err(RuleError::AddressFamily);
                 }
-                Rule::Cidr(ip, prefix, *action)
+                Rule::Cidr(ip, prefix, *action, *resolve)
             }
             RuleConfig::DstPort { value, action } => {
                 if *value == 0 {
@@ -138,6 +245,17 @@ impl TryFrom<&RuleConfig> for Rule {
 }
 
 impl Rule {
+    fn matches_ip(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        };
+        match self {
+            Self::China(..) => china_ip::contains(ip),
+            Self::Cidr(net, prefix, ..) => contains(*net, *prefix, ip),
+            _ => false,
+        }
+    }
     fn matches(
         &self,
         target: &Target,
@@ -145,6 +263,10 @@ impl Rule {
         network: Network,
     ) -> Option<RouteAction> {
         match self {
+            Self::China(action, _) => match target.address {
+                Address::Ip(ip) if self.matches_ip(ip) => Some(*action),
+                _ => None,
+            },
             Self::Domain(expected, action) => domain
                 .is_some_and(|actual| actual == expected)
                 .then_some(*action),
@@ -156,8 +278,8 @@ impl Rule {
                             .is_some_and(|prefix| prefix.ends_with('.'))
                 })
                 .then_some(*action),
-            Self::Cidr(network, prefix, action) => match &target.address {
-                Address::Ip(ip) if contains(*network, *prefix, *ip) => Some(*action),
+            Self::Cidr(_, _, action, _) => match &target.address {
+                Address::Ip(ip) if self.matches_ip(*ip) => Some(*action),
                 _ => None,
             },
             Self::DstPort(port, action) => (target.port == *port).then_some(*action),
@@ -229,6 +351,8 @@ fn masked_v6(address: Ipv6Addr, prefix: u8) -> u128 {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RuleError {
+    #[error("only geoip country cn is supported")]
+    InvalidGeoip,
     #[error("rule domain is invalid")]
     InvalidDomain,
     #[error("rule CIDR is invalid")]
@@ -246,6 +370,149 @@ pub enum RuleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_resume_preserves_cursor_and_mixed_rule_priority_for_both_families() {
+        let rules = RuleSet::new(&[
+            RuleConfig::Geoip {
+                value: "cn".into(),
+                action: RouteAction::Reject,
+                no_resolve: true,
+            },
+            RuleConfig::IpCidr6 {
+                value: "2400::/12".into(),
+                action: RouteAction::Direct,
+                resolve: true,
+            },
+            RuleConfig::Geoip {
+                value: "cn".into(),
+                action: RouteAction::Direct,
+                no_resolve: false,
+            },
+            RuleConfig::DstPort {
+                value: 443,
+                action: RouteAction::Proxy,
+            },
+            RuleConfig::Final {
+                action: RouteAction::Reject,
+            },
+        ])
+        .unwrap();
+        let domain = target(Address::Domain("unknown.example".into()), 443);
+        let cursor = rules
+            .evaluate_from(&domain, Network::Tcp, None, 0)
+            .unwrap_err();
+        assert_eq!(cursor, 1);
+        let ips = [
+            "2408::1".parse().unwrap(),
+            "182.92.244.55".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ];
+        assert_eq!(
+            rules
+                .evaluate_from(&domain, Network::Tcp, Some(&ips), cursor)
+                .unwrap(),
+            (RouteAction::Direct, Some(1), vec![ips[0]])
+        );
+        assert_eq!(
+            rules
+                .evaluate_from(&domain, Network::Tcp, Some(&ips[1..]), cursor)
+                .unwrap(),
+            (RouteAction::Direct, Some(2), vec![ips[1]])
+        );
+        assert_eq!(
+            rules
+                .evaluate_from(&domain, Network::Tcp, Some(&[]), cursor)
+                .unwrap()
+                .0,
+            RouteAction::Proxy
+        );
+    }
+
+    #[test]
+    fn geoip_resolves_in_order_and_pins_only_matching_addresses() {
+        let rules = RuleSet::new(&[
+            RuleConfig::DomainSuffix {
+                value: "google.com".into(),
+                action: RouteAction::Proxy,
+            },
+            RuleConfig::Geoip {
+                value: "cn".into(),
+                action: RouteAction::Direct,
+                no_resolve: false,
+            },
+            RuleConfig::Final {
+                action: RouteAction::Proxy,
+            },
+        ])
+        .unwrap();
+        let domestic = target(Address::Domain("smart.zeroiot.com".into()), 443);
+        assert!(rules.evaluate(&domestic, Network::Tcp, None).is_none());
+        let ips = ["182.92.244.55".parse().unwrap(), "8.8.8.8".parse().unwrap()];
+        for network in [Network::Tcp, Network::Udp] {
+            assert_eq!(
+                rules.evaluate(&domestic, network, Some(&ips)),
+                Some((RouteAction::Direct, Some(1), vec![ips[0]]))
+            );
+            assert_eq!(
+                rules.evaluate(&domestic, network, Some(&[])).unwrap().0,
+                RouteAction::Proxy
+            );
+        }
+        assert_eq!(
+            rules
+                .evaluate(
+                    &target(Address::Domain("www.google.com".into()), 443),
+                    Network::Tcp,
+                    None
+                )
+                .unwrap()
+                .0,
+            RouteAction::Proxy
+        );
+        assert_eq!(
+            rules
+                .evaluate(&target(Address::Ip(ips[0]), 443), Network::Tcp, None)
+                .unwrap()
+                .0,
+            RouteAction::Direct
+        );
+    }
+
+    #[test]
+    fn geoip_no_resolve_and_legacy_cidr_do_not_request_dns() {
+        for rule in [
+            RuleConfig::Geoip {
+                value: "cn".into(),
+                action: RouteAction::Direct,
+                no_resolve: true,
+            },
+            RuleConfig::IpCidr {
+                value: "182.92.0.0/16".into(),
+                action: RouteAction::Direct,
+                resolve: false,
+            },
+        ] {
+            let rules = RuleSet::new(&[
+                rule,
+                RuleConfig::Final {
+                    action: RouteAction::Proxy,
+                },
+            ])
+            .unwrap();
+            assert_eq!(
+                rules
+                    .evaluate(
+                        &target(Address::Domain("smart.zeroiot.com".into()), 443),
+                        Network::Tcp,
+                        None
+                    )
+                    .unwrap()
+                    .0,
+                RouteAction::Proxy
+            );
+        }
+    }
 
     fn target(address: Address, port: u16) -> Target {
         Target::new(address, port).unwrap()
@@ -298,10 +565,12 @@ mod tests {
             RuleConfig::IpCidr {
                 value: "192.168.0.0/16".into(),
                 action: RouteAction::Direct,
+                resolve: false,
             },
             RuleConfig::IpCidr6 {
                 value: "2001:db8::/32".into(),
                 action: RouteAction::Direct,
+                resolve: false,
             },
             RuleConfig::DstPort {
                 value: 22,
