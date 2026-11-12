@@ -1,0 +1,17 @@
+[package]
+name = "helios-android-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+name = "nsh"
+crate-type = ["cdylib"]
+
+[dependencies]
+helios = { package = "helios-client-nsh-prototype", path = "../.." }
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42", default-features = false }
+nsh-platform-android = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42", default-features = false }

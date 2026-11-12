@@ -180,9 +180,16 @@ TCP_CONNECT
 UDP_DATAGRAM
 UDP_OVER_STREAM
 PADDING_TIERS
+UDP_LARGE_STREAM (bit 4)
 ```
 
 客户端不得仅凭自己支持某能力就使用它，必须等待服务端确认。
+
+`UDP_LARGE_STREAM` 经双方确认后，将可靠流上的 UDP payload 上限提升至 1472 bytes，
+并在 QUIC 的 UDP association 流上收发 `UDP_PACKET`，不再使用 datagram。
+未协商此位时保留原有 TLS 1200-byte 上限和 QUIC datagram 行为；默认
+`UdpPacket` 编解码仍按 1200 bytes 验证。移动 TUN MTU 为 1500，IPv6
+UDP payload 因头部开销限制为 1452 bytes；不提供 IP 分片。
 
 ## 10. 0-RTT、重放与恢复
 

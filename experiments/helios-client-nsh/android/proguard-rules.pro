@@ -1,0 +1,2 @@
+-keep class com.helios.mobile.HeliosVpnService { *; }
+-keep class com.helios.mobile.MainActivity { *; }

@@ -1,0 +1,23 @@
+[package]
+name = "helios-ios-ui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[target.'cfg(target_os = "ios")'.dependencies]
+helios = { package = "helios-client-nsh-prototype", path = "../.." }
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42", default-features = false }
+nsh-platform-ios = { git = "https://github.com/longbridge/nsh", rev = "034c11b4537156d12cda1d12b5b4878d29f3bf42", default-features = false }
+objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3.2", features = ["CFCGTypes"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

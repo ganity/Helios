@@ -1,0 +1,144 @@
+name: Mobile packages (IPA and APK)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'experiments/helios-client-nsh/**'
+      - 'crates/helios-config/**'
+      - 'crates/helios-client-model/**'
+      - 'crates/helios-protocol/**'
+      - 'crates/helios-routing/**'
+      - 'crates/helios-transport/**'
+      - '.github/workflows/mobile-ios.yml'
+  pull_request:
+    paths:
+      - 'experiments/helios-client-nsh/**'
+      - 'crates/helios-config/**'
+      - 'crates/helios-client-model/**'
+      - 'crates/helios-protocol/**'
+      - 'crates/helios-routing/**'
+      - 'crates/helios-transport/**'
+      - '.github/workflows/mobile-ios.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: iOS unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            experiments/helios-client-nsh -> target
+            experiments/helios-client-nsh/core -> target
+          cache-directories: experiments/helios-client-nsh/ios/build/cargo
+      - name: Test shared UI bridge and extension engine
+        run: |
+          cargo +stable test --manifest-path experiments/helios-client-nsh/Cargo.toml --locked
+          cargo +stable test --manifest-path experiments/helios-client-nsh/core/Cargo.toml --features ios-ffi --locked
+          cargo +stable clippy --manifest-path experiments/helios-client-nsh/core/Cargo.toml --all-targets --features ios-ffi --locked -- -D warnings
+      - name: Generate containing app and Packet Tunnel project
+        run: |
+          python3 experiments/helios-client-nsh/ios/test_project.py
+          python3 experiments/helios-client-nsh/ios/generate.py
+          plutil -lint experiments/helios-client-nsh/ios/Helios.xcodeproj/project.pbxproj
+      - name: Validate simulator compile and link
+        run: |
+          xcodebuild -project experiments/helios-client-nsh/ios/Helios.xcodeproj -scheme Helios \
+            -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath experiments/helios-client-nsh/ios/build/simulator \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Validate unsigned device compile and link
+        run: |
+          xcodebuild -project experiments/helios-client-nsh/ios/Helios.xcodeproj -scheme Helios \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath experiments/helios-client-nsh/ios/build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          task_app=experiments/helios-client-nsh/ios/build/device/Build/Products/Release-iphoneos/Helios.app
+          test -x "$task_app/Helios"
+          test -x "$task_app/PlugIns/PacketTunnel.appex/PacketTunnel"
+          task_stage="$RUNNER_TEMP/helios-ipa"
+          mkdir -p "$task_stage/Payload" experiments/helios-client-nsh/ios/build/artifacts
+          ditto "$task_app" "$task_stage/Payload/Helios.app"
+          ditto -c -k --keepParent "$task_stage/Payload" \
+            experiments/helios-client-nsh/ios/build/artifacts/Helios-ios-arm64-unsigned.ipa
+          unzip -t experiments/helios-client-nsh/ios/build/artifacts/Helios-ios-arm64-unsigned.ipa
+          (cd experiments/helios-client-nsh/ios/build/artifacts && shasum -a 256 ./*.ipa > SHA256SUMS)
+          ditto -c -k --keepParent \
+            experiments/helios-client-nsh/ios/build/simulator/Build/Products/Debug-iphonesimulator/Helios.app \
+            experiments/helios-client-nsh/ios/build/Helios-ios-simulator.zip
+          echo '### iOS package' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download **helios-ios-ipa**. The IPA is unsigned and requires signing with App Group and Packet Tunnel entitlements before installation.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-ios-ipa
+          path: experiments/helios-client-nsh/ios/build/artifacts/
+          if-no-files-found: error
+      - name: Upload simulator app
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-ios-simulator
+          path: experiments/helios-client-nsh/ios/build/Helios-ios-simulator.zip
+          if-no-files-found: error
+
+  android:
+    name: Android ARM64 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            experiments/helios-client-nsh -> target
+            experiments/helios-client-nsh/core -> target
+            experiments/helios-client-nsh/android/runner -> target
+      - name: Test mobile engine and UI bridge
+        run: |
+          cargo +stable test --manifest-path experiments/helios-client-nsh/core/Cargo.toml --features ios-ffi --locked
+          cargo +stable test --manifest-path experiments/helios-client-nsh/Cargo.toml --locked
+      - name: Build and verify APK
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          python3 experiments/helios-client-nsh/android/build.py --release
+          task_apk=experiments/helios-client-nsh/android/runner/target/artifacts/helios-arm64-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$task_apk"
+          (cd experiments/helios-client-nsh/android/runner/target/artifacts && sha256sum ./*.apk > SHA256SUMS)
+          echo '### Android package' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download **helios-android-apk** for an ARM64 APK signed with a development key. Different CI runs may require uninstalling the previous development build before installation.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-android-apk
+          path: |
+            experiments/helios-client-nsh/android/runner/target/artifacts/*.apk
+            experiments/helios-client-nsh/android/runner/target/artifacts/SHA256SUMS
+          if-no-files-found: error

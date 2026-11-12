@@ -40,7 +40,7 @@ impl<S> FrameIo<S> {
 
 impl<S> FrameIo<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame, FrameIoError> {
         let mut encoded = vec![0; FRAME_HEADER_LEN];
@@ -52,7 +52,12 @@ where
             .await?;
         Ok(Frame::decode(&encoded)?)
     }
+}
 
+impl<S> FrameIo<S>
+where
+    S: AsyncWrite + Unpin,
+{
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<(), FrameIoError> {
         self.stream.write_all(&frame.encode()?).await?;
         self.stream.flush().await?;

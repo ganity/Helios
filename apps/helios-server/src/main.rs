@@ -15,8 +15,8 @@ use helios_config::{
     load_token,
 };
 use helios_protocol::{
-    Address, CAP_TCP_CONNECT, CAP_UDP_DATAGRAM, CAP_UDP_OVER_STREAM, Frame, FrameType,
-    MAX_UDP_PAYLOAD, Target, UdpAssociate, UdpPacket,
+    Address, CAP_TCP_CONNECT, CAP_UDP_DATAGRAM, CAP_UDP_LARGE_STREAM, CAP_UDP_OVER_STREAM, Frame,
+    FrameType, MAX_UDP_PAYLOAD, MAX_UDP_STREAM_PAYLOAD, Target, UdpAssociate, UdpPacket,
 };
 use helios_transport::{
     ClientCrypto, FrameIo, QuicBiStream, ServerCrypto, TlsServer, accept_tcp_frame,
@@ -508,14 +508,16 @@ async fn serve_tls_flow(
     handshake_timeout_seconds: u64,
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), AnyError> {
-    let mut io = timeout(Duration::from_secs(handshake_timeout_seconds), async {
+    let (mut io, capabilities) = timeout(Duration::from_secs(handshake_timeout_seconds), async {
         helios_transport::configure_tcp(&stream)?;
         let mut io = tls.accept(stream).await?;
-        authenticate_server(&mut io, CAP_TCP_CONNECT | CAP_UDP_OVER_STREAM, |id| {
-            (id == credential.id.as_ref()).then_some(credential.token)
-        })
+        let session = authenticate_server(
+            &mut io,
+            CAP_TCP_CONNECT | CAP_UDP_OVER_STREAM | CAP_UDP_LARGE_STREAM,
+            |id| (id == credential.id.as_ref()).then_some(credential.token),
+        )
         .await?;
-        Ok::<_, AnyError>(io)
+        Ok::<_, AnyError>((io, session.capabilities))
     })
     .await??;
     let frame = timeout(
@@ -533,7 +535,7 @@ async fn serve_tls_flow(
         return Ok(());
     }
     if frame.frame_type == FrameType::UdpAssociate {
-        return serve_udp_stream(io, frame).await;
+        return serve_udp_stream(io, frame, capabilities).await;
     }
     let (mut client, mut target) = accept_tcp_frame(io, frame).await?;
     copy_bidirectional(&mut client, &mut target).await?;
@@ -578,8 +580,15 @@ async fn run_quic(
             )
             .await
             {
-                Ok(Ok((connection, control))) => {
-                    serve_quic_session(connection, control, max_flows_per_session, permit).await;
+                Ok(Ok((connection, control, capabilities))) => {
+                    serve_quic_session(
+                        connection,
+                        control,
+                        capabilities,
+                        max_flows_per_session,
+                        permit,
+                    )
+                    .await;
                 }
                 Ok(Err(error)) => {
                     warn!(event = "quic_session_failed");
@@ -594,23 +603,32 @@ async fn run_quic(
 async fn authenticate_quic(
     incoming: quinn::Incoming,
     credential: Credential,
-) -> Result<(quinn::Connection, FrameIo<QuicBiStream>), AnyError> {
+) -> Result<(quinn::Connection, FrameIo<QuicBiStream>, u32), AnyError> {
     let connection = incoming.await?;
     let (send, recv) = connection.accept_bi().await?;
     let mut control = FrameIo::new(QuicBiStream::new(send, recv));
-    authenticate_server(
+    let session = authenticate_server(
         &mut control,
-        CAP_TCP_CONNECT | CAP_UDP_DATAGRAM | CAP_UDP_OVER_STREAM,
+        CAP_TCP_CONNECT | CAP_UDP_DATAGRAM | CAP_UDP_OVER_STREAM | CAP_UDP_LARGE_STREAM,
         |id| (id == credential.id.as_ref()).then_some(credential.token),
     )
     .await?;
-    Ok((connection, control))
+    Ok((connection, control, session.capabilities))
 }
 
-async fn serve_udp_stream<S>(mut io: FrameIo<S>, first: Frame) -> Result<(), AnyError>
+async fn serve_udp_stream<S>(
+    mut io: FrameIo<S>,
+    first: Frame,
+    capabilities: u32,
+) -> Result<(), AnyError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let limit = if capabilities & CAP_UDP_LARGE_STREAM != 0 {
+        MAX_UDP_STREAM_PAYLOAD
+    } else {
+        MAX_UDP_PAYLOAD
+    };
     let _request = UdpAssociate::decode(&first.payload)?;
     let association_id = first.request_id.max(1);
     io.write_frame(&Frame::new(
@@ -627,7 +645,7 @@ where
         if frame.frame_type != FrameType::UdpPacket {
             continue;
         }
-        let packet = UdpPacket::decode(&frame.payload)?;
+        let packet = UdpPacket::decode_with_limit(&frame.payload, limit)?;
         if packet.association_id != association_id {
             continue;
         }
@@ -650,23 +668,27 @@ where
         };
         let socket = UdpSocket::bind(bind_address).await?;
         socket.send_to(&packet.payload, destination).await?;
-        let mut buffer = vec![0u8; MAX_UDP_PAYLOAD];
+        let mut buffer = vec![0u8; limit + 1];
         let Ok((length, source)) =
             timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await?
         else {
             continue;
         };
+        if length > limit {
+            continue;
+        }
         let target = Target::new(Address::Ip(source.ip()), source.port())?;
-        let response = UdpPacket::new(
+        let response = UdpPacket::new_with_limit(
             association_id,
             packet.packet_id,
             target,
             buffer[..length].to_vec(),
+            limit,
         )?;
         io.write_frame(&Frame::new(
             FrameType::UdpPacket,
             frame.request_id,
-            response.encode()?,
+            response.encode_with_limit(limit)?,
         )?)
         .await?;
     }
@@ -675,6 +697,7 @@ where
 async fn serve_quic_session(
     connection: quinn::Connection,
     control: FrameIo<QuicBiStream>,
+    capabilities: u32,
     max_flows: usize,
     _session_permit: OwnedSemaphorePermit,
 ) {
@@ -685,12 +708,12 @@ async fn serve_quic_session(
                 debug!(event = "quic_control_error", error = %error);
             }
         }
-        _ = serve_quic_flows(connection.clone(), max_flows) => {}
+        _ = serve_quic_flows(connection.clone(), capabilities, max_flows) => {}
     }
     connection.close(0u32.into(), b"control session ended");
 }
 
-async fn serve_quic_flows(connection: quinn::Connection, max_flows: usize) {
+async fn serve_quic_flows(connection: quinn::Connection, capabilities: u32, max_flows: usize) {
     let flows = Arc::new(Semaphore::new(max_flows));
     loop {
         let Ok((send, recv)) = connection.accept_bi().await else {
@@ -704,7 +727,7 @@ async fn serve_quic_flows(connection: quinn::Connection, max_flows: usize) {
         tokio::spawn(async move {
             let _permit = permit;
             let io = FrameIo::new(QuicBiStream::new(send, recv));
-            match serve_quic_flow(io, connection).await {
+            match serve_quic_flow(io, connection, capabilities).await {
                 Ok(()) => {}
                 Err(error) => {
                     warn!(event = "quic_flow_setup_failed");
@@ -718,9 +741,13 @@ async fn serve_quic_flows(connection: quinn::Connection, max_flows: usize) {
 async fn serve_quic_flow(
     mut io: FrameIo<QuicBiStream>,
     connection: quinn::Connection,
+    capabilities: u32,
 ) -> Result<(), AnyError> {
     let first = io.read_frame().await?;
     if first.frame_type == FrameType::UdpAssociate {
+        if capabilities & CAP_UDP_LARGE_STREAM != 0 {
+            return serve_udp_stream(io, first, capabilities).await;
+        }
         let _request = UdpAssociate::decode(&first.payload)?;
         let association_id = first.request_id.max(1);
         io.write_frame(&Frame::new(
@@ -1058,46 +1085,65 @@ token_file = "token.hex"
 
     #[tokio::test]
     async fn udp_over_stream_relays_a_real_datagram() {
-        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let echo_address = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
-            let mut buffer = [0; 64];
-            let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
-            echo.send_to(&buffer[..length], peer).await.unwrap();
-        });
-        let (client, server) = duplex(16 * 1024);
-        let first = Frame::new(
-            FrameType::UdpAssociate,
-            7,
-            UdpAssociate { target: None }.encode().unwrap(),
-        )
-        .unwrap();
-        let server_task = tokio::spawn(serve_udp_stream(FrameIo::new(server), first));
-        let mut client = FrameIo::new(client);
-        let accepted = client.read_frame().await.unwrap();
-        assert_eq!(accepted.frame_type, FrameType::UdpAssociateOk);
-        let packet = UdpPacket::new(
-            7,
-            9,
-            Target::new(Address::Ip(echo_address.ip()), echo_address.port()).unwrap(),
-            b"tls-udp".to_vec(),
-        )
-        .unwrap();
-        client
-            .write_frame(&Frame::new(FrameType::UdpPacket, 9, packet.encode().unwrap()).unwrap())
-            .await
+        for (capabilities, payload) in [
+            (0, b"tls-udp".to_vec()),
+            (CAP_UDP_LARGE_STREAM, vec![67; 1400]),
+        ] {
+            let limit = if capabilities == 0 {
+                MAX_UDP_PAYLOAD
+            } else {
+                MAX_UDP_STREAM_PAYLOAD
+            };
+            let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let echo_address = echo.local_addr().unwrap();
+            let echo_task = tokio::spawn(async move {
+                let mut buffer = [0; MAX_UDP_STREAM_PAYLOAD + 1];
+                let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
+                echo.send_to(&buffer[..length], peer).await.unwrap();
+            });
+            let (client, server) = duplex(16 * 1024);
+            let first = Frame::new(
+                FrameType::UdpAssociate,
+                7,
+                UdpAssociate { target: None }.encode().unwrap(),
+            )
             .unwrap();
-        let response = client.read_frame().await.unwrap();
-        assert_eq!(response.frame_type, FrameType::UdpPacket);
-        let response = UdpPacket::decode(&response.payload).unwrap();
-        assert_eq!(response.association_id, 7);
-        assert_eq!(response.packet_id, 9);
-        assert_eq!(response.payload, b"tls-udp");
-        client
-            .write_frame(&Frame::new(FrameType::Close, 10, Vec::new()).unwrap())
-            .await
+            let server_task =
+                tokio::spawn(serve_udp_stream(FrameIo::new(server), first, capabilities));
+            let mut client = FrameIo::new(client);
+            let accepted = client.read_frame().await.unwrap();
+            assert_eq!(accepted.frame_type, FrameType::UdpAssociateOk);
+            let packet = UdpPacket::new_with_limit(
+                7,
+                9,
+                Target::new(Address::Ip(echo_address.ip()), echo_address.port()).unwrap(),
+                payload.clone(),
+                limit,
+            )
             .unwrap();
-        server_task.await.unwrap().unwrap();
-        echo_task.await.unwrap();
+            client
+                .write_frame(
+                    &Frame::new(
+                        FrameType::UdpPacket,
+                        9,
+                        packet.encode_with_limit(limit).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response = client.read_frame().await.unwrap();
+            assert_eq!(response.frame_type, FrameType::UdpPacket);
+            let response = UdpPacket::decode_with_limit(&response.payload, limit).unwrap();
+            assert_eq!(response.association_id, 7);
+            assert_eq!(response.packet_id, 9);
+            assert_eq!(response.payload, payload);
+            client
+                .write_frame(&Frame::new(FrameType::Close, 10, Vec::new()).unwrap())
+                .await
+                .unwrap();
+            server_task.await.unwrap().unwrap();
+            echo_task.await.unwrap();
+        }
     }
 }

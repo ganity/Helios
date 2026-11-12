@@ -1,0 +1,9 @@
+/.nsh/
+/target/
+/android/runner/target/
+/core/target/
+/ios/runner/target/
+/ios/build/
+/ios/Helios.xcodeproj/
+/ios/Config.xcconfig
+__pycache__/

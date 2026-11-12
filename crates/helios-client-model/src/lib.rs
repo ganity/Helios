@@ -1,6 +1,5 @@
 #[cfg(any(test, windows, target_os = "macos"))]
 use std::net::IpAddr;
-#[cfg(any(test, windows, target_os = "macos", target_os = "linux"))]
 use std::net::SocketAddr;
 use std::{
     fs::OpenOptions,
@@ -674,7 +673,6 @@ pub fn parse_proxy_bypass(text: &str) -> Result<Vec<String>, String> {
     Ok(bypass)
 }
 
-#[cfg(any(test, windows, target_os = "macos", target_os = "linux"))]
 pub fn system_proxy_bypass(profile: &DesktopProfile) -> Vec<String> {
     let mut bypass = profile.proxy_bypass.clone();
     for node in &profile.nodes {

@@ -1,5 +1,29 @@
 # VPS 真机测试与使用
 
+## 2026-11-12：移动端协议更新部署到两台 IPv6 VPS
+
+- 将本次工作区的 `x86_64-unknown-linux-musl` release 服务端部署到
+  `[2a12:bec0:16e:6d0::]:24443` 和 `[2602:fd37:10b:3d::a]:24443`。
+  两台 Alpine/OpenRC 的 `helios-server` 重启成功，配置校验通过。
+- 程序 SHA-256：`f80a1e5409cdfe1a02910b498ccca0b30b50fd84b6b8621a65196c5cf9d17d69`。
+  替换前后核对配置、证书、私钥和 token 的哈希，全部保持不变；原导入链接继续使用。
+- 旧程序备份分别为：
+  `/usr/local/bin/helios-server.before-mobile-20261112T094116Z`（第一台）和
+  `/usr/local/bin/helios-server.before-mobile-20261112T094129Z`（第二台）。
+- 从本机连接两台服务端，TLS 认证、代理 TCP 获取远端本机 SSH banner、
+  协商后 1400-byte UDP 回显均通过。第二台公网 QUIC 的上述 TCP/UDP 测试也通过，
+  测试确认没有回退 TLS。
+- 第一台从本机测试时 QUIC 触发 TLS 回退；改从第二台 VPS 连接第一台，
+  QUIC TCP 和 1400-byte UDP 回显均通过且没有回退。此结果证明第一台服务端
+  的 QUIC 转发可用，但不能证明当前本机到第一台的 QUIC 路径正常；未确定回退原因。
+- 回显程序仅临时绑定 VPS 的 IPv6 loopback，测试程序和测试凭据已从远端清理。
+  上述是短时协议冒烟测试，不代表移动设备、长时间负载或公网带宽验收。
+
+同次移动端构建配置见 `.github/workflows/mobile-ios.yml`：独立生成未签名 IPA
+（包含 Packet Tunnel 扩展）、模拟器 ZIP 和开发签名 ARM64 APK，并上传 SHA256SUMS。
+本地 Android release APK 构建及签名验证通过，workflow 的 actionlint 和 iOS 项目
+生成检查通过；未执行 GitHub Actions 或 Apple SDK 编译，尚无已编译 IPA。
+
 ## 2026-11-03：吞吐与会话稳定性
 
 - 同一 10 MiB 下载：公网 QUIC 一次 48.5 秒、一次 60 秒超时；强制 TLS 两次约 4.3 秒。50 MiB 下载：Helios TLS 8.25 秒，本机 7890 代理 13.67 秒。公网测量随时间和路径变化，不是带宽上限保证。

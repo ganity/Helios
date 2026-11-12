@@ -16,6 +16,8 @@ pub const CAP_TCP_CONNECT: u32 = 1 << 0;
 pub const CAP_UDP_DATAGRAM: u32 = 1 << 1;
 pub const CAP_UDP_OVER_STREAM: u32 = 1 << 2;
 pub const CAP_PADDING_TIERS: u32 = 1 << 3;
+/// UDP over a reliable stream, with payloads up to MAX_UDP_STREAM_PAYLOAD.
+pub const CAP_UDP_LARGE_STREAM: u32 = 1 << 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHello {

@@ -1,6 +1,7 @@
 use crate::{DecodeError, EncodeError, MAX_PADDING_LEN, Target};
 
 pub const MAX_UDP_PAYLOAD: usize = 1200;
+pub const MAX_UDP_STREAM_PAYLOAD: usize = 1472;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UdpAssociate {
@@ -53,10 +54,21 @@ impl UdpPacket {
         target: Target,
         payload: Vec<u8>,
     ) -> Result<Self, EncodeError> {
-        if payload.len() > MAX_UDP_PAYLOAD {
+        Self::new_with_limit(association_id, packet_id, target, payload, MAX_UDP_PAYLOAD)
+    }
+
+    pub fn new_with_limit(
+        association_id: u32,
+        packet_id: u32,
+        target: Target,
+        payload: Vec<u8>,
+        limit: usize,
+    ) -> Result<Self, EncodeError> {
+        let limit = limit.min(MAX_UDP_STREAM_PAYLOAD);
+        if payload.len() > limit {
             return Err(EncodeError::PayloadTooLarge {
                 actual: payload.len(),
-                limit: MAX_UDP_PAYLOAD,
+                limit,
             });
         }
         Ok(Self {
@@ -68,10 +80,15 @@ impl UdpPacket {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
-        if self.payload.len() > MAX_UDP_PAYLOAD {
+        self.encode_with_limit(MAX_UDP_PAYLOAD)
+    }
+
+    pub fn encode_with_limit(&self, limit: usize) -> Result<Vec<u8>, EncodeError> {
+        let limit = limit.min(MAX_UDP_STREAM_PAYLOAD);
+        if self.payload.len() > limit {
             return Err(EncodeError::PayloadTooLarge {
                 actual: self.payload.len(),
-                limit: MAX_UDP_PAYLOAD,
+                limit,
             });
         }
         let mut output = Vec::with_capacity(12 + self.payload.len());
@@ -84,6 +101,11 @@ impl UdpPacket {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode_with_limit(input, MAX_UDP_PAYLOAD)
+    }
+
+    pub fn decode_with_limit(input: &[u8], limit: usize) -> Result<Self, DecodeError> {
+        let limit = limit.min(MAX_UDP_STREAM_PAYLOAD);
         let fixed = input.get(..8).ok_or(DecodeError::UnexpectedEnd)?;
         let association_id = u32::from_be_bytes(fixed[..4].try_into().unwrap());
         let packet_id = u32::from_be_bytes(fixed[4..].try_into().unwrap());
@@ -96,10 +118,10 @@ impl UdpPacket {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        if length > MAX_UDP_PAYLOAD {
+        if length > limit {
             return Err(DecodeError::PayloadTooLarge {
                 actual: length,
-                limit: MAX_UDP_PAYLOAD,
+                limit,
             });
         }
         let payload_start = length_start + 2;
@@ -247,6 +269,32 @@ fn validate_padding_for_encode(length: usize) -> Result<(), EncodeError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_udp_requires_an_explicit_negotiated_limit() {
+        let target = super::Target::new(crate::Address::Ip("::1".parse().unwrap()), 1234).unwrap();
+        let packet = super::UdpPacket::new_with_limit(
+            1,
+            2,
+            target,
+            vec![42; 1400],
+            super::MAX_UDP_STREAM_PAYLOAD,
+        )
+        .unwrap();
+        assert!(packet.encode().is_err());
+        let bytes = packet
+            .encode_with_limit(super::MAX_UDP_STREAM_PAYLOAD)
+            .unwrap();
+        assert!(super::UdpPacket::decode(&bytes).is_err());
+        assert_eq!(
+            super::UdpPacket::decode_with_limit(&bytes, super::MAX_UDP_STREAM_PAYLOAD).unwrap(),
+            packet
+        );
+        let mut oversized = packet;
+        oversized
+            .payload
+            .resize(super::MAX_UDP_STREAM_PAYLOAD + 1, 0);
+        assert!(oversized.encode_with_limit(usize::MAX).is_err());
+    }
     use crate::{Address, MAX_PADDING_LEN};
 
     use super::*;

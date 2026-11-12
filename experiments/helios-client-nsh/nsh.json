@@ -1,0 +1,7 @@
+{
+  "name": "Helios",
+  "id": "com.helios.mobile",
+  "appearance": "dark",
+  "rust": ".",
+  "root": "App"
+}

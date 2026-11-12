@@ -8,10 +8,12 @@ pub use address::{Address, Target};
 pub use error::{DecodeError, EncodeError};
 pub use frame::{Frame, FrameType};
 pub use handshake::{
-    Auth, AuthOk, CAP_PADDING_TIERS, CAP_TCP_CONNECT, CAP_UDP_DATAGRAM, CAP_UDP_OVER_STREAM,
-    ClientHello, ServerHello, compute_auth_proof, verify_auth_proof,
+    Auth, AuthOk, CAP_PADDING_TIERS, CAP_TCP_CONNECT, CAP_UDP_DATAGRAM, CAP_UDP_LARGE_STREAM,
+    CAP_UDP_OVER_STREAM, ClientHello, ServerHello, compute_auth_proof, verify_auth_proof,
 };
-pub use message::{ConnectErrorCode, ConnectTcp, MAX_UDP_PAYLOAD, UdpAssociate, UdpPacket};
+pub use message::{
+    ConnectErrorCode, ConnectTcp, MAX_UDP_PAYLOAD, MAX_UDP_STREAM_PAYLOAD, UdpAssociate, UdpPacket,
+};
 
 pub const VERSION: u8 = 1;
 pub const MAX_CONTROL_PAYLOAD: usize = 16 * 1024;
