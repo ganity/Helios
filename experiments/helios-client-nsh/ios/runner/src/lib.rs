@@ -27,13 +27,12 @@ pub unsafe extern "C" fn helios_ui_create(
         return std::ptr::null_mut();
     };
     nsh_platform_ios::set_ui_sets(vec![nsh_base::registry(), helios::registry()]);
+    let mut options = SurfaceOptions::default();
+    options.data_dir = Some(PathBuf::from(directory));
     let app = AppView::new(
         main,
         CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width, height)),
-        SurfaceOptions {
-            data_dir: Some(PathBuf::from(directory)),
-            ..SurfaceOptions::default()
-        },
+        options,
     );
     app.run(
         nsh_core::element::Root::of::<helios::App>()
