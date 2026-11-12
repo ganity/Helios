@@ -39,7 +39,7 @@ Android still requires a disconnect before switching nodes. If a remembered node
 
 ## Build and validate
 
-NSH is pinned to revision `034c11b4537156d12cda1d12b5b4878d29f3bf42`.
+NSH is pinned to revision `78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e`. This includes the upstream iOS release-build fix for `Mounter::ui_view` (longbridge/nsh#1810); the `dev` feature stays disabled.
 It requires Rust 1.97 or newer; validation used Rust stable 1.99.1.
 The main Helios workspace keeps its existing toolchain.
 

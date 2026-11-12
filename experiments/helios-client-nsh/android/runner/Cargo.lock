@@ -1631,7 +1631,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "chrono",
  "html5ever",
@@ -1650,7 +1650,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -1689,7 +1689,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "crossbeam-channel",
  "env_filter",
@@ -1707,7 +1707,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -1720,7 +1720,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-android"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "jni 0.21.1",
  "libc",
@@ -1737,7 +1737,7 @@ dependencies = [
 [[package]]
 name = "nsh-updater"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/nsh?rev=034c11b4537156d12cda1d12b5b4878d29f3bf42#034c11b4537156d12cda1d12b5b4878d29f3bf42"
+source = "git+https://github.com/longbridge/nsh?rev=78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e#78e2f02a21c4eadfa295ae6c79bdbc9b76a40c7e"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
