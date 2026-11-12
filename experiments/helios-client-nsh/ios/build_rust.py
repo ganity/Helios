@@ -9,6 +9,13 @@ import shutil
 import subprocess
 
 
+def native_flags(output):
+    # Cargo may force ANSI colours in CI; escape sequences are not linker flags.
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    flags = re.findall(r"native-static-libs:\s*([^\n]+)", plain)
+    return " ".join(shlex.quote(flag) for flag in shlex.split(flags[-1])) + "\n" if flags else None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("component", choices=["app", "tunnel"])
@@ -21,6 +28,7 @@ def main():
     library = "helios_ios_ui" if args.component == "app" else "helios_mobile_core"
     env = os.environ.copy()
     env["RUSTUP_TOOLCHAIN"] = "stable"
+    env["CARGO_TERM_COLOR"] = "never"
     env["CARGO_TARGET_DIR"] = str(root / "build/cargo")
     # Xcode's per-architecture output settings must not leak into Cargo build scripts.
     env.pop("SDKROOT", None)
@@ -44,10 +52,10 @@ def main():
         output = root / "build/rust" / platform / arch
         output.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path(env["CARGO_TARGET_DIR"]) / target / "release" / f"lib{library}.a", output / f"lib{library}.a")
-        flags = re.findall(r"native-static-libs:\s*([^\n]+)", result.stdout)
+        flags = native_flags(result.stdout)
         response = output / ("app-linker-flags.rsp" if args.component == "app" else "tunnel-linker-flags.rsp")
         if flags:
-            response.write_text(" ".join(shlex.quote(flag) for flag in shlex.split(flags[-1])) + "\n")
+            response.write_text(flags)
         elif not response.exists():
             raise RuntimeError("Rust did not report native linker flags; clean the Rust build and retry")
 

@@ -17,6 +17,14 @@ spec.loader.exec_module(generate)
 
 
 class ProjectTest(unittest.TestCase):
+    def test_native_linker_flags_strip_ci_colours(self):
+        spec = importlib.util.spec_from_file_location("build_rust", Path(__file__).with_name("build_rust.py"))
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        output = "\x1b[1m\x1b[92mnote\x1b[0m: native-static-libs: -framework Security -lSystem -lm\x1b[0m\n"
+        self.assertEqual(build.native_flags(output), "-framework Security -lSystem -lm\n")
+        self.assertIsNone(build.native_flags("Finished release profile\n"))
+
     def test_app_embeds_extension_with_matching_entitlements_and_scheme(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
