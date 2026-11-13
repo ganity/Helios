@@ -265,9 +265,11 @@ fn lock_helper_instance() -> Result<fs::File, AnyError> {
     use std::os::unix::fs::MetadataExt;
 
     #[cfg(target_os = "macos")]
-    let path = Path::new("/private/var/run/helios-helper.lock");
+    let path = Path::new("/Library/Application Support/Helios/helios-helper.lock");
     #[cfg(not(target_os = "macos"))]
     let path = Path::new("/run/helios-helper.lock");
+    #[cfg(target_os = "macos")]
+    prepare_private_lock_directory(path.parent().unwrap())?;
     let parent = fs::symlink_metadata(path.parent().unwrap())?;
     if !parent.is_dir() || parent.uid() != 0 || parent.mode() & 0o022 != 0 {
         return Err("helper lock directory must be a root-owned, non-writable directory".into());
@@ -278,6 +280,23 @@ fn lock_helper_instance() -> Result<fs::File, AnyError> {
         return Err("helper lock must be owned by root and not writable by other users".into());
     }
     Ok(file)
+}
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn prepare_private_lock_directory(path: &Path) -> Result<(), AnyError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    // macOS's shared runtime directory may be group-writable; use our own private directory.
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
+        return Err("helper lock directory must be a private directory".into());
+    }
+    // The caller checks root ownership before opening the lock.
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -388,6 +407,43 @@ mod tests {
     // fork on macOS can temporarily inherit another test's flock until exec closes it.
     #[cfg(unix)]
     static CHILD_PROCESS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn private_lock_directory_does_not_require_changing_shared_parent_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let directory = std::env::temp_dir().join(format!(
+            "helios-private-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).unwrap();
+        let private = directory.join("Helios");
+        prepare_private_lock_directory(&private).unwrap();
+        prepare_private_lock_directory(&private).unwrap();
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o775);
+        let lock = lock_instance_file(&private.join("helper.lock")).unwrap();
+        assert!(lock_instance_file(&private.join("helper.lock")).is_err());
+        drop(lock);
+
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(prepare_private_lock_directory(&private).is_err());
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o777, 0o770);
+        let link = directory.join("linked");
+        symlink(&private, &link).unwrap();
+        assert!(prepare_private_lock_directory(&link).is_err());
+        let file = directory.join("file");
+        fs::write(&file, b"preserve").unwrap();
+        assert!(prepare_private_lock_directory(&file).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"preserve");
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn failed_run_preserves_status_and_success_cleans_it() {
