@@ -219,18 +219,28 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    let mut greeting = [0; 3];
-                    stream.read_exact(&mut greeting).await.unwrap();
-                    assert_eq!(greeting, [5, 1, 0]);
+                    let mut greeting = [0; 2];
+                    if stream.read_exact(&mut greeting).await.is_err() || greeting[0] != 5 {
+                        return;
+                    }
+                    let mut methods = vec![0; greeting[1] as usize];
+                    if stream.read_exact(&mut methods).await.is_err() || !methods.contains(&0) {
+                        return;
+                    }
                     stream.write_all(&[5, 0]).await.unwrap();
                     let mut request = [0; 10];
-                    stream.read_exact(&mut request).await.unwrap();
-                    assert_eq!(&request[4..8], &[198, 18, 0, 0]);
+                    if stream.read_exact(&mut request).await.is_err()
+                        || request[..4] != [5, 1, 0, 1]
+                        || request[4..8] != [198, 18, 0, 0]
+                        || request[8..] != 53u16.to_be_bytes()
+                    {
+                        return;
+                    }
                     stream
                         .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
                         .await
                         .unwrap();
-                    helios_dns::serve_tcp(stream, pool).await.unwrap();
+                    let _ = helios_dns::serve_tcp(stream, pool).await;
                 });
             }
         });
