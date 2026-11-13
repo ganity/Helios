@@ -513,7 +513,12 @@ impl HeliosApp {
                     self.stop_daemon();
                     let saved = save_profile(&self.profile_path, &self.profile);
                     #[cfg(target_os = "macos")]
-                    // The helper removes status only after confirming that no network lease remains.
+                    if result.is_err() && tun_needs_recovery() && !self.exit_after_tun {
+                        self.notice = Some(("TUN 已停止，正在恢复系统路由和 DNS".into(), true));
+                        desktop_tun::recover(&self.profile, self.event_tx.clone());
+                        continue;
+                    }
+                    #[cfg(target_os = "macos")]
                     if saved.is_ok()
                         && !self.exit_after_tun
                         && self.child.is_none()
@@ -529,6 +534,15 @@ impl HeliosApp {
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Event::TunRecovered(result) => {
+                    #[cfg(target_os = "macos")]
+                    if result.is_ok()
+                        && !self.exit_after_tun
+                        && self.child.is_none()
+                        && self.daemon_profile.is_none()
+                        && self.profile.tun_outbound.is_none()
+                    {
+                        self.spawn_daemon("网络设置已恢复，后台已重新启动");
+                    }
                     self.notice = Some(match result {
                         Ok(()) => ("虚拟网卡路由与 DNS 已恢复，可重新开启".into(), true),
                         Err(error) => (error, false),

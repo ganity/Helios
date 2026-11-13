@@ -79,10 +79,6 @@ fn launch_inner(
         &profile.helper_config,
         profile.helper_config_toml()?.as_bytes(),
     )?;
-    let log_path = Path::new("/Library/Logs/Helios/helper.log");
-    let log_offset = std::fs::metadata(log_path)
-        .map(|info| info.len())
-        .unwrap_or(0);
     launch_helper_elevated(&profile.helper_binary, &profile.helper_config, false)?;
     let started = Instant::now();
     let mut seen = false;
@@ -109,21 +105,7 @@ fn launch_inner(
         thread::sleep(Duration::from_millis(100));
     }
     if tun_status_file().exists() || (!ready && !cancel.load(Ordering::Relaxed)) {
-        let details = (|| -> std::io::Result<String> {
-            let mut log = std::fs::File::open(log_path)?;
-            if log.metadata()?.len() >= log_offset {
-                log.seek(SeekFrom::Start(log_offset))?;
-            }
-            let mut text = String::new();
-            log.take(65_536).read_to_string(&mut text)?;
-            Ok(text)
-        })()
-        .unwrap_or_default();
-        return Err(format!(
-            "TUN 启停失败；若恢复记录仍在，请重试恢复。{}",
-            details.trim()
-        )
-        .into());
+        return Err("TUN 启停失败，正在检查并恢复网络设置；详细信息见 helper.log".into());
     }
     Ok(())
 }
