@@ -1,6 +1,15 @@
 //! macOS route/DNS transactions, shared with fault-injection tests on other hosts.
 use std::{io, net::IpAddr};
 
+pub(crate) fn route_destination(cidr: cidr::IpCidr) -> (&'static str, String) {
+    // Darwin needs RTF_HOST for /32 and /128; IpCidr displays these without a prefix.
+    if cidr.is_host_address() {
+        ("-host", cidr.first_address().to_string())
+    } else {
+        ("-net", cidr.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Route {
     pub cidr: cidr::IpCidr,
@@ -275,6 +284,27 @@ pub(crate) fn recover(lease: &mut Lease, network: &mut impl Network) -> io::Resu
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn host_route_commands_do_not_use_network_lookups() {
+        for (cidr, kind, destination) in [
+            ("127.0.0.1/32", "-host", "127.0.0.1"),
+            ("127.0.0.1", "-host", "127.0.0.1"),
+            ("::1/128", "-host", "::1"),
+            ("::1", "-host", "::1"),
+            ("2602:fd37:10b:3d::a/128", "-host", "2602:fd37:10b:3d::a"),
+            ("0.0.0.0/0", "-net", "0.0.0.0/0"),
+            ("::/0", "-net", "::/0"),
+            ("0.0.0.0/1", "-net", "0.0.0.0/1"),
+            ("8000::/1", "-net", "8000::/1"),
+            ("192.168.0.0/16", "-net", "192.168.0.0/16"),
+        ] {
+            assert_eq!(
+                route_destination(cidr.parse().unwrap()),
+                (kind, destination.into())
+            );
+        }
+    }
 
     #[test]
     fn parses_native_route_output_without_confusing_scoped_defaults() {

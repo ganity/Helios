@@ -181,13 +181,13 @@ impl crate::macos_lease::Network for Native<'_> {
         .map(|found| found.filter(|found| found.cidr == route.cidr))
     }
     fn add(&mut self, route: &crate::macos_lease::Route) -> std::io::Result<()> {
-        let cidr = route.cidr.to_string();
+        let (kind, destination) = crate::macos_lease::route_destination(route.cidr);
         let family = if route.cidr.first_address().is_ipv4() {
             "-inet"
         } else {
             "-inet6"
         };
-        let mut args = vec!["-n", "add", family, "-proto2", "-net", &cidr];
+        let mut args = vec!["-n", "add", family, "-proto2", kind, &destination];
         if let Some(gateway) = &route.gateway {
             args.push(gateway);
         } else {
@@ -196,16 +196,13 @@ impl crate::macos_lease::Network for Native<'_> {
         run_command("/sbin/route", &args).map(|_| ())
     }
     fn delete(&mut self, route: &crate::macos_lease::Route) -> std::io::Result<()> {
+        let (kind, destination) = crate::macos_lease::route_destination(route.cidr);
         let family = if route.cidr.first_address().is_ipv4() {
             "-inet"
         } else {
             "-inet6"
         };
-        run_command(
-            "/sbin/route",
-            &["-n", "delete", family, "-net", &route.cidr.to_string()],
-        )
-        .map(|_| ())
+        run_command("/sbin/route", &["-n", "delete", family, kind, &destination]).map(|_| ())
     }
     fn dns(&mut self, service: &str) -> std::io::Result<Option<Vec<IpAddr>>> {
         get_dns_servers(service)
@@ -266,8 +263,16 @@ fn lookup_route(
     ipv6: bool,
 ) -> std::io::Result<Option<crate::macos_lease::Route>> {
     let family = if ipv6 { "-inet6" } else { "-inet" };
+    let cidr = if destination == "default" {
+        if ipv6 { "::/0" } else { "0.0.0.0/0" }
+    } else {
+        destination
+    }
+    .parse()
+    .map_err(std::io::Error::other)?;
+    let (kind, destination) = crate::macos_lease::route_destination(cidr);
     let output = std::process::Command::new("/sbin/route")
-        .args(["-n", "get", family, "-net", destination])
+        .args(["-n", "get", family, kind, &destination])
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("not in table") {
