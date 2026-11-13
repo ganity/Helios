@@ -170,6 +170,7 @@ pub(crate) async fn command(args: &[OsString]) -> Result<(), AnyError> {
     let desktop = process_identity(request.desktop_pid, uid)?;
     let daemon = process_identity(request.daemon_pid, uid)?;
     let mut config = HelperConfig {
+        desktop_pid: None,
         schema_version: 1,
         socks_listen: request.socks_listen,
         server_ip: request.server_ip,
@@ -372,29 +373,6 @@ async fn check_daemon(request: &DesktopTunRequest) -> Result<(), AnyError> {
     let info: TunDaemonInfo = serde_json::from_slice(&bytes)?;
     if info.pid != request.daemon_pid || info.outbound != request.outbound {
         return Err("helper and daemon uplink/DNS configurations disagree".into());
-    }
-    Ok(())
-}
-
-pub(super) async fn probe_tun_dns() -> Result<(), AnyError> {
-    let mut stream = tokio::net::TcpStream::connect((helios_dns::TUN_DNS, 53)).await?;
-    let query = hickory_proto::op::Message::query()
-        .add_query(hickory_proto::op::Query::query(
-            hickory_proto::rr::Name::from_str("helios-tun-ready.invalid.")?,
-            hickory_proto::rr::RecordType::AAAA,
-        ))
-        .to_vec()?;
-    stream.write_u16(query.len().try_into()?).await?;
-    stream.write_all(&query).await?;
-    let size = stream.read_u16().await? as usize;
-    if size > 4096 {
-        return Err("oversized TUN DNS probe".into());
-    }
-    let mut bytes = vec![0; size];
-    stream.read_exact(&mut bytes).await?;
-    let reply = hickory_proto::op::Message::from_vec(&bytes)?;
-    if !reply.answers.iter().any(|r| matches!(&r.data, hickory_proto::rr::RData::AAAA(ip) if helios_dns::is_fake_ip(IpAddr::V6(ip.0)))) {
-        return Err("TUN DNS probe did not reach the shared cache".into());
     }
     Ok(())
 }

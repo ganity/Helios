@@ -5,134 +5,123 @@ use system_configuration::{
     core_foundation::{
         array::CFArray,
         base::TCFType,
-        dictionary::{CFDictionary, CFDictionaryGetValue},
+        dictionary::CFDictionary,
         propertylist::{CFPropertyList, CFPropertyListSubClass},
         string::CFString,
     },
     dynamic_store::SCDynamicStoreBuilder,
-    sys::dynamic_store::SCDynamicStoreCopyValue,
 };
 
-use crate::{ETC_RESOLV_CONF_FILE, TproxyArgs, TproxyStateInner, run_command};
+use crate::macos_lease::Network;
+use crate::{TproxyArgs, TproxyStateInner, run_command};
 use std::{net::IpAddr, str::FromStr};
 
-pub(crate) async fn _tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyStateInner> {
-    flush_dns_cache()?;
-
-    // 0. Save the original gateway and scope
-    let (original_gateway_0, orig_gw_iface, service_id, orig_iface_name) =
-        get_default_iface_params()?;
-    let original_gateway = original_gateway_0.to_string();
-
-    let tun_ip = tproxy_args.tun_ip.to_string();
-    let tun_netmask = tproxy_args.tun_netmask.to_string();
-    let tun_gateway = tproxy_args.tun_gateway.to_string();
-
-    let default_service_dns = match get_dns_servers(&service_id) {
-        Ok(servers) => servers,
-        Err(msg) => {
-            log::error!("failed to get DNS servers of default interface: {msg}");
-            None
-        }
-    };
-
-    let restore_resolvconf_content = Some(std::fs::read(ETC_RESOLV_CONF_FILE)?);
-
-    let state = TproxyStateInner {
-        tproxy_args: Some(tproxy_args.clone()),
-        original_dns_servers: None,
-        gateway: Some(original_gateway_0),
-        gw_scope: Some(orig_gw_iface.clone()),
-        umount_resolvconf: false,
-        restore_resolvconf_content,
-        tproxy_removed_done: false,
-        default_service_id: Some(service_id.clone()),
-        default_service_dns,
-        orig_iface_name: orig_iface_name.clone(),
-    };
-
-    #[cfg(all(
-        feature = "unsafe-state-file",
-        any(target_os = "macos", target_os = "windows")
-    ))]
-    crate::store_intermediate_state(&state)?;
+pub(crate) async fn _tproxy_setup(args: &TproxyArgs) -> std::io::Result<TproxyStateInner> {
+    use crate::macos_lease::{self, Dns, Lease, Route};
     #[cfg(feature = "secure-state-file")]
-    crate::store_secure_state(&state)?;
-
-    // Persist the original network settings before the first route or DNS mutation.
-    // sudo sysctl -w net.inet.ip.forwarding=1
-    run_command("sysctl", &["-w", "net.inet.ip.forwarding=1"])?;
-
-    // Set up the address and netmask and gateway of the interface
-    // Command: `sudo ifconfig tun_name 10.0.0.33 10.0.0.1 netmask 255.255.255.0`
-    let args = &[
-        &tproxy_args.tun_name,
-        &tun_ip,
-        &tun_gateway,
-        "netmask",
-        &tun_netmask,
-    ];
-    run_command("ifconfig", args)?;
-
-    // route delete default
-    // route delete default -ifscope original_gw_scope
-    // route add default tun_gateway
-    // route add default original_gateway -ifscope original_gw_scope
-    run_command("route", &["delete", "default"])?;
-    run_command("route", &["delete", "default", "-ifscope", &orig_gw_iface])?;
-    run_command("route", &["add", "default", &tun_gateway])?;
+    if crate::get_secure_state_file_path()?.try_exists()? {
+        return Err(std::io::Error::other(
+            "an earlier TUN recovery record exists; recover it before starting a new session",
+        ));
+    }
+    let (gateway, interface, service, name) = get_default_iface_params()?;
+    let name =
+        name.ok_or_else(|| std::io::Error::other("cannot identify the uplink network service"))?;
+    let (sources, _) = snapshot(args.ipv6_default_route, Some(&args.tun_name))?;
+    if args.source_bypass.is_empty()
+        || args
+            .source_bypass
+            .iter()
+            .any(|source| !sources.contains(source))
+    {
+        return Err(std::io::Error::other(
+            "TUN requires a daemon bound to the current physical uplink",
+        ));
+    }
+    let ipv6 = default_gateway(true)?;
+    let mut routes = Vec::new();
+    let mut bypass = args.bypass_ips.clone();
+    if bypass.is_empty() && !crate::is_private_ip(args.proxy_addr.ip()) {
+        bypass.push(IpCidr::new_host(args.proxy_addr.ip()));
+    }
+    bypass.sort_by_key(ToString::to_string);
+    bypass.dedup();
+    for cidr in bypass {
+        let (route_gateway, route_interface) = if cidr.first_address().is_ipv4() {
+            (gateway.to_string(), interface.clone())
+        } else {
+            if !args.ipv6_default_route {
+                continue;
+            }
+            let Some((gateway, interface)) = &ipv6 else {
+                continue;
+            };
+            (gateway.clone(), interface.clone())
+        };
+        routes.push(Route {
+            cidr,
+            gateway: Some(route_gateway),
+            interface: route_interface,
+            tagged: true,
+        });
+    }
+    for (enabled, prefixes) in [
+        (args.ipv4_default_route, ["0.0.0.0/1", "128.0.0.0/1"]),
+        (args.ipv6_default_route, ["::/1", "8000::/1"]),
+    ] {
+        if enabled {
+            for prefix in prefixes {
+                routes.push(Route {
+                    cidr: prefix.parse().unwrap(),
+                    gateway: None,
+                    interface: args.tun_name.clone(),
+                    tagged: true,
+                });
+            }
+        }
+    }
+    let mut lease = Lease {
+        boot: boot_identity()?,
+        tun: args.tun_name.clone(),
+        tun_index: interface_index(&args.tun_name)?,
+        routes: Vec::new(),
+        dns: None,
+    };
+    let dns = Dns {
+        service: service.clone(),
+        name: name.clone(),
+        original: get_dns_servers(&service)?,
+        applied: vec![args.tun_gateway],
+    };
+    let mut state = TproxyStateInner {
+        tproxy_args: Some(args.clone()),
+        ..Default::default()
+    };
+    let mut network = Native { state: &mut state };
+    // Configuring only our newly created interface cannot remove the physical default route.
     run_command(
-        "route",
+        "/sbin/ifconfig",
         &[
-            "add",
-            "default",
-            &original_gateway,
-            "-ifscope",
-            &orig_gw_iface,
+            &args.tun_name,
+            &args.tun_ip.to_string(),
+            &args.tun_gateway.to_string(),
+            "netmask",
+            &args.tun_netmask.to_string(),
         ],
     )?;
-
-    // Route the bypass ip to the original gateway
-    // Command: `sudo route add bypass_ip/32 original_gateway`
-    for bypass_ip in tproxy_args.bypass_ips.iter() {
-        let args = &["add", &bypass_ip.to_string(), &original_gateway];
-        run_command("route", args)?;
+    if args.ipv6_default_route {
+        run_command(
+            "/sbin/ifconfig",
+            &[&args.tun_name, "inet6", "fdfe:dcba:9875::1/126", "alias"],
+        )?;
     }
-    if tproxy_args.bypass_ips.is_empty() && !crate::is_private_ip(tproxy_args.proxy_addr.ip()) {
-        let bypass_ip = IpCidr::new_host(tproxy_args.proxy_addr.ip());
-        let args = &["add", &bypass_ip.to_string(), &original_gateway];
-        run_command("route", args)?;
+    if lease.tun_index == 0 {
+        return Err(std::io::Error::other("TUN interface does not exist"));
     }
-
-    /*
-    let unspecified = Ipv4Addr::UNSPECIFIED.to_string();
-
-    // 2. Remove the default route
-    // Command: `sudo route delete 0.0.0.0`
-    let args = &["delete", &unspecified];
-    run_command("route", args)?;
-
-    // 3. Set the gateway `10.0.0.1` as the default route
-    // Command: `sudo route add -net 0.0.0.0 10.0.0.1`
-    let args = &["add", "-net", &unspecified, &tun_gateway];
-    run_command("route", args)?;
-    // */
-
-    // 5. Set the DNS server to the gateway of the interface
-    {
-        // Command: `sudo sh -c "echo nameserver 10.0.0.1 > /etc/resolv.conf"`
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(ETC_RESOLV_CONF_FILE)?;
-        let mut writer = std::io::BufWriter::new(file);
-        use std::io::Write;
-        writeln!(writer, "nameserver {tun_gateway}\n")?;
-
-        let orig_iface_name = orig_iface_name.as_deref().unwrap_or("");
-        configure_dns_servers(orig_iface_name, &service_id, &[tproxy_args.tun_gateway])?;
+    macos_lease::apply(&mut lease, &routes, dns, &mut network)?;
+    if let Err(error) = flush_dns_cache() {
+        log::warn!("DNS cache flush failed: {error}");
     }
-
     Ok(state)
 }
 
@@ -140,74 +129,400 @@ pub(crate) async fn _tproxy_remove(state: &mut TproxyStateInner) -> std::io::Res
     if state.tproxy_removed_done {
         return Ok(());
     }
+    if let Some(mut lease) = state.macos_lease.clone() {
+        // Kernel routes cannot survive a reboot; never remove another session's matching routes.
+        if lease.boot != boot_identity()? {
+            lease.routes.clear();
+            lease.boot = boot_identity()?;
+            lease.tun_index = interface_index(&lease.tun)?;
+            Native { state }.save(&lease)?;
+        }
+        crate::macos_lease::recover(&mut lease, &mut Native { state })?;
+        if let Err(error) = flush_dns_cache() {
+            log::warn!("DNS cache flush after recovery failed: {error}");
+        }
+    } else {
+        recover_legacy(state)?;
+    }
     state.tproxy_removed_done = true;
+    Ok(())
+}
 
-    let err = std::io::Error::other("No original gateway found");
-    let original_gateway = state.gateway.take().ok_or(err)?.to_string();
-    let err = std::io::Error::other("No original gateway scope found");
-    let original_gw_scope = state.gw_scope.take().ok_or(err)?;
-
-    if let Some(service_id) = &state.default_service_id {
-        let iface_friendly_name = state.orig_iface_name.as_deref().unwrap_or("");
-        if let Some(default_service_dns) = &state.default_service_dns {
-            if let Err(_err) = configure_dns_servers(
-                iface_friendly_name,
-                service_id,
-                default_service_dns.as_slice(),
-            ) {
-                log::debug!("restore original dns servers error: {_err}");
+struct Native<'a> {
+    state: &'a mut TproxyStateInner,
+}
+impl crate::macos_lease::Network for Native<'_> {
+    fn validate(&mut self, lease: &crate::macos_lease::Lease) -> std::io::Result<()> {
+        if lease.boot != boot_identity()? {
+            return Err(std::io::Error::other(
+                "TUN recovery belongs to a previous boot; record preserved",
+            ));
+        }
+        Ok(())
+    }
+    fn route(
+        &mut self,
+        route: &crate::macos_lease::Route,
+    ) -> std::io::Result<Option<crate::macos_lease::Route>> {
+        if let Some(lease) = &self.state.macos_lease
+            && route.interface == lease.tun
+        {
+            let index = interface_index(&lease.tun)?;
+            if index != 0 && index != lease.tun_index {
+                return Err(std::io::Error::other(
+                    "TUN interface was reused; route record preserved",
+                ));
             }
-        } else if let Err(e) = remove_dns_servers(service_id, iface_friendly_name) {
-            log::debug!("failed to remove DNS servers: {e}");
+        }
+        lookup_route(
+            &route.cidr.to_string(),
+            route.cidr.first_address().is_ipv6(),
+        )
+        .map(|found| found.filter(|found| found.cidr == route.cidr))
+    }
+    fn add(&mut self, route: &crate::macos_lease::Route) -> std::io::Result<()> {
+        let cidr = route.cidr.to_string();
+        let family = if route.cidr.first_address().is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        };
+        let mut args = vec!["-n", "add", family, "-proto2", "-net", &cidr];
+        if let Some(gateway) = &route.gateway {
+            args.push(gateway);
+        } else {
+            args.extend(["-interface", &route.interface]);
+        }
+        run_command("/sbin/route", &args).map(|_| ())
+    }
+    fn delete(&mut self, route: &crate::macos_lease::Route) -> std::io::Result<()> {
+        let family = if route.cidr.first_address().is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        };
+        run_command(
+            "/sbin/route",
+            &["-n", "delete", family, "-net", &route.cidr.to_string()],
+        )
+        .map(|_| ())
+    }
+    fn dns(&mut self, service: &str) -> std::io::Result<Option<Vec<IpAddr>>> {
+        get_dns_servers(service)
+    }
+    fn set_dns(&mut self, dns: &crate::macos_lease::Dns, restore: bool) -> std::io::Result<()> {
+        if restore {
+            match &dns.original {
+                Some(servers) if !servers.is_empty() => {
+                    configure_dns_servers(&dns.name, &dns.service, servers)
+                }
+                _ => remove_dns_servers(&dns.service, &dns.name),
+            }
+        } else {
+            configure_dns_servers(&dns.name, &dns.service, &dns.applied)
         }
     }
-
-    let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "tproxy_args is None");
-    let tproxy_args = state.tproxy_args.as_ref().ok_or(err)?;
-
-    // Command: `sudo route delete bypass_ip/24`
-    for bypass_ip in tproxy_args.bypass_ips.iter() {
-        let args = &["delete", &bypass_ip.to_string()];
-        run_command("route", args)?;
+    fn save(&mut self, lease: &crate::macos_lease::Lease) -> std::io::Result<()> {
+        self.state.macos_lease = Some(lease.clone());
+        #[cfg(feature = "secure-state-file")]
+        {
+            crate::store_secure_state(self.state)
+        }
+        #[cfg(not(feature = "secure-state-file"))]
+        {
+            Err(std::io::Error::other(
+                "macOS TUN requires secure-state-file recovery",
+            ))
+        }
     }
-    if tproxy_args.bypass_ips.is_empty() && !crate::is_private_ip(tproxy_args.proxy_addr.ip()) {
-        let bypass_ip = IpCidr::new_host(tproxy_args.proxy_addr.ip());
-        let args = &["delete", &bypass_ip.to_string()];
-        run_command("route", args)?;
+    fn clear(&mut self) -> std::io::Result<()> {
+        #[cfg(feature = "secure-state-file")]
+        {
+            let path = crate::get_secure_state_file_path()?;
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+            std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+        }
+        Ok(())
     }
+}
 
-    // route delete default
-    // route delete default -ifscope original_gw_scope
-    // route add default original_gateway
-    if let Err(_err) = run_command("route", &["delete", "default"]) {
-        log::debug!("command \"route delete default\" error: {_err}");
+fn interface_index(name: &str) -> std::io::Result<u32> {
+    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    Ok(unsafe { libc::if_nametoindex(name.as_ptr()) })
+}
+fn boot_identity() -> std::io::Result<String> {
+    Ok(
+        String::from_utf8_lossy(&run_command("/usr/sbin/sysctl", &["-n", "kern.boottime"])?)
+            .trim()
+            .to_owned(),
+    )
+}
+
+fn lookup_route(
+    destination: &str,
+    ipv6: bool,
+) -> std::io::Result<Option<crate::macos_lease::Route>> {
+    let family = if ipv6 { "-inet6" } else { "-inet" };
+    let output = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", family, "-net", destination])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not in table") {
+        return Ok(None);
     }
-    if let Err(_err) = run_command(
-        "route",
-        &["delete", "default", "-ifscope", &original_gw_scope],
-    ) {
-        log::debug!("command \"route delete default -ifscope {original_gw_scope}\" error: {_err}");
+    if !output.status.success() || !stderr.trim().is_empty() {
+        return Err(std::io::Error::other(format!(
+            "route lookup failed: {stderr}"
+        )));
     }
-    if let Err(_err) = run_command("route", &["add", "default", &original_gateway]) {
-        log::debug!("command \"route add default {original_gateway}\" error: {_err}");
+    crate::macos_lease::parse_route(&String::from_utf8_lossy(&output.stdout), ipv6)
+}
+
+fn default_gateway(ipv6: bool) -> std::io::Result<Option<(String, String)>> {
+    let store = SCDynamicStoreBuilder::new("Helios uplink")
+        .build()
+        .ok_or_else(|| std::io::Error::other("cannot open network settings"))?;
+    let key = if ipv6 {
+        "State:/Network/Global/IPv6"
+    } else {
+        "State:/Network/Global/IPv4"
+    };
+    let Some(dict) = store
+        .get(key)
+        .and_then(|value| value.downcast::<CFDictionary>())
+    else {
+        return Ok(None);
+    };
+    let Some(gateway) = get_cf_dict_entry::<CFString>(&dict, "Router".into()) else {
+        return Ok(None);
+    };
+    let Some(interface) = get_cf_dict_entry::<CFString>(&dict, "PrimaryInterface".into()) else {
+        return Ok(None);
+    };
+    let mut gateway = gateway.to_string();
+    let interface = interface.to_string();
+    if ipv6 && gateway.starts_with("fe80:") && !gateway.contains('%') {
+        gateway = format!("{gateway}%{interface}");
     }
+    Ok(Some((gateway, interface)))
+}
 
-    if let Some(data) = &state.restore_resolvconf_content {
-        std::fs::write(ETC_RESOLV_CONF_FILE, data)?;
+/// Capture real uplink addresses and resolver IPs before installing TUN routes or DNS.
+pub fn uplink_snapshot(ipv6: bool) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
+    snapshot(ipv6, None)
+}
+
+fn snapshot(ipv6: bool, own: Option<&str>) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
+    for family in ["inet", "inet6"] {
+        let table = run_command("/usr/sbin/netstat", &["-rn", "-f", family])?;
+        if let Some(route) =
+            crate::macos_lease::foreign_tunnel_route(&String::from_utf8_lossy(&table), own)
+        {
+            return Err(std::io::Error::other(format!(
+                "another VPN owns route {route}; disable it before enabling Helios TUN"
+            )));
+        }
     }
+    let (_, interface, service, _) = get_default_iface_params()?;
+    let store = SCDynamicStoreBuilder::new("Helios uplink snapshot")
+        .build()
+        .ok_or_else(|| std::io::Error::other("cannot open network settings"))?;
+    let mut sources = Vec::new();
+    for family in [false, true] {
+        if family && !ipv6 {
+            continue;
+        }
+        let Some((_, iface)) = default_gateway(family)? else {
+            continue;
+        };
+        if iface.starts_with("utun") || iface == "lo0" {
+            return Err(std::io::Error::other(
+                "another VPN owns the uplink; disable it before enabling Helios TUN",
+            ));
+        }
+        if lookup_route("default", family)?.is_none() {
+            return Err(std::io::Error::other(
+                "physical default route is missing; restore system networking before enabling TUN",
+            ));
+        }
+        let key = format!(
+            "State:/Network/Interface/{iface}/{}",
+            if family { "IPv6" } else { "IPv4" }
+        );
+        let addresses = read_addresses(&store, &key, "Addresses")?;
+        if let Some(ip) = addresses.into_iter().find(|ip| {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local())
+        }) {
+            sources.push(ip);
+        }
+    }
+    if sources.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "no physical uplink address on {interface}"
+        )));
+    }
+    let mut dns = read_addresses(
+        &store,
+        &format!("State:/Network/Service/{service}/DNS"),
+        "ServerAddresses",
+    )?;
+    dns.retain(|ip| {
+        !ip.is_loopback()
+            && !ip.is_unspecified()
+            && sources
+                .iter()
+                .any(|source| source.is_ipv4() == ip.is_ipv4())
+    });
+    dns.dedup();
+    dns.truncate(4);
+    if dns.is_empty() {
+        return Err(std::io::Error::other(
+            "no real upstream DNS servers on physical uplink",
+        ));
+    }
+    Ok((sources, dns))
+}
 
-    // remove the record file anyway
-    #[cfg(all(
-        feature = "unsafe-state-file",
-        any(target_os = "macos", target_os = "windows")
-    ))]
-    let _ = std::fs::remove_file(crate::get_state_file_path());
-    #[cfg(feature = "secure-state-file")]
-    crate::remove_secure_state();
+fn read_addresses(
+    store: &system_configuration::dynamic_store::SCDynamicStore,
+    key: &str,
+    field: &str,
+) -> std::io::Result<Vec<IpAddr>> {
+    let Some(dict) = store
+        .get(key)
+        .and_then(|value| value.downcast::<CFDictionary>())
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(array) = get_cf_dict_entry::<CFArray>(&dict, field.into()) else {
+        return Ok(Vec::new());
+    };
+    let mut addresses = Vec::new();
+    for item in array.iter() {
+        if item.is_null() {
+            continue;
+        }
+        let value = unsafe { CFPropertyList::wrap_under_get_rule(*item) };
+        if let Some(value) = value.downcast::<CFString>() {
+            addresses.push(value.to_string().parse().map_err(std::io::Error::other)?);
+        }
+    }
+    Ok(addresses)
+}
 
-    flush_dns_cache()?;
-
-    Ok(())
+// Old releases replaced the default route. Restore only their recognizable changes.
+fn recover_legacy(state: &mut TproxyStateInner) -> std::io::Result<()> {
+    let args = state
+        .tproxy_args
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing legacy TUN arguments"))?;
+    let gateway = state
+        .gateway
+        .ok_or_else(|| std::io::Error::other("missing original gateway"))?
+        .to_string();
+    let interface = state
+        .gw_scope
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing original interface"))?;
+    let mut errors = Vec::new();
+    let restore = || -> std::io::Result<()> {
+        match lookup_route("default", false)? {
+            Some(route)
+                if route.gateway.as_ref() == Some(&gateway) && &route.interface == interface =>
+            {
+                Ok(())
+            }
+            None => {
+                run_command("/sbin/route", &["-n", "add", "-inet", "default", &gateway]).map(|_| ())
+            }
+            Some(route)
+                if route.interface == args.tun_name
+                    && route.gateway.as_ref() == Some(&args.tun_gateway.to_string()) =>
+            {
+                run_command(
+                    "/sbin/route",
+                    &["-n", "change", "-inet", "default", &gateway],
+                )
+                .map(|_| ())
+            }
+            _ => Err(std::io::Error::other(
+                "default route changed externally; legacy recovery refused",
+            )),
+        }
+    };
+    if let Err(error) = restore() {
+        errors.push(error.to_string());
+    }
+    match lookup_route("default", false) {
+        Ok(Some(route))
+            if route.gateway.as_ref() == Some(&gateway) && &route.interface == interface => {}
+        _ => errors.push("original unscoped default route was not restored".into()),
+    }
+    if let Some(service) = &state.default_service_id {
+        let name = state.orig_iface_name.as_deref().unwrap_or("");
+        let current = get_dns_servers(service);
+        let applied = Some(vec![args.tun_gateway]);
+        let result = match current {
+            Ok(current) if current == state.default_service_dns => Ok(()),
+            Ok(current) if current == applied => match &state.default_service_dns {
+                Some(servers) => configure_dns_servers(name, service, servers),
+                None => remove_dns_servers(service, name),
+            },
+            Ok(_) => Err(std::io::Error::other(
+                "DNS changed externally; legacy recovery refused",
+            )),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+        match get_dns_servers(service) {
+            Ok(current) if current == state.default_service_dns => {}
+            Ok(_) => errors.push("original DNS was not restored".into()),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    let mut bypass = args.bypass_ips.clone();
+    bypass.sort_by_key(ToString::to_string);
+    bypass.dedup();
+    for cidr in bypass {
+        if cidr.first_address().is_ipv6() {
+            continue;
+        }
+        let expected = crate::macos_lease::Route {
+            cidr,
+            gateway: Some(gateway.clone()),
+            interface: interface.clone(),
+            tagged: false,
+        };
+        let result = (|| {
+            let current =
+                lookup_route(&cidr.to_string(), false)?.filter(|route| route.cidr == cidr);
+            match current {
+                None => Ok(()),
+                Some(route) if expected.matches(&route) => Native {
+                    state: &mut TproxyStateInner::default(),
+                }
+                .delete(&expected),
+                _ => Err(std::io::Error::other(
+                    "legacy bypass route changed externally",
+                )),
+            }
+        })();
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+    if !errors.is_empty() {
+        return Err(std::io::Error::other(errors.join("; ")));
+    }
+    Native { state }.clear()?;
+    flush_dns_cache()
 }
 
 fn get_cf_dict_entry<T>(dict: &CFDictionary, key: CFString) -> Option<T>
@@ -250,26 +565,12 @@ pub(crate) fn get_default_iface_params() -> std::io::Result<(IpAddr, String, Str
     let gateway_ip = IpAddr::from_str(gateway.to_string().as_str())
         .map_err(|err| Error::new(InvalidData, err))?;
 
-    let mut iface_name = None;
-    let svc_path: CFString = format!("Setup:/Network/Service/{service_id}")
-        .as_str()
-        .into();
-    if let Some(service_dict) = unsafe {
-        SCDynamicStoreCopyValue(store.as_concrete_TypeRef(), svc_path.as_concrete_TypeRef())
-            .as_ref()
-    }
-    .and_then(|plist| {
-        unsafe { CFPropertyList::wrap_under_create_rule(plist) }.downcast::<CFDictionary>()
-    }) {
-        let key: CFString = "UserDefinedName".into();
-        if let Some(name) = unsafe {
-            CFDictionaryGetValue(service_dict.as_concrete_TypeRef(), key.as_CFTypeRef()).as_ref()
-        }
-        .map(|cfstr| unsafe { CFString::wrap_under_get_rule(cfstr as *const _ as _) })
-        {
-            iface_name = Some(name.to_string());
-        }
-    }
+    let svc_path = format!("Setup:/Network/Service/{service_id}");
+    let iface_name = store
+        .get(svc_path.as_str())
+        .and_then(|value| value.downcast::<CFDictionary>())
+        .and_then(|dict| get_cf_dict_entry::<CFString>(&dict, "UserDefinedName".into()))
+        .map(|name| name.to_string());
 
     Ok((
         gateway_ip,
@@ -281,53 +582,32 @@ pub(crate) fn get_default_iface_params() -> std::io::Result<(IpAddr, String, Str
 
 fn configure_dns_servers(
     iface_friendly_name: &str,
-    service_id: &str,
+    _service_id: &str,
     dns_servers: &[IpAddr],
 ) -> std::io::Result<()> {
-    if dns_servers.is_empty() {
-        return Ok(());
+    if iface_friendly_name.is_empty() || dns_servers.is_empty() {
+        return Err(std::io::Error::other(
+            "missing DNS service name or addresses",
+        ));
     }
-    let store = SCDynamicStoreBuilder::new("tproxy-config configure dns")
-        .build()
-        .ok_or(std::io::Error::other("Create SC DynamicStore failed"))?;
-    let mut dns_server_vec = Vec::<CFString>::new();
-    dns_servers
+    let addrs = dns_servers
         .iter()
-        .for_each(|x| dns_server_vec.push(x.to_string().as_str().into()));
-    let dns_server_array = CFArray::from_CFTypes(dns_server_vec.as_slice());
-    let dns_dict =
-        CFDictionary::from_CFType_pairs(&[(CFString::from("ServerAddresses"), dns_server_array)]);
-    let key = format!("State:/Network/Service/{service_id}/DNS")
-        .as_str()
-        .into();
-    if !store.set::<CFString, CFDictionary>(key, dns_dict.to_untyped()) {
-        log::error!("Failed to set DNS servers");
-    }
-
-    // The above statements actually changes the DNS settings, but the network preferences dialog still
-    // shows the old settings. Therefore, we execute the following command additionally.
-    // Maybe one day the above settings will fully take effect, and this command can be removed.
-    if !iface_friendly_name.is_empty() {
-        // networksetup -setdnsservers "$iface_name" dns1 dns2 ...
-        let addrs = dns_servers
-            .iter()
-            .map(|x| x.to_string())
-            .collect::<Vec<String>>();
-        let mut args = vec!["-setdnsservers", iface_friendly_name];
-        args.extend(addrs.iter().map(|s| s.as_str()));
-        run_command("networksetup", &args)?;
-    }
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut args = vec!["-setdnsservers", iface_friendly_name];
+    args.extend(addrs.iter().map(String::as_str));
+    run_command("/usr/sbin/networksetup", &args)?;
     Ok(())
 }
 
 /// Get the DNS servers from the specified service.
 /// If the DNS servers are obtained through DHCP, this function will return None.
 /// Overridden DNS servers are returned as a vector.
-fn get_dns_servers(service_id: &String) -> std::io::Result<Option<Vec<IpAddr>>> {
+fn get_dns_servers(service_id: &str) -> std::io::Result<Option<Vec<IpAddr>>> {
     let store = SCDynamicStoreBuilder::new("tproxy-config get dns")
         .build()
         .ok_or(std::io::Error::other("Create SC DynamicStore failed"))?;
-    let key: CFString = format!("State:/Network/Service/{service_id}/DNS")
+    let key: CFString = format!("Setup:/Network/Service/{service_id}/DNS")
         .as_str()
         .into();
 
@@ -374,35 +654,37 @@ fn get_dns_servers(service_id: &String) -> std::io::Result<Option<Vec<IpAddr>>> 
     Ok(Some(vec))
 }
 
-fn remove_dns_servers(_service_id: &str, _friendly_name: &str) -> std::io::Result<()> {
-    /*
-    let store = SCDynamicStoreBuilder::new("tproxy-config remove dns").build();
-    let key: CFString = format!("State:/Network/Service/{}/DNS", _service_id).as_str().into();
-    if !store.remove(key) {
-        return Err(std::io::Error::other("Failed to remove DNS servers"));
+fn remove_dns_servers(_service_id: &str, friendly_name: &str) -> std::io::Result<()> {
+    if friendly_name.is_empty() {
+        return Err(std::io::Error::other("missing DNS service name"));
     }
-    // */
-    if !_friendly_name.is_empty() {
-        // command: `networksetup -setdnsservers Wi-Fi Empty`
-        run_command("networksetup", &["-setdnsservers", _friendly_name, "Empty"])?;
-    }
+    run_command(
+        "/usr/sbin/networksetup",
+        &["-setdnsservers", friendly_name, "Empty"],
+    )?;
     Ok(())
 }
 
 pub(crate) fn flush_dns_cache() -> std::io::Result<()> {
-    // retrieve current macos version `sw_vers -productVersion`
-    let ver = run_command("sw_vers", &["-productVersion"])?;
-    let ver = String::from_utf8_lossy(&ver).into_owned();
-
-    if crate::compare_version(&ver, "10.12") >= 0 {
-        // MacOS version 10.12 and later
-        // Command: `sudo killall -HUP mDNSResponder`
-        if let Err(e) = run_command("killall", &["-HUP", "mDNSResponder"]) {
-            log::debug!("Failed to flush DNS cache: {e}");
-        }
-    } else {
-        // to make the code simpler, we do nothing for MacOS version 10.11 and earlier
-    }
-
+    run_command("/usr/bin/dscacheutil", &["-flushcache"])?;
+    run_command("/usr/bin/killall", &["-HUP", "mDNSResponder"])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_native_route_and_dns_queries_are_read_only() {
+        for (host, ipv6) in [("127.0.0.1/32", false), ("::1/128", true)] {
+            let route = lookup_route(host, ipv6).unwrap().unwrap();
+            assert_eq!(route.interface, "lo0");
+            assert_eq!(route.cidr, host.parse().unwrap());
+        }
+        let (_, _, service, name) = get_default_iface_params().unwrap();
+        assert!(name.is_some());
+        get_dns_servers(&service).unwrap();
+        assert!(!boot_identity().unwrap().is_empty());
+    }
 }

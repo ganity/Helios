@@ -25,6 +25,15 @@ pub fn client_quic_endpoint_bound(
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     });
+    #[cfg(target_os = "macos")]
+    if source.is_some() {
+        return Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            crate::udp_socket_bound(bind_ip)?,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        );
+    }
     Endpoint::client(SocketAddr::new(bind_ip, 0))
 }
 
@@ -145,7 +154,8 @@ mod tests {
         });
 
         let mut client_endpoint =
-            Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+            client_quic_endpoint_bound(server_address, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+                .unwrap();
         client_endpoint.set_default_client_config(client_config);
         let connection = client_endpoint
             .connect(server_address, "localhost")

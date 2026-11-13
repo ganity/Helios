@@ -10,7 +10,7 @@ mod tls;
 
 pub use control::{ControlError, ping, serve_control};
 pub use crypto::{ClientCrypto, CryptoConfigError, ServerCrypto};
-pub use dial::{connect_tcp_ips, tcp_socket};
+pub use dial::{connect_tcp_ips, tcp_socket, udp_socket_bound};
 pub use framed::{FrameIo, FrameIoError};
 pub use handshake::{
     AuthenticatedSession, HandshakeError, authenticate_client, authenticate_client_with_connect,

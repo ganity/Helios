@@ -253,9 +253,9 @@ pub struct TunDaemonInfo {
 
 impl OutboundConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(ConfigError::Invalid(
-                "outbound binding currently requires Linux".into(),
+                "outbound binding requires Linux or macOS".into(),
             ));
         }
         if self.source_bypass.is_empty()
@@ -888,7 +888,10 @@ preferred_transport = "quic"
             source_bypass: vec!["192.0.2.1".parse().unwrap()],
             dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
         };
-        assert_eq!(config.validate().is_ok(), cfg!(target_os = "linux"));
+        assert_eq!(
+            config.validate().is_ok(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
         let encoded = toml::to_string(&config).unwrap();
         assert_eq!(toml::from_str::<OutboundConfig>(&encoded).unwrap(), config);
         assert!(toml::from_str::<OutboundConfig>(&(encoded + "unknown = 1\n")).is_err());

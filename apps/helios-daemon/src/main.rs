@@ -565,7 +565,7 @@ async fn run_daemon() -> Result<(), AnyError> {
     };
     // Only the desktop-managed process owns the desktop proxy lease.
     let desktop_managed = proxy_lease.is_some();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let bound_desktop = desktop_managed && config.outbound.is_some();
     if let Some(path) = proxy_lease {
         let settings = helios_system_proxy::ProxySettings {
@@ -658,7 +658,7 @@ async fn run_daemon() -> Result<(), AnyError> {
             monitor_proxy_status(metrics.clone(), shutdown.subscribe()),
         )
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let desktop_lifetime = async {
         if bound_desktop {
             use std::os::fd::AsFd;
@@ -671,7 +671,7 @@ async fn run_daemon() -> Result<(), AnyError> {
             std::future::pending().await
         }
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let desktop_lifetime = std::future::pending::<std::io::Result<()>>();
     let result = tokio::select! {
         result = listeners => {

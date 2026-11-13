@@ -1,46 +1,18 @@
 //! Linux TUN uses the installed root helper, never a user-selected executable or root path.
 use super::*;
-use helios_config::{DesktopTunRequest, OutboundConfig, TunDaemonInfo};
+use helios_config::{DesktopTunRequest, OutboundConfig};
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
     os::fd::AsFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    process::ChildStdin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncBufReadExt;
 
 const HELPER: &str = "/usr/libexec/helios-helper";
-
-pub(super) struct Session {
-    pub id: u64,
-    pub input: Option<ChildStdin>,
-    pub stopping: bool,
-    pub cancel: Arc<AtomicBool>,
-}
-impl Session {
-    pub fn new(id: u64) -> Self {
-        Self {
-            id,
-            input: None,
-            stopping: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-        }
-    }
-    pub fn stop(&mut self) {
-        self.stopping = true;
-        self.cancel.store(true, Ordering::Relaxed);
-        self.input.take(); // EOF is the authenticated session's stop request.
-    }
-}
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
 
 fn trusted_helper(path: &Path) -> Result<(), AnyError> {
     let path = std::fs::canonicalize(path)
@@ -105,39 +77,8 @@ pub(super) fn prepare(id: u64, ipv6: bool, events: Sender<Event>) {
             })
         })()
         .map_err(|error: AnyError| error.to_string());
-        let _ = events.send(Event::LinuxTunPrepared(id, result));
+        let _ = events.send(Event::TunPrepared(id, result));
     });
-}
-
-async fn daemon_info(address: SocketAddr) -> Result<TunDaemonInfo, AnyError> {
-    let mut stream = tokio::net::TcpStream::connect(address).await?;
-    stream.write_all(&[5, 1, 0]).await?;
-    let mut greeting = [0; 2];
-    stream.read_exact(&mut greeting).await?;
-    if greeting != [5, 0] {
-        return Err("TUN daemon negotiation failed".into());
-    }
-    stream
-        .write_all(&[5, 1, 0, 1, 198, 18, 0, 0, 0, 54])
-        .await?;
-    let mut reply = [0; 4];
-    stream.read_exact(&mut reply).await?;
-    if reply[..3] != [5, 0, 0] {
-        return Err("daemon is not ready for Linux TUN".into());
-    }
-    let size = match reply[3] {
-        1 => 4,
-        4 => 16,
-        _ => return Err("invalid TUN daemon reply".into()),
-    };
-    stream.read_exact(&mut vec![0; size + 2]).await?;
-    let size = stream.read_u32().await? as usize;
-    if size > 4096 {
-        return Err("oversized TUN daemon handshake".into());
-    }
-    let mut bytes = vec![0; size];
-    stream.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub(super) fn launch(
@@ -148,7 +89,7 @@ pub(super) fn launch(
 ) {
     thread::spawn(move || {
         let result = launch_inner(id, profile, cancel, &events).map_err(|error| error.to_string());
-        let _ = events.send(Event::LinuxTunEnded(id, result));
+        let _ = events.send(Event::TunEnded(id, result));
     });
 }
 
@@ -216,7 +157,7 @@ fn launch_inner(
         let _ = child.wait();
         return Err(error.into());
     }
-    let _ = events.send(Event::LinuxTunPipe(id, input));
+    let _ = events.send(Event::TunPipe(id, input));
     let stdout = child.stdout.take().ok_or("missing helper output")?;
     let ready = run_async(async {
         let pipe =
@@ -230,7 +171,7 @@ fn launch_inner(
                     if length? == 0 { break; }
                     if line.trim() == "ready" {
                         ready = true;
-                        let _ = events.send(Event::LinuxTunReady(id));
+                        let _ = events.send(Event::TunReady(id));
                     }
                     line.clear();
                 }
@@ -257,7 +198,7 @@ fn launch_inner(
     Ok(())
 }
 
-pub(super) fn recover(events: Sender<Event>) {
+pub(super) fn recover(_profile: &DesktopProfile, events: Sender<Event>) {
     thread::spawn(move || {
         let result = (|| {
             trusted_helper(Path::new(HELPER))?;
@@ -270,6 +211,6 @@ pub(super) fn recover(events: Sender<Event>) {
             Ok(())
         })()
         .map_err(|error: AnyError| error.to_string());
-        let _ = events.send(Event::LinuxTunRecovered(result));
+        let _ = events.send(Event::TunRecovered(result));
     });
 }

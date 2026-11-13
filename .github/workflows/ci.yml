@@ -129,6 +129,12 @@ jobs:
       - name: Reject missing and corrupt TUN recovery records
         run: cargo test -p tproxy-config --features secure-state-file recovery_rejects_missing_or_corrupt_secure_record
       - run: cargo test -p helios-helper
+      - name: Test macOS TUN rollback, retry and route ownership
+        run: cargo test -p tproxy-config --features secure-state-file macos_
+      - name: Test native bound TCP, QUIC and UDP sockets
+        run: cargo test -p helios-transport
+      - run: cargo test -p helios-client
+      - run: cargo test -p helios-config
       - run: cargo test -p tproxy-config --features secure-state-file recovery_record_
       - run: cargo clippy -p helios-daemon -p helios-client -p helios-helper -p heliosctl --all-targets -- -D warnings
       - name: Build workspace release binaries

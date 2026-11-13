@@ -190,13 +190,111 @@ pub fn tcp_socket(
     };
     if let Some(source) = source {
         socket.bind((source, 0).into())?;
+        #[cfg(target_os = "macos")]
+        bind_interface(&socket2::SockRef::from(&socket), source)?;
     }
     Ok(socket)
+}
+
+/// UDP sockets share the TCP uplink policy, including macOS interface-scoped routing.
+pub fn udp_socket_bound(source: IpAddr) -> io::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind((source, 0))?;
+    #[cfg(target_os = "macos")]
+    if !source.is_unspecified() {
+        bind_interface(&socket2::SockRef::from(&socket), source)?;
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "macos")]
+fn bind_interface(socket: &socket2::SockRef<'_>, source: IpAddr) -> io::Result<()> {
+    let mut interfaces = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut current = interfaces;
+    let mut index = None;
+    while !current.is_null() {
+        let entry = unsafe { &*current };
+        if !entry.ifa_addr.is_null() {
+            let address = unsafe { &*entry.ifa_addr };
+            let ip = match address.sa_family as i32 {
+                libc::AF_INET => Some(IpAddr::V4(std::net::Ipv4Addr::from(
+                    unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in>() }
+                        .sin_addr
+                        .s_addr
+                        .to_ne_bytes(),
+                ))),
+                libc::AF_INET6 => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                    unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in6>() }
+                        .sin6_addr
+                        .s6_addr,
+                ))),
+                _ => None,
+            };
+            if ip == Some(source) {
+                index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(entry.ifa_name) });
+                break;
+            }
+        }
+        current = entry.ifa_next;
+    }
+    unsafe {
+        libc::freeifaddrs(interfaces);
+    }
+    let index = index.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "TUN uplink address no longer exists",
+        )
+    })?;
+    if source.is_ipv4() {
+        socket.bind_device_by_index_v4(Some(index))
+    } else {
+        socket.bind_device_by_index_v6(Some(index))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn bound_tcp_and_udp_reach_the_requested_interface_for_both_families() {
+        for source in ["127.0.0.1", "::1"].map(|ip| ip.parse::<IpAddr>().unwrap()) {
+            let tcp = tokio::net::TcpListener::bind((source, 0)).await.unwrap();
+            let stream = tcp_socket(tcp.local_addr().unwrap(), Some(source))
+                .unwrap()
+                .connect(tcp.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(stream.local_addr().unwrap().ip(), source);
+            let udp = tokio::net::UdpSocket::bind((source, 0)).await.unwrap();
+            let sender =
+                tokio::net::UdpSocket::from_std(udp_socket_bound(source).unwrap()).unwrap();
+            sender
+                .send_to(b"bound", udp.local_addr().unwrap())
+                .await
+                .unwrap();
+            let mut bytes = [0; 8];
+            let (length, peer) =
+                tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(peer.ip(), source);
+            assert_eq!(&bytes[..length], b"bound");
+        }
+        assert!(
+            tcp_socket(
+                "[::1]:443".parse().unwrap(),
+                Some("127.0.0.1".parse().unwrap())
+            )
+            .is_err()
+        );
+        assert!(udp_socket_bound("192.0.2.99".parse().unwrap()).is_err());
+    }
+
     #[tokio::test]
     async fn lookup_failure_is_shared_only_for_one_second() {
         let resolver = Resolver::default();

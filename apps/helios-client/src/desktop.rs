@@ -32,11 +32,14 @@ use tray_icon::{
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(target_os = "linux")]
+#[path = "linux_tun.rs"]
+mod desktop_tun;
+#[cfg(target_os = "macos")]
+#[path = "macos_tun.rs"]
+mod desktop_tun;
+#[cfg(target_os = "linux")]
 #[path = "linux_tray.rs"]
 mod linux_tray;
-#[cfg(target_os = "linux")]
-#[path = "linux_tun.rs"]
-mod linux_tun;
 #[cfg(any(test, target_os = "macos"))]
 #[path = "tray_display.rs"]
 mod tray_display;
@@ -144,18 +147,92 @@ struct LogEntry {
     event: String,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use helios_config::TunDaemonInfo;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{
+    net::SocketAddr,
+    process::ChildStdin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct TunSession {
+    pub id: u64,
+    pub input: Option<ChildStdin>,
+    pub stopping: bool,
+    pub cancel: Arc<AtomicBool>,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl TunSession {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            input: None,
+            stopping: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub fn stop(&mut self) {
+        self.stopping = true;
+        self.cancel.store(true, Ordering::Relaxed);
+        self.input.take(); // EOF is the authenticated session's stop request.
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for TunSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn daemon_info(address: SocketAddr) -> Result<TunDaemonInfo, AnyError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting != [5, 0] {
+        return Err("TUN daemon negotiation failed".into());
+    }
+    stream
+        .write_all(&[5, 1, 0, 1, 198, 18, 0, 0, 0, 54])
+        .await?;
+    let mut reply = [0; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[..3] != [5, 0, 0] {
+        return Err("daemon is not ready for TUN".into());
+    }
+    let size = match reply[3] {
+        1 => 4,
+        4 => 16,
+        _ => return Err("invalid TUN daemon reply".into()),
+    };
+    stream.read_exact(&mut vec![0; size + 2]).await?;
+    let size = stream.read_u32().await? as usize;
+    if size > 4096 {
+        return Err("oversized TUN daemon handshake".into());
+    }
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 enum Event {
     RouteTest(u64, Result<helios_control::RouteTestReport, String>),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    TunPrepared(u64, Result<helios_config::OutboundConfig, String>),
     #[cfg(target_os = "linux")]
-    LinuxTunPrepared(u64, Result<helios_config::OutboundConfig, String>),
-    #[cfg(target_os = "linux")]
-    LinuxTunPipe(u64, std::process::ChildStdin),
-    #[cfg(target_os = "linux")]
-    LinuxTunReady(u64),
-    #[cfg(target_os = "linux")]
-    LinuxTunEnded(u64, Result<(), String>),
-    #[cfg(target_os = "linux")]
-    LinuxTunRecovered(Result<(), String>),
+    TunPipe(u64, std::process::ChildStdin),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    TunReady(u64),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    TunEnded(u64, Result<(), String>),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    TunRecovered(Result<(), String>),
     ConfigApplied(u64, DesktopProfile, Result<u64, String>),
     Status(u64, Result<StatusSnapshot, String>),
     DaemonOffline(u64),
@@ -228,12 +305,12 @@ struct HeliosApp {
     system_proxy_enabled: bool,
     system_proxy_verified: bool,
     tun_enabled: bool,
-    #[cfg(target_os = "linux")]
-    linux_tun: Option<linux_tun::Session>,
-    #[cfg(target_os = "linux")]
-    linux_tun_serial: u64,
-    #[cfg(target_os = "linux")]
-    linux_exit_after_tun: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    desktop_tun: Option<TunSession>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tun_serial: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    exit_after_tun: bool,
     notice: Option<(String, bool)>,
     child: Option<Child>,
     daemon_starting: Option<(Instant, String)>,
@@ -327,12 +404,12 @@ impl HeliosApp {
             system_proxy_enabled: false,
             system_proxy_verified: false,
             tun_enabled: false,
-            #[cfg(target_os = "linux")]
-            linux_tun: None,
-            #[cfg(target_os = "linux")]
-            linux_tun_serial: 0,
-            #[cfg(target_os = "linux")]
-            linux_exit_after_tun: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            desktop_tun: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            tun_serial: 0,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            exit_after_tun: false,
             notice: None,
             child: None,
             daemon_starting: None,
@@ -358,7 +435,7 @@ impl HeliosApp {
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             self.tun_enabled = tun_is_running();
         }
@@ -375,44 +452,44 @@ impl HeliosApp {
                         self.rule_test_result = Some(result);
                     }
                 }
-                #[cfg(target_os = "linux")]
-                Event::LinuxTunPrepared(id, result) => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Event::TunPrepared(id, result) => {
                     if self
-                        .linux_tun
+                        .desktop_tun
                         .as_ref()
                         .is_none_or(|session| session.id != id)
                     {
                         continue;
                     }
                     if self
-                        .linux_tun
+                        .desktop_tun
                         .as_ref()
                         .is_some_and(|session| session.stopping)
                     {
-                        self.linux_tun = None;
+                        self.desktop_tun = None;
                         continue;
                     }
                     match result {
-                        Ok(outbound) => self.start_linux_tun_daemon(id, outbound),
+                        Ok(outbound) => self.start_tun_daemon(id, outbound),
                         Err(error) => {
-                            self.linux_tun = None;
+                            self.desktop_tun = None;
                             self.notice = Some((error, false));
                         }
                     }
                 }
                 #[cfg(target_os = "linux")]
-                Event::LinuxTunPipe(id, input) => {
-                    if let Some(session) = &mut self.linux_tun
+                Event::TunPipe(id, input) => {
+                    if let Some(session) = &mut self.desktop_tun
                         && session.id == id
                         && !session.stopping
                     {
                         session.input = Some(input);
                     }
                 }
-                #[cfg(target_os = "linux")]
-                Event::LinuxTunReady(id) => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Event::TunReady(id) => {
                     if self
-                        .linux_tun
+                        .desktop_tun
                         .as_ref()
                         .is_some_and(|session| session.id == id && !session.stopping)
                     {
@@ -420,29 +497,33 @@ impl HeliosApp {
                         self.notice = Some((t("虚拟网卡已开启").into(), true));
                     }
                 }
-                #[cfg(target_os = "linux")]
-                Event::LinuxTunEnded(id, result) => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Event::TunEnded(id, result) => {
                     if self
-                        .linux_tun
+                        .desktop_tun
                         .as_ref()
                         .is_none_or(|session| session.id != id)
                     {
                         continue;
                     }
-                    self.linux_tun = None;
+                    self.desktop_tun = None;
                     self.tun_enabled = false;
                     self.profile.tun_outbound = None;
                     // Rebuild the normal daemon config after the helper has finished recovery.
                     self.stop_daemon();
                     let saved = save_profile(&self.profile_path, &self.profile);
+                    #[cfg(target_os = "macos")]
+                    if result.is_ok() && saved.is_ok() && !self.exit_after_tun {
+                        self.spawn_daemon("虚拟网卡已关闭，后台已恢复普通出口");
+                    }
                     self.notice =
                         Some(match result.and(saved.map_err(|error| error.to_string())) {
                             Ok(()) => ("虚拟网卡已关闭，网络设置已恢复".into(), true),
                             Err(error) => (error, false),
                         });
                 }
-                #[cfg(target_os = "linux")]
-                Event::LinuxTunRecovered(result) => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Event::TunRecovered(result) => {
                     self.notice = Some(match result {
                         Ok(()) => ("虚拟网卡路由与 DNS 已恢复，可重新开启".into(), true),
                         Err(error) => (error, false),
@@ -863,8 +944,8 @@ impl HeliosApp {
             return;
         }
         let was_system_proxy_enabled = self.system_proxy_enabled || self.recovering_connection;
-        #[cfg(target_os = "linux")]
-        if self.linux_tun.is_some() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.desktop_tun.is_some() {
             self.stop_tun();
         }
         let reconnect = (was_system_proxy_enabled || self.tun_enabled)
@@ -1007,13 +1088,13 @@ impl HeliosApp {
                 return;
             }
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let stdin = if self.profile.tun_outbound.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let stdin = Stdio::null();
         match Command::new(&self.profile.daemon_binary)
             .args(["desktop-managed", "--config"])
@@ -1156,13 +1237,21 @@ impl HeliosApp {
             self.notice = Some((t("正在关闭虚拟网卡，关闭后可启用系统代理").into(), true));
             return;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "macos")]
+        if enabled && status_is_fresh(&tun_status_file()) {
+            self.notice = Some(match write_atomic(&tun_stop_file(), b"stop") {
+                Ok(()) => ("正在关闭上次的虚拟网卡，完成后可开启系统代理".into(), true),
+                Err(error) => (error.to_string(), false),
+            });
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if enabled && tun_needs_recovery() {
-            linux_tun::recover(self.event_tx.clone());
+            desktop_tun::recover(&self.profile, self.event_tx.clone());
             self.notice = Some(("正在恢复上次的虚拟网卡网络设置".into(), true));
             return;
         }
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(windows)]
         if enabled && tun_needs_recovery() {
             if let Err(error) = self.write_helper_config() {
                 self.notice = Some((format!("虚拟网卡配置无效：{error}"), false));
@@ -1214,24 +1303,32 @@ impl HeliosApp {
     }
 
     fn tun_transition_pending(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.linux_tun.is_some()
+            self.desktop_tun.is_some()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             false
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn start_tun(&mut self) {
-        if self.linux_tun.is_some() || !self.startup_checked {
+        if self.desktop_tun.is_some() || !self.startup_checked {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if status_is_fresh(&tun_status_file()) {
+            self.notice = Some(match write_atomic(&tun_stop_file(), b"stop") {
+                Ok(()) => ("正在关闭上次的虚拟网卡，完成后可重新开启".into(), true),
+                Err(error) => (error.to_string(), false),
+            });
             return;
         }
         if tun_needs_recovery() {
             self.notice = Some(("正在请求授权并恢复上次的网络设置".into(), true));
-            linux_tun::recover(self.event_tx.clone());
+            desktop_tun::recover(&self.profile, self.event_tx.clone());
             return;
         }
         if self.system_proxy_enabled {
@@ -1245,24 +1342,24 @@ impl HeliosApp {
             return;
         }
         self.connecting_since = None;
-        self.linux_tun_serial = self.linux_tun_serial.wrapping_add(1);
-        let id = self.linux_tun_serial;
-        self.linux_tun = Some(linux_tun::Session::new(id));
-        self.notice = Some(("正在检查 Linux TUN 出口和 DNS".into(), true));
-        linux_tun::prepare(id, self.profile.tun_ipv6_enabled, self.event_tx.clone());
+        self.tun_serial = self.tun_serial.wrapping_add(1);
+        let id = self.tun_serial;
+        self.desktop_tun = Some(TunSession::new(id));
+        self.notice = Some(("正在检查虚拟网卡出口和 DNS".into(), true));
+        desktop_tun::prepare(id, self.profile.tun_ipv6_enabled, self.event_tx.clone());
     }
 
-    #[cfg(target_os = "linux")]
-    fn start_linux_tun_daemon(&mut self, id: u64, outbound: helios_config::OutboundConfig) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn start_tun_daemon(&mut self, id: u64, outbound: helios_config::OutboundConfig) {
         let mut profile = self.profile.clone();
         profile.tun_outbound = Some(outbound);
         if let Err(error) = profile.daemon_config() {
-            self.linux_tun = None;
+            self.desktop_tun = None;
             self.notice = Some((error.to_string(), false));
             return;
         }
         // Temporarily take the session so stop_daemon can stop the old, unbound daemon.
-        let session = self.linux_tun.take();
+        let session = self.desktop_tun.take();
         self.stop_daemon();
         if self.child.is_some() || self.daemon_profile.is_some() {
             self.notice = Some(("无法停止旧后台，虚拟网卡尚未启动".into(), false));
@@ -1281,20 +1378,20 @@ impl HeliosApp {
         }
         let session = session.expect("TUN preparation has a live session");
         let cancel = session.cancel.clone();
-        self.linux_tun = Some(session);
+        self.desktop_tun = Some(session);
         self.notice = Some(("请在系统提示中授权虚拟网卡，随后执行网络自检".into(), true));
-        linux_tun::launch(id, self.profile.clone(), cancel, self.event_tx.clone());
+        desktop_tun::launch(id, self.profile.clone(), cancel, self.event_tx.clone());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn stop_tun(&mut self) {
-        if let Some(session) = &mut self.linux_tun {
+        if let Some(session) = &mut self.desktop_tun {
             session.stop();
             self.notice = Some((t("正在关闭虚拟网卡").into(), true));
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     fn start_tun(&mut self) {
         if self.tun_enabled {
             return;
@@ -1336,14 +1433,14 @@ impl HeliosApp {
         });
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     fn write_helper_config(&self) -> Result<(), AnyError> {
         let config = self.profile.helper_config_toml()?;
         write_atomic(&self.profile.helper_config, config.as_bytes())?;
         Ok(())
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     fn stop_tun(&mut self) {
         let result = write_atomic(&tun_stop_file(), b"stop");
         self.notice = Some(match result {
@@ -1515,20 +1612,37 @@ impl eframe::App for HeliosApp {
                 .is_some_and(|tray| tray.is_available());
             if ui.ctx().input(|input| input.viewport().close_requested())
                 && !has_tray
-                && self.linux_tun.is_some()
+                && self.desktop_tun.is_some()
             {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.linux_exit_after_tun = true;
+                self.exit_after_tun = true;
                 self.stop_tun();
             }
-            if self.linux_exit_after_tun && self.linux_tun.is_none() && !tun_status_file().exists()
-            {
+            if self.exit_after_tun && self.desktop_tun.is_none() && !tun_status_file().exists() {
                 self.stop_daemon();
                 if self.child.is_none() && self.daemon_profile.is_none() {
                     self.exit_requested = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if ui.ctx().input(|input| input.viewport().close_requested())
+            && self._tray.is_none()
+            && self.desktop_tun.is_some()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.exit_after_tun = true;
+            self.stop_tun();
+        }
+        #[cfg(target_os = "macos")]
+        if self.exit_after_tun && self.desktop_tun.is_none() && !tun_status_file().exists() {
+            self.stop_daemon();
+            if self.child.is_none() && self.daemon_profile.is_none() {
+                self.exit_requested = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
         self.content(ui);
@@ -1570,9 +1684,9 @@ impl HeliosApp {
             }
             TrayAction::ToggleDaemon => self.toggle_connection(),
             TrayAction::Quit => {
-                #[cfg(target_os = "linux")]
-                if self.linux_tun.is_some() {
-                    self.linux_exit_after_tun = true;
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if self.desktop_tun.is_some() {
+                    self.exit_after_tun = true;
                     self.stop_tun();
                     return;
                 }
@@ -3348,11 +3462,11 @@ fn open_log_directory() -> Result<(), AnyError> {
 }
 
 fn tun_is_running() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         false
     } // Only this window's verified readiness event establishes an active session.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         status_is_fresh(&tun_status_file())
     }
@@ -4112,7 +4226,7 @@ mod tests {
         assert!(app.notice.as_ref().is_some_and(|(_, success)| !success));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn proxy_request_does_not_retry_after_tun_blocks_it() {
         let mut app = preview_app();
@@ -4141,6 +4255,36 @@ mod tests {
             assert!(!app.recovering_connection);
             assert_eq!(app.notice, notice);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tun_readiness_requires_the_current_live_session_and_cannot_restart_a_stopped_session() {
+        let mut app = preview_app();
+        let ctx = egui::Context::default();
+        app.desktop_tun = Some(TunSession::new(7));
+        app.event_tx.send(Event::TunReady(6)).unwrap();
+        app.poll_events(&ctx);
+        assert!(!app.tun_enabled);
+        app.event_tx.send(Event::TunReady(7)).unwrap();
+        app.poll_events(&ctx);
+        assert!(app.tun_enabled);
+        app.stop_tun();
+        app.tun_enabled = false;
+        app.event_tx.send(Event::TunReady(7)).unwrap();
+        app.poll_events(&ctx);
+        assert!(!app.tun_enabled);
+        assert!(
+            app.desktop_tun
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        app.desktop_tun = None;
+        app.event_tx.send(Event::TunReady(7)).unwrap();
+        app.poll_events(&ctx);
+        assert!(!app.tun_enabled);
     }
 
     #[test]
@@ -4927,7 +5071,7 @@ mod tests {
                 if if active {
                     app.tun_enabled
                 } else {
-                    app.linux_tun.is_none()
+                    app.desktop_tun.is_none()
                 } {
                     break;
                 }
@@ -4938,7 +5082,7 @@ mod tests {
                 );
                 if active {
                     assert!(
-                        app.linux_tun.is_some(),
+                        app.desktop_tun.is_some(),
                         "desktop start failed: {:?}",
                         app.notice
                     );
@@ -4969,7 +5113,7 @@ mod tests {
         );
         app.stop_tun();
         // Closing waits for root cleanup before reaping the daemon and resetting its policy.
-        assert!(app.linux_tun.is_some());
+        assert!(app.desktop_tun.is_some());
         pump(&mut app, false);
         assert!(!app.tun_enabled && app.child.is_none() && app.profile.tun_outbound.is_none());
         assert!(!tun_status_file().exists());

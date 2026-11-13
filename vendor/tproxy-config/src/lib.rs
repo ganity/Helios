@@ -3,6 +3,8 @@ mod common;
 mod fn_holder;
 mod linux;
 mod macos;
+#[cfg(any(test, target_os = "macos"))]
+mod macos_lease;
 mod private_ip;
 mod tproxy_args;
 mod windows;
@@ -16,6 +18,8 @@ use std::path::{Path, PathBuf};
 pub use {private_ip::is_private_ip, tproxy_args::TproxyArgs};
 
 pub use cidr::IpCidr;
+#[cfg(target_os = "macos")]
+pub use macos::uplink_snapshot as macos_uplink_snapshot;
 
 #[cfg(target_os = "linux")]
 pub use linux::resolver::check_resolver as check_linux_resolver;
@@ -201,6 +205,12 @@ pub(crate) struct TproxyStateInner {
     pub(crate) default_service_dns: Option<Vec<IpAddr>>,
     #[cfg(target_os = "macos")]
     pub(crate) orig_iface_name: Option<String>,
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(
+        any(feature = "secure-state-file", feature = "unsafe-state-file"),
+        serde(default)
+    )]
+    pub(crate) macos_lease: Option<macos_lease::Lease>,
 }
 
 #[allow(dead_code)]

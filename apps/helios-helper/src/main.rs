@@ -10,12 +10,12 @@ use std::{
 use serde::Deserialize;
 use tproxy_config::IpCidr;
 use tproxy_config::tproxy_remove;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use tun2proxy::general_run_async;
 use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken};
 
-#[cfg(target_os = "linux")]
-mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod session;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -35,6 +35,8 @@ struct HelperConfig {
     bypass: Vec<String>,
     #[serde(default)]
     source_bypass: Vec<IpAddr>,
+    #[serde(default)]
+    desktop_pid: Option<u32>,
     status_file: PathBuf,
     stop_file: PathBuf,
 }
@@ -62,14 +64,16 @@ impl HelperConfig {
         if !(576..=9000).contains(&self.mtu) {
             return Err("mtu must be between 576 and 9000".into());
         }
-        if cfg!(target_os = "linux") && !self.source_bypass.is_empty() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) && !self.source_bypass.is_empty() {
             helios_config::OutboundConfig {
                 source_bypass: self.source_bypass.clone(),
                 dns_servers: vec![SocketAddr::new(self.server_ip, 53)],
             }
             .validate()?;
-        } else if !cfg!(target_os = "linux") && !self.source_bypass.is_empty() {
-            return Err("source_bypass is only supported on Linux".into());
+        } else if !cfg!(any(target_os = "linux", target_os = "macos"))
+            && !self.source_bypass.is_empty()
+        {
+            return Err("source_bypass requires Linux or macOS".into());
         }
         if cfg!(target_os = "linux")
             && let Some(name) = &self.tun_name
@@ -95,8 +99,11 @@ impl HelperConfig {
 
     fn validate_for_start(&self) -> Result<(), AnyError> {
         self.validate()?;
-        if cfg!(target_os = "linux") && self.source_bypass.is_empty() {
-            return Err("Linux TUN requires source_bypass matching the running daemon; legacy unbound routing is unsafe".into());
+        if self.desktop_pid.is_some_and(|pid| pid <= 1) {
+            return Err("invalid desktop process ID".into());
+        }
+        if cfg!(any(target_os = "linux", target_os = "macos")) && self.source_bypass.is_empty() {
+            return Err("TUN requires source_bypass matching the running daemon; legacy unbound routing is unsafe".into());
         }
         Ok(())
     }
@@ -146,7 +153,11 @@ fn create_status_file(path: &Path) -> Result<fs::File, AnyError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(if cfg!(target_os = "macos") {
+            0o644
+        } else {
+            0o600
+        });
     }
     let mut file = options.open(path)?;
     file.write_all(std::process::id().to_string().as_bytes())?;
@@ -203,7 +214,7 @@ async fn run_helper() -> Result<(), AnyError> {
             .first()
             .is_some_and(|arg| arg.to_string_lossy().starts_with("--desktop"))
         {
-            return linux::desktop::command(&values).await;
+            return session::desktop::command(&values).await;
         }
         if std::env::var_os("PKEXEC_UID").is_some() {
             return Err("pkexec only supports --desktop and --desktop-recover; administrator CLI mode is not delegated".into());
@@ -226,8 +237,8 @@ async fn run_helper() -> Result<(), AnyError> {
         return Err("stale helper state detected; refusing to modify routes without a trusted recovery record".into());
     }
     let args = config.tun_args()?;
-    #[cfg(target_os = "linux")]
-    linux::preflight(&config).await?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    session::preflight(&config).await?;
     if let Some(parent) = config.status_file.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -235,14 +246,28 @@ async fn run_helper() -> Result<(), AnyError> {
     let status_file = create_status_file(&config.status_file)?;
     let shutdown = CancellationToken::new();
     #[cfg(target_os = "linux")]
-    let run = linux::run(&config, args, shutdown.clone(), None);
-    #[cfg(not(target_os = "linux"))]
-    let run = general_run_async(
-        args,
-        config.mtu,
-        cfg!(target_os = "macos"),
-        shutdown.clone(),
-    );
+    let run = session::run(&config, args, shutdown.clone(), None);
+    #[cfg(target_os = "macos")]
+    let run = async {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let run = session::run(&config, args, shutdown.clone(), Some(tx));
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            ready = rx => {
+                if ready.is_ok() {
+                    let mut status = &status_file;
+                    use std::io::{Seek, SeekFrom};
+                    if let Err(error) = status.seek(SeekFrom::Start(0)).and_then(|_| status.write_all(format!("ready:{}", std::process::id()).as_bytes())).and_then(|_|status.sync_all()) {
+                        shutdown.cancel(); let _ = run.await; return Err(error);
+                    }
+                }
+                run.await
+            }
+        }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let run = general_run_async(args, config.mtu, false, shutdown.clone());
     tokio::pin!(run);
 
     let result: Result<(), AnyError> = tokio::select! {
@@ -255,15 +280,25 @@ async fn run_helper() -> Result<(), AnyError> {
             signal?;
             result.map(|_| ()).map_err(Into::into)
         }
+        owner = wait_for_desktop(config.desktop_pid) => {
+            shutdown.cancel();
+            let result = run.await;
+            owner.and(result.map(|_| ()).map_err(Into::into))
+        }
         stop = wait_for_stop(&config.stop_file, &status_file) => {
             shutdown.cancel();
             let result = run.await;
             stop.and(result.map(|_| ()).map_err(Into::into))
         }
     };
+    #[cfg(not(target_os = "macos"))]
     drop(status_file);
     #[cfg(target_os = "linux")]
-    if result.is_err() && !Path::new("/var/lib/helios/tun-route-lease.json").try_exists()? {
+    let pending = Path::new("/var/lib/helios/tun-route-lease.json").try_exists()?;
+    #[cfg(target_os = "macos")]
+    let pending = route_state_file()?.try_exists()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if result.is_err() && !pending {
         // A failed preflight or a fully recovered data-plane error has no pending network lease.
         fs::remove_file(&config.status_file)?;
         return result;
@@ -363,6 +398,11 @@ async fn recover_helper(config: &HelperConfig) -> Result<(), AnyError> {
             "helios-helper heartbeat is active; stop the helper before recovering routes".into(),
         );
     }
+    #[cfg(target_os = "macos")]
+    if route_state_file()?.try_exists()? {
+        recover_routes().await?;
+    }
+    #[cfg(not(target_os = "macos"))]
     recover_routes().await?;
     let _ = fs::remove_file(&config.status_file);
     let _ = fs::remove_file(&config.stop_file);
@@ -467,6 +507,38 @@ fn configure_route_state() -> Result<(), AnyError> {
     }
     tproxy_config::set_state_file_path(path)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_desktop(pid: Option<u32>) -> Result<(), AnyError> {
+    let Some(pid) = pid else {
+        return std::future::pending().await;
+    };
+    let identity = || -> std::io::Result<Vec<u8>> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()?;
+        Ok(if output.status.success() {
+            output.stdout
+        } else {
+            Vec::new()
+        })
+    };
+    let original = identity()?;
+    if original.is_empty() {
+        return Ok(());
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if identity()? != original {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn wait_for_desktop(_pid: Option<u32>) -> Result<(), AnyError> {
+    std::future::pending().await
 }
 
 #[cfg(test)]
@@ -718,6 +790,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn failed_recovery_preserves_stale_status_and_stop_request() {
         let directory = std::env::temp_dir().join(format!(
@@ -758,11 +831,12 @@ mod tests {
             mtu: 1280,
             ipv6_enabled: false,
             bypass: vec!["192.168.0.0/16".into()],
-            source_bypass: if cfg!(target_os = "linux") {
+            source_bypass: if cfg!(any(target_os = "linux", target_os = "macos")) {
                 vec!["192.0.2.1".parse().unwrap()]
             } else {
                 vec![]
             },
+            desktop_pid: None,
             status_file: std::env::temp_dir().join("helios-helper-test.status"),
             stop_file: std::env::temp_dir().join("helios-helper-test.stop"),
         }
@@ -814,7 +888,7 @@ mod tests {
         let mut value = config();
         value.stop_file = value.status_file.clone();
         assert!(value.validate().is_err());
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             let mut value = config();
             value.source_bypass.clear();
             assert!(value.validate().is_ok()); // Legacy configuration remains usable for --recover.

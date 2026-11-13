@@ -34,6 +34,7 @@ ksni = { version = "0.3.7", features = ["blocking"] }
 tproxy-config = { workspace = true, features = ["secure-state-file"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tproxy-config = { workspace = true, features = ["secure-state-file"] }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["block2", "NSAccessibilityProtocols", "NSApplication", "NSAttributedString", "NSBezierPath", "NSColor", "NSFont", "NSFontDescriptor", "NSGraphics", "NSImage", "NSStringDrawing"] }

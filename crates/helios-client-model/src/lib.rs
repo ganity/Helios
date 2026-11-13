@@ -292,6 +292,8 @@ impl DesktopProfile {
             mtu: u16,
             ipv6_enabled: bool,
             bypass: Vec<String>,
+            source_bypass: Vec<IpAddr>,
+            desktop_pid: u32,
             status_file: PathBuf,
             stop_file: PathBuf,
         }
@@ -319,6 +321,12 @@ impl DesktopProfile {
             mtu: self.tun_mtu,
             ipv6_enabled: self.tun_ipv6_enabled,
             bypass,
+            source_bypass: self
+                .tun_outbound
+                .as_ref()
+                .map(|outbound| outbound.source_bypass.clone())
+                .unwrap_or_default(),
+            desktop_pid: std::process::id(),
             status_file: tun_status_file(),
             stop_file: tun_stop_file(),
         })?)

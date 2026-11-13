@@ -169,7 +169,7 @@ impl Outbound {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
         let source = self.source(SocketAddr::new(any, 0))?.unwrap_or(any);
-        UdpSocket::bind((source, 0)).await
+        UdpSocket::from_std(helios_transport::udp_socket_bound(source)?)
     }
 
     pub async fn connect(

@@ -1,11 +1,17 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::AbstractDevice;
+#[cfg(target_os = "linux")]
+#[path = "linux/desktop.rs"]
 pub(super) mod desktop;
 
 /// Refuse unsupported DNS managers or an existing interface before creating status or changing routes.
 pub(super) async fn preflight(config: &HelperConfig) -> Result<(), AnyError> {
+    #[cfg(target_os = "macos")]
+    tproxy_config::macos_uplink_snapshot(config.ipv6_enabled)?;
+    #[cfg(target_os = "linux")]
     tproxy_config::check_linux_resolver().await?;
+    #[cfg(target_os = "linux")]
     if let Some(name) = &config.tun_name
         && Path::new("/sys/class/net").join(name).exists()
     {
@@ -39,8 +45,14 @@ pub(super) async fn run(
         tun_config.tun_name(name);
     }
     // Use raw IP frames, without the optional Linux packet-information prefix.
+    #[cfg(target_os = "linux")]
     tun_config.platform_config(|platform| {
         platform.ensure_root_privileges(true);
+    });
+    #[cfg(target_os = "macos")]
+    tun_config.platform_config(|platform| {
+        // Keep utun framing, but leave every explicit route mutation to the journal.
+        platform.packet_information(true).enable_routing(false);
     });
     let device = tun::create_as_async(&tun_config)?;
     let routes = tproxy_config::TproxyArgs::new()
@@ -62,8 +74,7 @@ pub(super) async fn run(
     tokio::pin!(run);
     let result = if let Some(ready) = ready {
         // Poll the real data plane while testing its DNS path; only then report ready.
-        let probe =
-            tokio::time::timeout(std::time::Duration::from_secs(5), desktop::probe_tun_dns());
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), probe_tun_dns());
         tokio::pin!(probe);
         tokio::select! {
             result = &mut run => result,
@@ -119,7 +130,7 @@ async fn check_dns_gateway(socks: SocketAddr) -> Result<(), AnyError> {
     let mut reply = [0; 4];
     stream.read_exact(&mut reply).await?;
     if reply[..3] != [5, 0, 0] {
-        return Err("Linux TUN requires a running source-bound daemon with DNS enabled".into());
+        return Err("TUN requires a running source-bound daemon with DNS enabled".into());
     }
     let length = match reply[3] {
         1 => 4,
@@ -146,6 +157,29 @@ async fn check_dns_gateway(socks: SocketAddr) -> Result<(), AnyError> {
     let response = Message::from_vec(&bytes)?;
     if response.id != query.id || response.queries != query.queries || !response.answers.iter().any(|record| matches!(&record.data, RData::AAAA(ip) if helios_dns::is_fake_ip(IpAddr::V6(ip.0)))) {
         return Err("daemon DNS gateway did not return a dual-stack Fake-IP answer".into());
+    }
+    Ok(())
+}
+
+pub(super) async fn probe_tun_dns() -> Result<(), AnyError> {
+    let mut stream = tokio::net::TcpStream::connect((helios_dns::TUN_DNS, 53)).await?;
+    let query = hickory_proto::op::Message::query()
+        .add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_str("helios-tun-ready.invalid.")?,
+            hickory_proto::rr::RecordType::AAAA,
+        ))
+        .to_vec()?;
+    stream.write_u16(query.len().try_into()?).await?;
+    stream.write_all(&query).await?;
+    let size = stream.read_u16().await? as usize;
+    if size > 4096 {
+        return Err("oversized TUN DNS probe".into());
+    }
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes).await?;
+    let reply = hickory_proto::op::Message::from_vec(&bytes)?;
+    if !reply.answers.iter().any(|r| matches!(&r.data, hickory_proto::rr::RData::AAAA(ip) if helios_dns::is_fake_ip(IpAddr::V6(ip.0)))) {
+        return Err("TUN DNS probe did not reach the shared cache".into());
     }
     Ok(())
 }
