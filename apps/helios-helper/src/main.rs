@@ -275,17 +275,20 @@ async fn run_helper() -> Result<(), AnyError> {
             result.map(|_| ()).map_err(Into::into)
         }
         signal = shutdown_signal() => {
+            tracing::info!(event = "tun_stop_requested", reason = "signal");
             shutdown.cancel();
             let result = run.await;
             signal?;
             result.map(|_| ()).map_err(Into::into)
         }
         owner = wait_for_desktop(config.desktop_pid) => {
+            tracing::info!(event = "tun_stop_requested", reason = "desktop_owner_disconnected");
             shutdown.cancel();
             let result = run.await;
             owner.and(result.map(|_| ()).map_err(Into::into))
         }
         stop = wait_for_stop(&config.stop_file, &status_file) => {
+            tracing::info!(event = "tun_stop_requested", reason = "stop_file");
             shutdown.cancel();
             let result = run.await;
             stop.and(result.map(|_| ()).map_err(Into::into))
