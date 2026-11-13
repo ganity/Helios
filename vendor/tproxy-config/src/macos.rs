@@ -208,7 +208,7 @@ impl crate::macos_lease::Network for Native<'_> {
         get_dns_servers(service)
     }
     fn set_dns(&mut self, dns: &crate::macos_lease::Dns, restore: bool) -> std::io::Result<()> {
-        if restore {
+        let result = if restore {
             match &dns.original {
                 Some(servers) if !servers.is_empty() => {
                     configure_dns_servers(&dns.name, &dns.service, servers)
@@ -217,6 +217,25 @@ impl crate::macos_lease::Network for Native<'_> {
             }
         } else {
             configure_dns_servers(&dns.name, &dns.service, &dns.applied)
+        };
+        result?;
+        let expected = if restore {
+            dns.original.as_ref()
+        } else {
+            Some(&dns.applied)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let current = get_dns_servers(&dns.service)?;
+            if current.as_ref() == expected {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "DNS update was not reflected by macOS (expected {expected:?}, got {current:?})"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     fn save(&mut self, lease: &crate::macos_lease::Lease) -> std::io::Result<()> {
