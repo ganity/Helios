@@ -259,6 +259,13 @@ mod tests {
             result = &mut session => (Err(format!("TUN ended before readiness: {result:?}")), true),
             result = tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx) => (result.map_err(|error| error.to_string()).and_then(|result|result.map_err(|error|error.to_string())), false),
         };
+        let own_tun = ready.as_ref().ok().map(|_| {
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&lease).unwrap()).unwrap()
+                ["macos_lease"]["tun"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
         shutdown.cancel();
         // Always finish cleanup before asserting, including failed readiness.
         let stopped = if !ended {
@@ -270,7 +277,15 @@ mod tests {
             tproxy_config::tproxy_remove(None).await.unwrap();
         }
         server.abort();
-        let after = tproxy_config::macos_uplink_snapshot(false).unwrap();
+        let after = match own_tun.as_deref() {
+            Some(tun) => tproxy_config::macos_uplink_snapshot_with_tun(false, tun),
+            None => tproxy_config::macos_uplink_snapshot(false),
+        };
+        assert!(
+            after.is_ok(),
+            "uplink snapshot failed: {after:?}; ready: {ready:?}; stopped: {stopped:?}"
+        );
+        let after = after.unwrap();
         assert_eq!(before, after, "physical uplink and DNS must be restored");
         assert!(!lease.exists());
         fs::remove_dir(directory).unwrap();

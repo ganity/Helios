@@ -353,6 +353,14 @@ pub fn uplink_snapshot(ipv6: bool) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)
     snapshot(ipv6, None)
 }
 
+#[doc(hidden)]
+pub fn uplink_snapshot_with_tun(
+    ipv6: bool,
+    own: &str,
+) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
+    snapshot(ipv6, Some(own))
+}
+
 fn snapshot(ipv6: bool, own: Option<&str>) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
     for family in ["inet", "inet6"] {
         let table = run_command("/usr/sbin/netstat", &["-rn", "-f", family])?;
