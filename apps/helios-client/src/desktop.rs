@@ -4944,6 +4944,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_tun_status_requires_network_recovery() {
+        let path = std::env::temp_dir().join(format!("helios-stale-status-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(status_needs_recovery(&path));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn daemon_log_rotates_at_limit_and_is_private() {
         use std::io::Write as _;
 
