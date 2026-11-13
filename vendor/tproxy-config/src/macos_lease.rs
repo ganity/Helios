@@ -79,6 +79,37 @@ pub(crate) trait Network {
 }
 
 pub(crate) fn parse_route(output: &str, ipv6: bool) -> io::Result<Option<Route>> {
+    parse_route_inner(output, ipv6, false)
+}
+
+pub(crate) fn physical_default(
+    output: &str,
+    ipv6: bool,
+    interface: &str,
+    gateway: &str,
+) -> io::Result<()> {
+    // Every TUN daemon socket is bound to this physical interface, so its scoped default is valid.
+    let route = parse_route_inner(output, ipv6, true)?;
+    let gateway_ip = |value: &str| value.split('%').next().unwrap().parse::<IpAddr>();
+    if route.is_some_and(|route| {
+        !interface.starts_with("utun")
+            && interface != "lo0"
+            && route.cidr.network_length() == 0
+            && route.interface == interface
+            && route.gateway.as_deref().is_some_and(|current| {
+                matches!((gateway_ip(current), gateway_ip(gateway)), (Ok(a), Ok(b)) if a == b)
+            })
+    }) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "no matching physical IPv{} default route on {interface} via {gateway}",
+            if ipv6 { 6 } else { 4 }
+        )))
+    }
+}
+
+fn parse_route_inner(output: &str, ipv6: bool, allow_scoped: bool) -> io::Result<Option<Route>> {
     let field = |name: &str| {
         output.lines().find_map(|line| {
             let (key, value) = line.trim().split_once(':')?;
@@ -90,7 +121,7 @@ pub(crate) fn parse_route(output: &str, ipv6: bool) -> io::Result<Option<Route>>
         field("destination").ok_or_else(|| io::Error::other("route has no destination"))?;
     let flags = field("flags").unwrap_or("");
     // A scoped route does not provide an unscoped default for ordinary sockets.
-    if flags.contains("IFSCOPE") {
+    if flags.contains("IFSCOPE") && !allow_scoped {
         return Ok(None);
     }
     let parse_ip = |value: &str| -> io::Result<IpAddr> {
@@ -284,6 +315,42 @@ pub(crate) fn recover(lease: &mut Lease, network: &mut impl Network) -> io::Resu
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn physical_default_accepts_scoped_uplink_without_claiming_its_route() {
+        let scoped = "route to: default\ndestination: default\nmask: default\ngateway: 192.168.15.1\ninterface: en0\nflags: <UP,GATEWAY,DONE,STATIC,PRCLONING,IFSCOPE,GLOBAL>";
+        physical_default(scoped, false, "en0", "192.168.15.1").unwrap();
+        assert!(parse_route(scoped, false).unwrap().is_none());
+        let ipv6 = "route to: ::\ndestination: ::\nmask: default\ngateway: fe80::82ae:54ff:fe93:c4a2%en0\ninterface: en0\nflags: <UP,GATEWAY,DONE,PRCLONING,GLOBAL>";
+        physical_default(ipv6, true, "en0", "fe80::82ae:54ff:fe93:c4a2%en0").unwrap();
+        physical_default(
+            &format!("{ipv6},IFSCOPE"),
+            true,
+            "en0",
+            "fe80::82ae:54ff:fe93:c4a2%en0",
+        )
+        .unwrap();
+        assert!(physical_default(scoped, false, "en1", "192.168.15.1").is_err());
+        assert!(physical_default(scoped, false, "en0", "192.168.15.2").is_err());
+        assert!(
+            physical_default(
+                &scoped.replace("en0", "utun5"),
+                false,
+                "en0",
+                "192.168.15.1"
+            )
+            .is_err()
+        );
+        assert!(
+            physical_default(
+                &scoped.replace("mask: default", "mask: 128.0.0.0"),
+                false,
+                "en0",
+                "192.168.15.1"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn host_route_commands_do_not_use_network_lookups() {

@@ -513,7 +513,12 @@ impl HeliosApp {
                     self.stop_daemon();
                     let saved = save_profile(&self.profile_path, &self.profile);
                     #[cfg(target_os = "macos")]
-                    if result.is_ok() && saved.is_ok() && !self.exit_after_tun {
+                    // The helper removes status only after confirming that no network lease remains.
+                    if saved.is_ok()
+                        && !self.exit_after_tun
+                        && self.child.is_none()
+                        && tun_status_file().try_exists().is_ok_and(|exists| !exists)
+                    {
                         self.spawn_daemon("虚拟网卡已关闭，后台已恢复普通出口");
                     }
                     self.notice =
@@ -4165,6 +4170,64 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a disposable macOS CI home; starts a fake daemon and creates helper status"]
+    fn failed_tun_restores_normal_daemon_only_after_network_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        let directory = std::env::temp_dir().join(format!(
+            "helios-failed-tun-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join("fake-daemon");
+        std::fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = tun_status_file();
+        assert!(
+            !status.exists(),
+            "the test must not share an active TUN session"
+        );
+        for (pending, exiting) in [(false, false), (true, false), (false, true)] {
+            if pending {
+                std::fs::write(&status, "pending recovery").unwrap();
+            }
+            let mut app = preview_app();
+            app.profile_path = directory.join("desktop.json");
+            app.profile.daemon_config = directory.join("daemon.toml");
+            app.profile.daemon_binary = binary.clone();
+            app.profile.tun_outbound = Some(helios_config::OutboundConfig {
+                source_bypass: vec!["192.168.15.112".parse().unwrap()],
+                dns_servers: vec!["192.168.15.1:53".parse().unwrap()],
+            });
+            app.desktop_tun = Some(TunSession::new(1));
+            app.exit_after_tun = exiting;
+            app.event_tx
+                .send(Event::TunEnded(1, Err("TUN failed".into())))
+                .unwrap();
+            app.poll_events(&egui::Context::default());
+            assert_eq!(app.child.is_some(), !pending && !exiting);
+            assert!(app.profile.tun_outbound.is_none());
+            let config = helios_config::DaemonConfig::load(&app.profile.daemon_config).unwrap();
+            assert!(config.outbound.is_none());
+            assert_eq!(app.notice, Some(("TUN failed".into(), false)));
+            if let Some(mut child) = app.child.take() {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+            if pending {
+                assert!(status.exists());
+                std::fs::remove_file(&status).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

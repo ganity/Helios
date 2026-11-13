@@ -822,7 +822,7 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 
-    fn config() -> HelperConfig {
+    pub(super) fn config() -> HelperConfig {
         HelperConfig {
             schema_version: 1,
             socks_listen: "127.0.0.1:1080".parse().unwrap(),

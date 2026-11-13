@@ -315,6 +315,20 @@ fn default_gateway(ipv6: bool) -> std::io::Result<Option<(String, String)>> {
     Ok(Some((gateway, interface)))
 }
 
+fn check_physical_default(ipv6: bool, interface: &str, gateway: &str) -> std::io::Result<()> {
+    let family = if ipv6 { "-inet6" } else { "-inet" };
+    let output = run_command(
+        "/sbin/route",
+        &["-n", "get", family, "-ifscope", interface, "default"],
+    )?;
+    crate::macos_lease::physical_default(
+        &String::from_utf8_lossy(&output),
+        ipv6,
+        interface,
+        gateway,
+    )
+}
+
 /// Capture real uplink addresses and resolver IPs before installing TUN routes or DNS.
 pub fn uplink_snapshot(ipv6: bool) -> std::io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
     snapshot(ipv6, None)
@@ -340,7 +354,7 @@ fn snapshot(ipv6: bool, own: Option<&str>) -> std::io::Result<(Vec<IpAddr>, Vec<
         if family && !ipv6 {
             continue;
         }
-        let Some((_, iface)) = default_gateway(family)? else {
+        let Some((gateway, iface)) = default_gateway(family)? else {
             continue;
         };
         if iface.starts_with("utun") || iface == "lo0" {
@@ -348,11 +362,7 @@ fn snapshot(ipv6: bool, own: Option<&str>) -> std::io::Result<(Vec<IpAddr>, Vec<
                 "another VPN owns the uplink; disable it before enabling Helios TUN",
             ));
         }
-        if lookup_route("default", family)?.is_none() {
-            return Err(std::io::Error::other(
-                "physical default route is missing; restore system networking before enabling TUN",
-            ));
-        }
+        check_physical_default(family, &iface, &gateway)?;
         let key = format!(
             "State:/Network/Interface/{iface}/{}",
             if family { "IPv6" } else { "IPv4" }
@@ -687,9 +697,17 @@ mod tests {
             assert_eq!(route.interface, "lo0");
             assert_eq!(route.cidr, host.parse().unwrap());
         }
-        let (_, _, service, name) = get_default_iface_params().unwrap();
+        let (gateway, interface, service, name) = get_default_iface_params().unwrap();
+        check_physical_default(false, &interface, &gateway.to_string()).unwrap();
         assert!(name.is_some());
         get_dns_servers(&service).unwrap();
         assert!(!boot_identity().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_native_uplink_preflight_is_read_only() {
+        let (sources, dns) = uplink_snapshot(false).unwrap();
+        assert!(!sources.is_empty() && sources.iter().all(IpAddr::is_ipv4));
+        assert!(!dns.is_empty());
     }
 }

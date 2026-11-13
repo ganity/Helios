@@ -129,11 +129,18 @@ jobs:
       - name: Reject missing and corrupt TUN recovery records
         run: cargo test -p tproxy-config --features secure-state-file recovery_rejects_missing_or_corrupt_secure_record
       - run: cargo test -p helios-helper
+      - name: Test real macOS TUN DNS readiness and network restoration
+        shell: bash
+        run: |
+          task_helper_tests=$(cargo test -p helios-helper --no-run --message-format=json | python3 -c 'import json,sys; print(next(m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable")))')
+          sudo env GITHUB_ACTIONS=true "$task_helper_tests" macos_real_tun_dns_readiness_and_network_restoration --ignored --nocapture
       - name: Test macOS TUN rollback, retry and route ownership
         run: cargo test -p tproxy-config --features secure-state-file macos_
       - name: Test native bound TCP, QUIC and UDP sockets
         run: cargo test -p helios-transport
       - run: cargo test -p helios-client
+      - name: Restore the normal daemon after a recovered macOS TUN failure
+        run: cargo test -p helios-client failed_tun_restores_normal_daemon_only_after_network_cleanup -- --ignored
       - run: cargo test -p helios-config
       - run: cargo test -p tproxy-config --features secure-state-file recovery_record_
       - run: cargo clippy -p helios-daemon -p helios-client -p helios-helper -p heliosctl --all-targets -- -D warnings
