@@ -166,11 +166,36 @@ async fn wait_for_stop(path: &Path, status: &fs::File) -> Result<(), AnyError> {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
+    #[cfg(target_os = "macos")]
+    let log = macos_log_file()?;
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(move || {
+            #[cfg(target_os = "macos")]
+            {
+                Box::new(log.try_clone().expect("clone helper log")) as Box<dyn Write + Send>
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Box::new(std::io::stderr()) as Box<dyn Write + Send>
+            }
+        })
         .try_init()
         .ok();
+    let result = run_helper().await;
+    match &result {
+        Ok(()) => tracing::info!(event = "tun_helper_finished"),
+        Err(error) => tracing::error!(event = "tun_helper_failed", error = %error),
+    }
+    result
+}
+
+async fn run_helper() -> Result<(), AnyError> {
+    tracing::info!(event = "tun_helper_started");
     let values: Vec<_> = std::env::args_os().skip(1).collect();
     #[cfg(target_os = "linux")]
     {
@@ -185,7 +210,8 @@ async fn main() -> Result<(), AnyError> {
         }
     }
     let (recover, path) = parse_command(&values)?;
-    let config = HelperConfig::load(path)?;
+    let config = HelperConfig::load(&path)
+        .map_err(|error| format!("load helper config {}: {error}", path.display()))?;
     #[cfg(unix)]
     let _instance_lock = lock_helper_instance()?;
     configure_route_state()?;
@@ -344,8 +370,51 @@ async fn recover_helper(config: &HelperConfig) -> Result<(), AnyError> {
 }
 
 async fn recover_routes() -> Result<(), AnyError> {
-    tproxy_remove(None).await?;
+    tproxy_remove(None).await.map_err(|error| {
+        #[cfg(any(windows, target_os = "macos"))]
+        let path = route_state_file().unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        let path = PathBuf::from("/var/lib/helios/tun-route-lease.json");
+        format!(
+            "restore TUN routes from {}: {error}; recovery state preserved",
+            path.display()
+        )
+    })?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_log_file() -> Result<fs::File, AnyError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let directory = Path::new("/Library/Logs/Helios");
+    match fs::DirBuilder::new().mode(0o755).create(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err("untrusted helper log directory".into());
+    }
+    let path = directory.join("helper.log");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 =>
+        {
+            return Err("untrusted helper log file".into());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    if file.metadata()?.len() > 5 * 1024 * 1024 {
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 fn parse_command(values: &[std::ffi::OsString]) -> Result<(bool, PathBuf), AnyError> {

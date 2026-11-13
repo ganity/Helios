@@ -236,6 +236,7 @@ struct HeliosApp {
     linux_exit_after_tun: bool,
     notice: Option<(String, bool)>,
     child: Option<Child>,
+    daemon_starting: Option<(Instant, String)>,
     daemon_profile: Option<DesktopProfile>,
     startup_checked: bool,
     daemon_revision: u64,
@@ -334,6 +335,7 @@ impl HeliosApp {
             linux_exit_after_tun: false,
             notice: None,
             child: None,
+            daemon_starting: None,
             daemon_profile: None,
             startup_checked: false,
             daemon_revision: 0,
@@ -490,6 +492,14 @@ impl HeliosApp {
                     {
                         continue;
                     }
+                    if let Some((_, success)) = self.daemon_starting.take()
+                        && self
+                            .notice
+                            .as_ref()
+                            .is_some_and(|(text, _)| text == t("正在启动后台，请稍候"))
+                    {
+                        self.notice = Some((success, true));
+                    }
                     if status.desktop_managed
                         && !self.applying_config
                         && self.daemon_profile.is_none()
@@ -545,6 +555,19 @@ impl HeliosApp {
                     }
                 }
                 Event::Status(_, Err(error)) => {
+                    if self
+                        .daemon_starting
+                        .as_ref()
+                        .is_some_and(|(since, _)| since.elapsed() < Duration::from_secs(30))
+                        && self.owns_running_daemon()
+                    {
+                        continue;
+                    }
+                    if self.daemon_starting.take().is_some() {
+                        self.connecting_since = None;
+                        self.recovering_connection = false;
+                        self.notice = Some((t("后台未能就绪，请查看诊断日志").into(), false));
+                    }
                     self.status_error = Some(error);
                     self.upload_rate = 0.0;
                     self.download_rate = 0.0;
@@ -640,7 +663,7 @@ impl HeliosApp {
             ));
         }
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-        if self.system_proxy_enabled && self.child.is_some() {
+        if self.child.is_some() {
             match owned_daemon_running(&mut self.child) {
                 Ok(false) => {
                     self.handle_unexpected_daemon_exit();
@@ -848,6 +871,7 @@ impl HeliosApp {
             && !self.tun_transition_pending()
             && self.unexpected_restarts < 3;
         self.daemon_profile = None;
+        self.daemon_starting = None;
         self.status = None;
         self.system_proxy_enabled = false;
         self.system_proxy_verified = false;
@@ -1008,10 +1032,13 @@ impl HeliosApp {
                 self.upload_rate = 0.0;
                 self.download_rate = 0.0;
                 self.child = Some(child);
+                self.daemon_starting = Some((Instant::now(), success.into()));
                 self.daemon_profile = Some(self.profile.clone());
                 self.status = None;
+                self.status_error = None;
+                self.last_status_success = None;
                 self.last_poll = Instant::now() - Duration::from_secs(5);
-                self.notice = Some((success.into(), true));
+                self.notice = Some((t("正在启动后台，请稍候").into(), true));
             }
             Err(error) => self.notice = Some((format!("启动后台失败：{error}"), false)),
         }
@@ -1038,6 +1065,7 @@ impl HeliosApp {
                 return;
             }
         }
+        self.daemon_starting = None;
         let Some(child) = self.child.take() else {
             if self
                 .status
@@ -1116,6 +1144,12 @@ impl HeliosApp {
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn set_system_proxy(&mut self, enabled: bool) {
+        if enabled {
+            // Consume the request before TUN recovery or authorization can fail. Status polls
+            // must not turn a cancelled/blocked request into another administrator prompt.
+            self.connecting_since = None;
+            self.recovering_connection = false;
+        }
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         if enabled && (self.tun_enabled || self.tun_transition_pending()) {
             self.stop_tun();
@@ -2759,7 +2793,7 @@ impl HeliosApp {
 
     fn refresh_logs(&mut self) {
         self.last_log_refresh = Instant::now();
-        match read_daemon_log_tail(&daemon_log_path(), 128 * 1024, 200) {
+        match read_runtime_logs() {
             Ok(entries) => {
                 self.log_entries = entries;
                 self.log_error = None;
@@ -3190,6 +3224,30 @@ fn daemon_log_path() -> PathBuf {
     default_state_dir().join("daemon.log")
 }
 
+fn read_runtime_logs() -> Result<Vec<LogEntry>, AnyError> {
+    #[allow(unused_mut)]
+    let mut paths = vec![daemon_log_path()];
+    #[cfg(target_os = "macos")]
+    paths.push(PathBuf::from("/Library/Logs/Helios/helper.log"));
+    // Linux already stores helper output beside the daemon log.
+    #[cfg(target_os = "linux")]
+    paths.push(default_state_dir().join("tun-helper.log"));
+    let mut entries = Vec::new();
+    for path in paths {
+        match read_daemon_log_tail(&path, 128 * 1024, 200) {
+            Ok(logs) => entries.extend(logs),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let start = entries.len().saturating_sub(200);
+    Ok(entries.split_off(start))
+}
+
 fn read_daemon_log_tail(
     path: &Path,
     max_bytes: u64,
@@ -3219,10 +3277,26 @@ fn read_daemon_log_tail(
 
 fn parse_log_entry(line: &str) -> Option<LogEntry> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let fields = value.get("fields")?;
+    let event = fields
+        .get("event")
+        .or_else(|| fields.get("message"))?
+        .as_str()?;
+    let event = if matches!(event, "tun_helper_failed" | "daemon_failed") {
+        format!(
+            "{event}: {}",
+            fields
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        )
+    } else {
+        event.to_owned()
+    };
     Some(LogEntry {
         timestamp: value.get("timestamp")?.as_str()?.to_owned(),
         level: value.get("level")?.as_str()?.to_owned(),
-        event: value.get("fields")?.get("event")?.as_str()?.to_owned(),
+        event,
     })
 }
 
@@ -3329,18 +3403,27 @@ set helperArgs to ""
 repeat with i from 2 to count of argv
 set helperArgs to helperArgs & " " & quoted form of item i of argv
 end repeat
-do shell script (quoted form of item 1 of argv & helperArgs & " >/dev/null 2>&1 &") with administrator privileges
+set helperCommand to quoted form of item 1 of argv & helperArgs
+if item 2 of argv is "--recover" then
+do shell script helperCommand with administrator privileges
+else
+do shell script (helperCommand & " >/dev/null 2>&1 &") with administrator privileges
+end if
 end run"#;
     let mut command = Command::new("osascript");
     command.arg("-e").arg(script).arg(binary);
     if recover {
         command.arg("--recover");
     }
-    let status = command.arg(config).status()?;
-    if status.success() {
+    let output = command.arg(config).output()?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err("administrator authorization was rejected".into())
+        Err(format!(
+            "TUN helper: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into())
     }
 }
 
@@ -3968,6 +4051,97 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_startup_waits_for_control_readiness_but_reports_timeout() {
+        let mut app = preview_app();
+        let ctx = egui::Context::default();
+        app.child = Some(Command::new("sleep").arg("30").spawn().unwrap());
+        app.daemon_starting = Some((Instant::now(), "ready".into()));
+        app.notice = Some((t("正在启动后台，请稍候").into(), true));
+        let error = "control connection failed: No such file or directory (os error 2)";
+        app.event_tx
+            .send(Event::Status(0, Err(error.into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        let transient_error = app.status_error.clone();
+        let status: StatusSnapshot = serde_json::from_value(serde_json::json!({
+            "state": "connected", "transport": "tls", "desktop_managed": true,
+            "quic_rtt_micros": null, "tls_rtt_micros": 100,
+            "active_flows": 0, "uploaded_bytes": 0, "downloaded_bytes": 0,
+            "udp_dropped_packets": 0
+        }))
+        .unwrap();
+        app.event_tx.send(Event::Status(0, Ok(status))).unwrap();
+        app.poll_events(&ctx);
+        let ready = app.daemon_starting.is_none();
+        let ready_notice = app.notice.clone();
+        app.daemon_starting = Some((Instant::now() - Duration::from_secs(31), "ready".into()));
+        app.event_tx
+            .send(Event::Status(0, Err(error.into())))
+            .unwrap();
+        app.poll_events(&ctx);
+        app.child.as_mut().unwrap().kill().unwrap();
+        app.child.as_mut().unwrap().wait().unwrap();
+        assert!(transient_error.is_none(), "{transient_error:?}");
+        assert!(ready, "control success must end startup");
+        assert_eq!(ready_notice, Some(("ready".into(), true)));
+        assert_eq!(app.status_error.as_deref(), Some(error));
+        assert!(
+            app.daemon_starting.is_none(),
+            "startup must have a deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_exit_during_startup_is_not_hidden_by_readiness_wait() {
+        let mut app = preview_app();
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        app.child = Some(child);
+        app.daemon_starting = Some((Instant::now(), "ready".into()));
+        app.event_tx
+            .send(Event::Status(0, Err("daemon exited".into())))
+            .unwrap();
+        app.poll_events(&egui::Context::default());
+        assert_eq!(app.status_error.as_deref(), Some("daemon exited"));
+        assert!(app.daemon_starting.is_none());
+        assert!(app.child.is_none());
+        assert!(app.notice.as_ref().is_some_and(|(_, success)| !success));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_request_does_not_retry_after_tun_blocks_it() {
+        let mut app = preview_app();
+        app.connecting_since = Some(Instant::now());
+        app.recovering_connection = true;
+        app.tun_enabled = true;
+        app.set_system_proxy(true);
+        assert!(app.connecting_since.is_none());
+        assert!(!app.recovering_connection);
+        assert!(!app.system_proxy_enabled);
+        let ctx = egui::Context::default();
+        let notice = app.notice.clone();
+        let status: StatusSnapshot = serde_json::from_value(serde_json::json!({
+            "state": "connected", "transport": "tls", "desktop_managed": true,
+            "quic_rtt_micros": null, "tls_rtt_micros": 100,
+            "active_flows": 0, "uploaded_bytes": 0, "downloaded_bytes": 0,
+            "udp_dropped_packets": 0
+        }))
+        .unwrap();
+        for _ in 0..30 {
+            app.event_tx
+                .send(Event::Status(app.daemon_revision, Ok(status.clone())))
+                .unwrap();
+            app.poll_events(&ctx);
+            assert!(app.connecting_since.is_none());
+            assert!(!app.recovering_connection);
+            assert_eq!(app.notice, notice);
+        }
+    }
 
     #[test]
     fn stale_runtime_rule_test_cannot_replace_the_current_result() {
@@ -4604,6 +4778,34 @@ mod tests {
             }]
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn helper_failures_and_message_events_are_visible_in_logs() {
+        let failure = serde_json::json!({
+            "timestamp": "now", "level": "ERROR",
+            "fields": { "event": "tun_helper_failed", "error": "restore TUN routes: missing lease.json" }
+        });
+        let entry = parse_log_entry(&failure.to_string()).unwrap();
+        assert_eq!(
+            entry.event,
+            "tun_helper_failed: restore TUN routes: missing lease.json"
+        );
+        let daemon_failure = serde_json::json!({
+            "timestamp": "now", "level": "ERROR",
+            "fields": { "event": "daemon_failed", "error": "Address already in use" }
+        });
+        assert_eq!(
+            parse_log_entry(&daemon_failure.to_string()).unwrap().event,
+            "daemon_failed: Address already in use"
+        );
+        let message = serde_json::json!({
+            "timestamp": "now", "level": "INFO", "fields": { "message": "TUN initialized" }
+        });
+        assert_eq!(
+            parse_log_entry(&message.to_string()).unwrap().event,
+            "TUN initialized"
+        );
     }
 
     #[test]

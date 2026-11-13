@@ -425,6 +425,11 @@ const TEXT: &[(&str, &str)] = &[
     ("控制地址无效", "Invalid control address"),
     ("配置已保存", "Configuration saved"),
     ("后台已启动", "Daemon started"),
+    ("正在启动后台，请稍候", "Starting daemon, please wait"),
+    (
+        "后台未能就绪，请查看诊断日志",
+        "Daemon did not become ready; check diagnostic logs",
+    ),
     (
         "请先从托盘退出另一个 Helios 窗口，再点击连接",
         "Quit the other Helios instance from the tray, then connect",

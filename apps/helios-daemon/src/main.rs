@@ -476,6 +476,14 @@ enum RemoteError {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
+    let result = run_daemon().await;
+    if let Err(error) = &result {
+        tracing::error!(event = "daemon_failed", error = %error);
+    }
+    result
+}
+
+async fn run_daemon() -> Result<(), AnyError> {
     let mut proxy_lease = None;
     let config_path = match parse_command(env::args())? {
         DaemonCommand::Run(path) => path,
@@ -701,6 +709,7 @@ fn init_logging() -> Result<(), AnyError> {
         .with_env_filter(filter)
         .with_current_span(false)
         .with_span_list(false)
+        .with_writer(std::io::stderr)
         .try_init()?;
     Ok(())
 }
@@ -2296,6 +2305,37 @@ fn default_state_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_logging_writes_structured_events_to_stderr() {
+        const MARKER: &str = "HELIOS_TEST_LOG_STDERR";
+        if std::env::var_os(MARKER).is_some() {
+            super::init_logging().unwrap();
+            tracing::info!(event = "desktop_log_smoke");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::desktop_logging_writes_structured_events_to_stderr",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let events: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|value| value["fields"]["event"] == "desktop_log_smoke")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("desktop_log_smoke"));
+    }
+
     use std::net::IpAddr;
 
     use helios_protocol::{Address, Frame, FrameType};

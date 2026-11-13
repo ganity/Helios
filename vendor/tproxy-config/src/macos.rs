@@ -28,6 +28,38 @@ pub(crate) async fn _tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<T
     let tun_netmask = tproxy_args.tun_netmask.to_string();
     let tun_gateway = tproxy_args.tun_gateway.to_string();
 
+    let default_service_dns = match get_dns_servers(&service_id) {
+        Ok(servers) => servers,
+        Err(msg) => {
+            log::error!("failed to get DNS servers of default interface: {msg}");
+            None
+        }
+    };
+
+    let restore_resolvconf_content = Some(std::fs::read(ETC_RESOLV_CONF_FILE)?);
+
+    let state = TproxyStateInner {
+        tproxy_args: Some(tproxy_args.clone()),
+        original_dns_servers: None,
+        gateway: Some(original_gateway_0),
+        gw_scope: Some(orig_gw_iface.clone()),
+        umount_resolvconf: false,
+        restore_resolvconf_content,
+        tproxy_removed_done: false,
+        default_service_id: Some(service_id.clone()),
+        default_service_dns,
+        orig_iface_name: orig_iface_name.clone(),
+    };
+
+    #[cfg(all(
+        feature = "unsafe-state-file",
+        any(target_os = "macos", target_os = "windows")
+    ))]
+    crate::store_intermediate_state(&state)?;
+    #[cfg(feature = "secure-state-file")]
+    crate::store_secure_state(&state)?;
+
+    // Persist the original network settings before the first route or DNS mutation.
     // sudo sysctl -w net.inet.ip.forwarding=1
     run_command("sysctl", &["-w", "net.inet.ip.forwarding=1"])?;
 
@@ -86,16 +118,6 @@ pub(crate) async fn _tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<T
     run_command("route", args)?;
     // */
 
-    let default_service_dns = match get_dns_servers(&service_id) {
-        Ok(servers) => servers,
-        Err(msg) => {
-            log::error!("failed to get DNS servers of default interface: {msg}");
-            None
-        }
-    };
-
-    let restore_resolvconf_content = Some(std::fs::read(ETC_RESOLV_CONF_FILE)?);
-
     // 5. Set the DNS server to the gateway of the interface
     {
         // Command: `sudo sh -c "echo nameserver 10.0.0.1 > /etc/resolv.conf"`
@@ -110,27 +132,6 @@ pub(crate) async fn _tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<T
         let orig_iface_name = orig_iface_name.as_deref().unwrap_or("");
         configure_dns_servers(orig_iface_name, &service_id, &[tproxy_args.tun_gateway])?;
     }
-
-    let state = TproxyStateInner {
-        tproxy_args: Some(tproxy_args.clone()),
-        original_dns_servers: None,
-        gateway: Some(original_gateway_0),
-        gw_scope: Some(orig_gw_iface),
-        umount_resolvconf: false,
-        restore_resolvconf_content,
-        tproxy_removed_done: false,
-        default_service_id: Some(service_id),
-        default_service_dns,
-        orig_iface_name,
-    };
-
-    #[cfg(all(
-        feature = "unsafe-state-file",
-        any(target_os = "macos", target_os = "windows")
-    ))]
-    crate::store_intermediate_state(&state)?;
-    #[cfg(feature = "secure-state-file")]
-    crate::store_secure_state(&state)?;
 
     Ok(state)
 }

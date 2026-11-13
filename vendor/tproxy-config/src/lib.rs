@@ -63,7 +63,10 @@ pub(crate) fn run_command(command: &str, args: &[&str]) -> std::io::Result<Vec<u
         Ok(out) => out,
         Err(e) => {
             log::trace!("Run command: \"{full_cmd}\" failed with: {e}");
-            return Err(e);
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("start command {full_cmd}: {e}"),
+            ));
         }
     };
     if !out.status.success() {
@@ -334,7 +337,12 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 fn read_secure_record(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
 
-    let metadata = std::fs::symlink_metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("read recovery record {}: {error}", path.display()),
+        )
+    })?;
     if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -363,6 +371,15 @@ fn read_secure_record(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 #[cfg(all(test, feature = "secure-state-file"))]
 mod secure_record_tests {
     use super::*;
+
+    #[test]
+    fn missing_recovery_record_error_identifies_the_path() {
+        let path =
+            std::env::temp_dir().join(format!("helios-missing-record-{}.json", std::process::id()));
+        let error = read_secure_record(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
