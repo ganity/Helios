@@ -277,15 +277,26 @@ mod tests {
             tproxy_config::tproxy_remove(None).await.unwrap();
         }
         server.abort();
-        let after = match own_tun.as_deref() {
-            Some(tun) => tproxy_config::macos_uplink_snapshot_with_tun(false, tun),
-            None => tproxy_config::macos_uplink_snapshot(false),
-        };
-        assert!(
-            after.is_ok(),
-            "uplink snapshot failed: {after:?}; ready: {ready:?}; stopped: {stopped:?}"
-        );
-        let after = after.unwrap();
+        if let Some(tun) = &own_tun {
+            for _ in 0..30 {
+                let exists = std::process::Command::new("/sbin/ifconfig")
+                    .arg(tun)
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !exists {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(
+                !std::process::Command::new("/sbin/ifconfig")
+                    .arg(tun)
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "TUN interface {tun} did not close"
+            );
+        }
+        let after = tproxy_config::macos_uplink_snapshot(false).unwrap();
         assert_eq!(before, after, "physical uplink and DNS must be restored");
         assert!(!lease.exists());
         fs::remove_dir(directory).unwrap();

@@ -20,9 +20,6 @@ pub use {private_ip::is_private_ip, tproxy_args::TproxyArgs};
 pub use cidr::IpCidr;
 #[cfg(target_os = "macos")]
 pub use macos::uplink_snapshot as macos_uplink_snapshot;
-#[cfg(target_os = "macos")]
-#[doc(hidden)]
-pub use macos::uplink_snapshot_with_tun as macos_uplink_snapshot_with_tun;
 
 #[cfg(target_os = "linux")]
 pub use linux::resolver::check_resolver as check_linux_resolver;
