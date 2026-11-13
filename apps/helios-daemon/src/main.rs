@@ -782,8 +782,7 @@ async fn run_socks_listener(
                 let remote = runtime.remote().await;
                 tokio::spawn(async move {
                     if let Err(error) = serve_socks(stream, remote, handshake_seconds, udp_idle_seconds).await {
-                        warn!(event = "socks_flow_failed");
-                        debug!(event = "socks_flow_error", error = %error);
+                        warn!(event = "socks_flow_failed", error = %error);
                     }
                 });
             }

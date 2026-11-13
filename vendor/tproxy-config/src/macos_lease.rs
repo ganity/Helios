@@ -214,12 +214,14 @@ pub(crate) fn apply(
             lease.routes.push(route.clone());
             network.save(lease)?;
             network.add(&route)?;
-            if !network
-                .route(&route)?
+            let current = network.route(&route)?;
+            if !current
                 .as_ref()
                 .is_some_and(|current| route.matches(current))
             {
-                return Err(io::Error::other("TUN route was not installed as requested"));
+                return Err(io::Error::other(format!(
+                    "TUN route was not installed as requested: expected {route:?}, found {current:?}"
+                )));
             }
         }
         lease.dns = Some(dns);
