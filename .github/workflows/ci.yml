@@ -135,7 +135,11 @@ jobs:
         run: cargo test -p helios-transport
       - run: cargo test -p helios-client
       - name: Restore the normal daemon after a recovered macOS TUN failure
-        run: cargo test -p helios-client failed_tun_restores_normal_daemon_only_after_network_cleanup -- --ignored
+        run: |
+          # This isolated test writes the service status marker, without starting TUN.
+          sudo install -d -m 0755 -o "$(id -u)" /var/run/helios
+          trap 'sudo rmdir /var/run/helios' EXIT
+          cargo test -p helios-client failed_tun_restores_normal_daemon_only_after_network_cleanup -- --ignored
       - run: cargo test -p helios-config
       - run: cargo test -p tproxy-config --features secure-state-file recovery_record_
       - run: cargo clippy -p helios-daemon -p helios-client -p helios-helper -p heliosctl --all-targets -- -D warnings

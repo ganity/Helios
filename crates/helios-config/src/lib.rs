@@ -230,7 +230,7 @@ pub struct OutboundConfig {
     pub dns_servers: Vec<SocketAddr>,
 }
 
-/// Bounded, path-free request passed through pkexec's stdin. Never contains root file paths.
+/// Bounded, path-free request for the desktop helper. Never contains root file paths.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopTunRequest {
@@ -249,6 +249,26 @@ pub struct DesktopTunRequest {
 pub struct TunDaemonInfo {
     pub pid: u32,
     pub outbound: OutboundConfig,
+}
+
+pub const MACOS_TUN_SOCKET: &str = "/var/run/helios/tun.sock";
+pub const MACOS_TUN_STATUS: &str = "/var/run/helios/tun.status";
+pub const MACOS_TUN_SERVICE: &str = "/Library/Application Support/Helios/service/helios-helper";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TunServiceRequest {
+    Ping {},
+    Start { config: DesktopTunRequest },
+    Recover {},
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TunServiceReply {
+    Available { digest: String },
+    Ready,
+    Ended { error: Option<String> },
 }
 
 impl OutboundConfig {

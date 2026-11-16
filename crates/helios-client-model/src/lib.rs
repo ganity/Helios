@@ -656,6 +656,8 @@ pub fn default_control_socket() -> Option<PathBuf> {
 pub fn tun_status_file() -> PathBuf {
     if cfg!(target_os = "linux") {
         PathBuf::from("/run/helios/tun.status")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(helios_config::MACOS_TUN_STATUS)
     } else {
         default_state_dir().join("helios-helper.status")
     }

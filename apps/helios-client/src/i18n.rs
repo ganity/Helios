@@ -502,6 +502,12 @@ const TEXT: &[(&str, &str)] = &[
     ),
     ("启动虚拟网卡失败：{error}", "Failed to start TUN: {error}"),
     ("正在关闭虚拟网卡", "Stopping TUN"),
+    ("正在开启虚拟网卡", "Starting TUN"),
+    ("正在恢复网络", "Restoring network"),
+    (
+        "首次开启或组件更新时授权安装，后续启停无需密码",
+        "Authorize installation on first use or component updates; no password for subsequent starts and stops",
+    ),
     ("关闭虚拟网卡失败：{error}", "Failed to stop TUN: {error}"),
     (
         "节点配置有误，请先检查地址和凭据",

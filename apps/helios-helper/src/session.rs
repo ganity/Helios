@@ -184,6 +184,43 @@ pub(super) async fn probe_tun_dns() -> Result<(), AnyError> {
     Ok(())
 }
 
+pub(super) async fn check_daemon(
+    request: &helios_config::DesktopTunRequest,
+) -> Result<(), AnyError> {
+    let mut stream = tokio::net::TcpStream::connect(request.socks_listen).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting != [5, 0] {
+        return Err("daemon refused TUN handshake".into());
+    }
+    stream
+        .write_all(&[5, 1, 0, 1, 198, 18, 0, 0, 0, 54])
+        .await?;
+    let mut reply = [0; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[..3] != [5, 0, 0] {
+        return Err("daemon does not support the TUN configuration handshake".into());
+    }
+    let size = match reply[3] {
+        1 => 4,
+        4 => 16,
+        _ => return Err("invalid TUN handshake response".into()),
+    };
+    stream.read_exact(&mut vec![0; size + 2]).await?;
+    let length = stream.read_u32().await? as usize;
+    if length > 4096 {
+        return Err("oversized daemon handshake".into());
+    }
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await?;
+    let info: helios_config::TunDaemonInfo = serde_json::from_slice(&bytes)?;
+    if info.pid != request.daemon_pid || info.outbound != request.outbound {
+        return Err("helper and daemon uplink/DNS configurations disagree".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

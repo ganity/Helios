@@ -157,16 +157,25 @@ Policy
 
 阶段 6 原型用基准选择，不预先承诺。开发环境中可用普通 TUN 做算法验证，但不能把它当成正式分发方案。
 
-当前桌面版仍使用独立提权 helper 和 utun；NetworkExtension 是后续正式分发方案。当前实现的安全边界：
+macOS 桌面版使用 launchd 管理的独立 root helper 和 utun，兼容 macOS 12；NetworkExtension 是后续正式分发方案。首次开启 TUN 时，界面请求一次管理员授权，将当前 helper 复制到 root 私有目录并安装 LaunchDaemon；helper 或客户端更新后再次授权更新。后续启停及失败恢复通过 Unix socket 完成，不再重复弹管理员密码框，也不保存密码或设置 setuid。当前实现的安全边界：
 
 - 保留系统 IPv4/IPv6 默认路由，只添加 Helios 标记的 `/1` 分段路由；关闭时核对前缀、接口、网关和标记，只撤销本次改动。IPv6 bypass 使用 IPv6 网关及接口作用域。
 - 每次路由或 DNS 改动前持久化恢复意图；启动失败和运行结束都等待恢复完成。清理逐项执行，失败项留在受保护的恢复记录中，下次可重试；不覆盖尚未恢复的旧记录。
 - DNS 保存网络服务的手工设置；原先使用 DHCP 时恢复自动获取。不会重写 `/etc/resolv.conf`，恢复后清理系统 DNS 缓存。用户或其他软件更改过的路由/DNS 会报告冲突并保留。
 - 复用 daemon 的 `[outbound]` 与共享双栈 Fake-IP DNS；TCP、QUIC、直连 UDP 和真实 DNS 出站绑定物理接口（`IP_BOUND_IF` / `IPV6_BOUND_IF`），避免再次进入 TUN。
-- 只有真实 TUN DNS 探测通过后界面才显示开启。停止、SIGINT/SIGTERM 和检测到桌面进程退出时先恢复网络；强杀 helper 的恢复依赖持久化记录及下一次手动授权。
+- socket 仅允许安装时指定的桌面用户访问，并核对 peer UID/PID 和已授权客户端可执行文件的 SHA-256；目前每台 Mac 仅支持一个安装用户，切换用户需要重新授权安装。服务只接受有大小限制的结构化请求，不接受 shell 命令或 root 文件路径；启动时还核对 daemon UID 和绑定出口握手。
+- 每次连接使用独立 worker，服务保持 socket 连接作为会话凭据；关闭窗口、退出程序或停止请求造成 EOF，worker 先恢复网络再结束。worker 异常退出后由 root 服务根据受保护的记录恢复；服务重启也会先恢复旧记录。恢复冲突会保留记录并报告错误。
+- 只有真实 TUN DNS 探测通过后界面才显示开启。界面与托盘共用开启中、关闭中、恢复中、连接中、节点不可用和状态未知的判定，清理完成后才恢复普通 daemon。
 - 已存在其他 VPN 的非局部 utun 路由时拒绝启动。系统代理与 TUN 互斥，失败请求不会因状态轮询而反复请求管理员授权。
 
 Linux 上的故障注入测试覆盖逐项设置/持久化失败、丢失回执、清理重试、手工/DHCP DNS、外部改动、分段路由冲突及 macOS 输出解析。macOS CI 另执行原生只读路由/DNS查询、绑定 socket 测试及 ARM64/Intel 编译。交叉静态检查通过不代表已完成 Mac 真机 TUN 启停验收；升级后仍需验证正常退出、取消授权、网络切换和异常退出后的恢复。
+
+macOS 服务文件及排查位置：
+
+- 服务：`/Library/LaunchDaemons/net.helios.tun.plist`；安装后的 helper：`/Library/Application Support/Helios/service/helios-helper`。
+- socket / 心跳：`/var/run/helios/tun.sock`、`/var/run/helios/tun.status`；日志：`/Library/Logs/Helios/helper.log`。
+- 路由/DNS 恢复记录继续保存在 `/Library/Application Support/Helios/tun-route-lease.json`。安装时先处理旧恢复记录；旧用户目录中的状态标记不再作为新服务的判断依据，也不由 root 服务删除。节点与规则配置保持原样。
+- 关闭 TUN 后可在终端卸载服务：`sudo "/Library/Application Support/Helios/service/helios-helper" --uninstall-service`。有活动会话时拒绝卸载；恢复失败时保留服务与恢复记录。
 
 ## 8. Tunnel Lease
 
@@ -207,7 +216,7 @@ created_at
 
 ## 10. 同时启用 System Proxy 与 TUN
 
-默认互斥。TUN 已能接管大部分系统流量，再启用 System Proxy 可能让支持代理的应用经过两次入口。桌面请求停止 TUN 后不会立即启用系统代理；helper 确认离线后用户重试。若 helper 心跳已陈旧，则先请求授权恢复路由，恢复完成后用户再启用系统代理。
+默认互斥。TUN 已能接管大部分系统流量，再启用 System Proxy 可能让支持代理的应用经过两次入口。桌面请求停止 TUN 后不会立即启用系统代理；helper 确认离线后用户重试。若 helper 心跳已陈旧，则先请求恢复路由，恢复完成后用户再启用系统代理；macOS 使用已安装的服务恢复，不再打开授权弹窗。
 
 高级模式允许同时启用时，必须确保：
 

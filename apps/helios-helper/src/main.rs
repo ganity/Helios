@@ -14,6 +14,8 @@ use tproxy_config::tproxy_remove;
 use tun2proxy::general_run_async;
 use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken};
 
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+mod macos_service;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod session;
 
@@ -208,6 +210,14 @@ async fn main() -> Result<(), AnyError> {
 async fn run_helper() -> Result<(), AnyError> {
     tracing::info!(event = "tun_helper_started");
     let values: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    if values.first().is_some_and(|arg| {
+        arg.to_string_lossy().starts_with("--service")
+            || arg == "--install-service"
+            || arg == "--uninstall-service"
+    }) {
+        return macos_service::command(&values).await;
+    }
     #[cfg(target_os = "linux")]
     {
         if values
@@ -223,6 +233,10 @@ async fn run_helper() -> Result<(), AnyError> {
     let (recover, path) = parse_command(&values)?;
     let config = HelperConfig::load(&path)
         .map_err(|error| format!("load helper config {}: {error}", path.display()))?;
+    run_config(config, recover, false).await
+}
+
+async fn run_config(config: HelperConfig, recover: bool, service: bool) -> Result<(), AnyError> {
     #[cfg(unix)]
     let _instance_lock = lock_helper_instance()?;
     configure_route_state()?;
@@ -256,10 +270,19 @@ async fn run_helper() -> Result<(), AnyError> {
             result = &mut run => result,
             ready = rx => {
                 if ready.is_ok() {
-                    let mut status = &status_file;
-                    use std::io::{Seek, SeekFrom};
-                    if let Err(error) = status.seek(SeekFrom::Start(0)).and_then(|_| status.write_all(format!("ready:{}", std::process::id()).as_bytes())).and_then(|_|status.sync_all()) {
-                        shutdown.cancel(); let _ = run.await; return Err(error);
+                    let notify = || -> Result<(), AnyError> {
+                        use std::io::{Seek, SeekFrom};
+                        let mut status = &status_file;
+                        status.seek(SeekFrom::Start(0))?;
+                        status.write_all(format!("ready:{}", std::process::id()).as_bytes())?;
+                        status.sync_all()?;
+                        if service { macos_service::reply(&helios_config::TunServiceReply::Ready)?; }
+                        Ok(())
+                    };
+                    if let Err(error) = notify() {
+                        shutdown.cancel();
+                        let _ = run.await;
+                        return Err(std::io::Error::other(error));
                     }
                 }
                 run.await
@@ -270,6 +293,14 @@ async fn run_helper() -> Result<(), AnyError> {
     let run = general_run_async(args, config.mtu, false, shutdown.clone());
     tokio::pin!(run);
 
+    let service_lifetime = async {
+        if service {
+            use tokio::io::AsyncReadExt;
+            let _ = tokio::io::stdin().read_u8().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     let result: Result<(), AnyError> = tokio::select! {
         result = &mut run => {
             result.map(|_| ()).map_err(Into::into)
@@ -280,6 +311,11 @@ async fn run_helper() -> Result<(), AnyError> {
             let result = run.await;
             signal?;
             result.map(|_| ()).map_err(Into::into)
+        }
+        _ = service_lifetime => {
+            tracing::info!(event = "tun_stop_requested", reason = "service_connection_closed");
+            shutdown.cancel();
+            run.await.map(|_| ()).map_err(Into::into)
         }
         owner = wait_for_desktop(config.desktop_pid) => {
             tracing::info!(event = "tun_stop_requested", reason = "desktop_owner_disconnected");

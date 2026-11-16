@@ -44,7 +44,7 @@ mod linux_tray;
 #[path = "tray_display.rs"]
 mod tray_display;
 use crate::i18n::{self, t};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 use helios_client_model::tun_stop_file;
 use helios_client_model::{
     DesktopProfile, Language, NodeProfile, RoutingMode, action_name, default_control_socket,
@@ -274,6 +274,7 @@ struct HeliosApp {
     page: Page,
     diagnostic_tab: DiagnosticTab,
     connecting_since: Option<Instant>,
+    tun_recovering: bool,
     profile_path: PathBuf,
     profile: DesktopProfile,
     rule_text: String,
@@ -373,6 +374,7 @@ impl HeliosApp {
             page: Page::Overview,
             diagnostic_tab: DiagnosticTab::Connections,
             connecting_since: None,
+            tun_recovering: false,
             profile_path,
             profile,
             rule_text,
@@ -515,6 +517,7 @@ impl HeliosApp {
                     #[cfg(target_os = "macos")]
                     if result.is_err() && tun_needs_recovery() && !self.exit_after_tun {
                         self.notice = Some(("TUN 已停止，正在恢复系统路由和 DNS".into(), true));
+                        self.tun_recovering = true;
                         desktop_tun::recover(&self.profile, self.event_tx.clone());
                         continue;
                     }
@@ -534,6 +537,7 @@ impl HeliosApp {
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Event::TunRecovered(result) => {
+                    self.tun_recovering = false;
                     #[cfg(target_os = "macos")]
                     if result.is_ok()
                         && !self.exit_after_tun
@@ -989,6 +993,9 @@ impl HeliosApp {
     }
 
     fn toggle_connection(&mut self) {
+        if self.tun_recovering {
+            return;
+        }
         if self.tun_enabled || self.tun_transition_pending() {
             self.stop_daemon();
             return;
@@ -1244,6 +1251,9 @@ impl HeliosApp {
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn set_system_proxy(&mut self, enabled: bool) {
+        if self.tun_recovering {
+            return;
+        }
         if enabled {
             // Consume the request before TUN recovery or authorization can fail. Status polls
             // must not turn a cancelled/blocked request into another administrator prompt.
@@ -1258,14 +1268,15 @@ impl HeliosApp {
         }
         #[cfg(target_os = "macos")]
         if enabled && status_is_fresh(&tun_status_file()) {
-            self.notice = Some(match write_atomic(&tun_stop_file(), b"stop") {
-                Ok(()) => ("正在关闭上次的虚拟网卡，完成后可开启系统代理".into(), true),
-                Err(error) => (error.to_string(), false),
-            });
+            self.notice = Some((
+                "另一个 Helios 窗口正在使用虚拟网卡，请先在该窗口关闭".into(),
+                false,
+            ));
             return;
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if enabled && tun_needs_recovery() {
+            self.tun_recovering = true;
             desktop_tun::recover(&self.profile, self.event_tx.clone());
             self.notice = Some(("正在恢复上次的虚拟网卡网络设置".into(), true));
             return;
@@ -1334,19 +1345,21 @@ impl HeliosApp {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn start_tun(&mut self) {
-        if self.desktop_tun.is_some() || !self.startup_checked {
+        if self.desktop_tun.is_some() || self.tun_recovering || !self.startup_checked {
             return;
         }
         #[cfg(target_os = "macos")]
         if status_is_fresh(&tun_status_file()) {
-            self.notice = Some(match write_atomic(&tun_stop_file(), b"stop") {
-                Ok(()) => ("正在关闭上次的虚拟网卡，完成后可重新开启".into(), true),
-                Err(error) => (error.to_string(), false),
-            });
+            self.notice = Some((
+                "另一个 Helios 窗口正在使用虚拟网卡，请先在该窗口关闭".into(),
+                false,
+            ));
             return;
         }
+        #[cfg(target_os = "linux")]
         if tun_needs_recovery() {
-            self.notice = Some(("正在请求授权并恢复上次的网络设置".into(), true));
+            self.notice = Some(("正在恢复上次的网络设置".into(), true));
+            self.tun_recovering = true;
             desktop_tun::recover(&self.profile, self.event_tx.clone());
             return;
         }
@@ -1365,7 +1378,10 @@ impl HeliosApp {
         let id = self.tun_serial;
         self.desktop_tun = Some(TunSession::new(id));
         self.notice = Some(("正在检查虚拟网卡出口和 DNS".into(), true));
+        #[cfg(target_os = "linux")]
         desktop_tun::prepare(id, self.profile.tun_ipv6_enabled, self.event_tx.clone());
+        #[cfg(target_os = "macos")]
+        desktop_tun::prepare(id, &self.profile, self.event_tx.clone());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1398,7 +1414,14 @@ impl HeliosApp {
         let session = session.expect("TUN preparation has a live session");
         let cancel = session.cancel.clone();
         self.desktop_tun = Some(session);
-        self.notice = Some(("请在系统提示中授权虚拟网卡，随后执行网络自检".into(), true));
+        #[cfg(target_os = "linux")]
+        {
+            self.notice = Some(("请在系统提示中授权虚拟网卡，随后执行网络自检".into(), true));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.notice = Some(("正在启动虚拟网卡并检查网络".into(), true));
+        }
         desktop_tun::launch(id, self.profile.clone(), cancel, self.event_tx.clone());
     }
 
@@ -1672,15 +1695,8 @@ impl HeliosApp {
     #[cfg(target_os = "macos")]
     fn update_tray_traffic(&self) {
         if let Some(tray) = &self._tray {
-            let proxy = self.system_proxy_enabled && self.system_proxy_verified;
-            let connected =
-                tray_connection_active(proxy, self.tun_enabled, self.connecting_since.is_some());
-            tray_display::update(tray, connected, self.upload_rate, self.download_rate);
-            let (label, _) = connection_label(
-                self.status.as_ref(),
-                proxy || self.tun_enabled,
-                self.connecting_since.is_some(),
-            );
+            let (label, color) = self.connection_presentation();
+            tray_display::update(tray, color == GOOD, self.upload_rate, self.download_rate);
             let _ = tray.set_tooltip(Some(format!("{} · {label}", t("Helios · 曜光"))));
         }
     }
@@ -1847,15 +1863,59 @@ impl HeliosApp {
                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
     }
 
+    fn connection_pending(&self) -> bool {
+        if self.connecting_since.is_some() || self.tun_recovering {
+            return true;
+        }
+        let active = (self.system_proxy_enabled && self.system_proxy_verified) || self.tun_enabled;
+        if active
+            && !self.status_is_stale()
+            && self
+                .status
+                .as_ref()
+                .is_none_or(|status| status.state == ConnectionState::Unknown)
+        {
+            return true;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self
+            .desktop_tun
+            .as_ref()
+            .is_some_and(|session| session.stopping || !self.tun_enabled)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn connection_presentation(&self) -> (&'static str, Color32) {
+        if self.tun_recovering {
+            return (t("正在恢复网络"), WARN);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(session) = &self.desktop_tun {
+            if session.stopping {
+                return (t("正在关闭虚拟网卡"), WARN);
+            }
+            if !self.tun_enabled {
+                return (t("正在开启虚拟网卡"), WARN);
+            }
+        }
+        if self.status_is_stale() && !self.connection_pending() {
+            return (t("状态未知"), WARN);
+        }
+        connection_label(
+            self.status.as_ref(),
+            (self.system_proxy_enabled && self.system_proxy_verified) || self.tun_enabled,
+            self.connection_pending(),
+        )
+    }
+
     fn overview(&mut self, ui: &mut egui::Ui) {
         let connected = self.system_proxy_enabled && self.system_proxy_verified;
-        let pending = self.connecting_since.is_some();
-        let stale = self.status_is_stale();
-        let (label, color) = if stale && !pending {
-            (t("状态未知"), WARN)
-        } else {
-            connection_label(self.status.as_ref(), connected || self.tun_enabled, pending)
-        };
+        let pending = self.connection_pending();
+        let stale = self.status_is_stale() && !pending;
+        let (label, color) = self.connection_presentation();
         let hero_width = ui.available_width();
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -1871,8 +1931,10 @@ impl HeliosApp {
                                 "STATUS UNKNOWN"
                             } else if pending {
                                 "CONNECTING"
-                            } else if connected || self.tun_enabled {
+                            } else if color == GOOD {
                                 "CONNECTION ACTIVE"
+                            } else if color == BAD {
+                                "CONNECTION UNAVAILABLE"
                             } else {
                                 "CONNECTION IDLE"
                             })
@@ -1886,12 +1948,12 @@ impl HeliosApp {
                     ui.label(
                         RichText::new(if stale {
                             t("无法确认当前连接状态")
+                        } else if pending {
+                            label
                         } else if self.tun_enabled {
                             t("虚拟网卡已开启")
                         } else if connected {
                             t("系统代理已开启")
-                        } else if pending {
-                            t("正在连接节点")
                         } else {
                             t("系统代理未开启")
                         })
@@ -2764,7 +2826,13 @@ impl HeliosApp {
                     #[cfg(not(target_os = "linux"))]
                     {
                         path_field(ui, t("虚拟网卡辅助程序"), &mut self.profile.helper_binary);
+                        #[cfg(not(target_os = "macos"))]
                         path_field(ui, t("虚拟网卡配置文件"), &mut self.profile.helper_config);
+                        #[cfg(target_os = "macos")]
+                        ui.label(
+                            RichText::new(t("首次开启或组件更新时授权安装，后续启停无需密码"))
+                                .color(MUTED),
+                        );
                     }
                     #[cfg(target_os = "linux")]
                     ui.label("Linux TUN：/usr/libexec/helios-helper（系统安装组件）");
@@ -3173,7 +3241,7 @@ impl HeliosApp {
 
 impl Drop for HeliosApp {
     fn drop(&mut self) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         if self.exit_requested && self.tun_enabled {
             let _ = write_atomic(&tun_stop_file(), b"stop");
         }
@@ -3337,7 +3405,7 @@ fn action_color(action: RouteAction) -> Color32 {
     }
 }
 
-#[cfg(any(test, windows, target_os = "macos"))]
+#[cfg(any(windows, all(test, not(target_os = "macos"))))]
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AnyError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -3529,37 +3597,6 @@ fn launch_helper_elevated(binary: &Path, config: &Path, recover: bool) -> Result
     }
 }
 
-#[cfg(target_os = "macos")]
-fn launch_helper_elevated(binary: &Path, config: &Path, recover: bool) -> Result<(), AnyError> {
-    let script = r#"on run argv
-set helperArgs to ""
-repeat with i from 2 to count of argv
-set helperArgs to helperArgs & " " & quoted form of item i of argv
-end repeat
-set helperCommand to quoted form of item 1 of argv & helperArgs
-if item 2 of argv is "--recover" then
-do shell script helperCommand with administrator privileges
-else
-do shell script (helperCommand & " >/dev/null 2>&1 &") with administrator privileges
-end if
-end run"#;
-    let mut command = Command::new("osascript");
-    command.arg("-e").arg(script).arg(binary);
-    if recover {
-        command.arg("--recover");
-    }
-    let output = command.arg(config).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "TUN helper: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into())
-    }
-}
-
 fn configure_style(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     if let Some(font) = chinese_font() {
@@ -3638,11 +3675,6 @@ fn connection_label(
     } else {
         (t("未连接"), MUTED)
     }
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn tray_connection_active(proxy: bool, tun: bool, connecting: bool) -> bool {
-    (proxy || tun) && !connecting
 }
 
 fn page_label(page: Page) -> &'static str {
@@ -4208,7 +4240,7 @@ mod tests {
             !status.exists(),
             "the test must not share an active TUN session"
         );
-        for (pending, exiting) in [(false, false), (true, false), (false, true)] {
+        for (pending, exiting) in [(false, false), (false, true)] {
             if pending {
                 std::fs::write(&status, "pending recovery").unwrap();
             }
@@ -4332,6 +4364,48 @@ mod tests {
             assert!(!app.recovering_connection);
             assert_eq!(app.notice, notice);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tun_transition_state_overrides_stale_status_and_ready_requires_healthy_node() {
+        let mut app = preview_app();
+        app.status_error = Some("old daemon stopped".into());
+        app.last_status_success = None;
+        app.desktop_tun = Some(TunSession::new(1));
+        assert!(app.connection_pending());
+        assert_eq!(app.connection_presentation(), (t("正在开启虚拟网卡"), WARN));
+        app.tun_enabled = true;
+        assert!(!app.connection_pending());
+        assert_eq!(app.connection_presentation(), (t("状态未知"), WARN));
+        app.status_error = None;
+        app.status = Some(serde_json::from_value(serde_json::json!({
+            "state": "connected", "transport": "tls", "quic_rtt_micros": null, "tls_rtt_micros": 100,
+            "active_flows": 0, "uploaded_bytes": 0, "downloaded_bytes": 0, "udp_dropped_packets": 0
+        })).unwrap());
+        app.status.as_mut().unwrap().state = ConnectionState::Unknown;
+        assert!(app.connection_pending());
+        assert_eq!(app.connection_presentation(), (t("连接中"), WARN));
+        app.status.as_mut().unwrap().state = ConnectionState::Connected;
+        assert_eq!(app.connection_presentation(), (t("已连接"), GOOD));
+        app.status.as_mut().unwrap().state = ConnectionState::Unavailable;
+        assert_eq!(app.connection_presentation(), (t("节点暂不可用"), BAD));
+        app.desktop_tun.as_mut().unwrap().stop();
+        assert!(app.connection_pending());
+        assert_eq!(app.connection_presentation(), (t("正在关闭虚拟网卡"), WARN));
+        app.desktop_tun = None;
+        app.tun_enabled = false;
+        app.tun_recovering = true;
+        assert_eq!(app.connection_presentation(), (t("正在恢复网络"), WARN));
+        app.set_system_proxy(true);
+        assert!(!app.system_proxy_enabled);
+        assert!(app.connecting_since.is_none());
+        app.event_tx
+            .send(Event::TunRecovered(Err("test failure".into())))
+            .unwrap();
+        app.poll_events(&egui::Context::default());
+        assert!(!app.tun_recovering);
+        assert!(!app.connection_pending());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4894,7 +4968,7 @@ mod tests {
         assert_eq!(connection_label(Some(&status), false, true).0, t("连接中"));
         status.state = ConnectionState::Unavailable;
         assert!(!node_ready(&status));
-        assert!(tray_connection_active(true, false, false));
+        // Node readiness, rather than the proxy switch alone, controls the active indicator.
         assert_eq!(
             connection_label(Some(&status), true, false).0,
             t("节点暂不可用")
