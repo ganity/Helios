@@ -43,6 +43,19 @@ pub extern "system" fn Java_com_helios_mobile_MainActivity_nativeOpenLink<'local
 static PROTECTOR: std::sync::Mutex<std::sync::Weak<VpnProtector>> =
     std::sync::Mutex::new(std::sync::Weak::new());
 
+pub async fn resolve_node(
+    node: &helios_config::NodeAddresses,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let protector = PROTECTOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .upgrade();
+    match protector {
+        Some(protector) => crate::tunnel::Connector::resolve(protector.as_ref(), node).await,
+        None => helios_mobile_core::resolve_node(node).await,
+    }
+}
+
 pub async fn probe_udp(ipv6: bool) -> io::Result<tokio::net::UdpSocket> {
     let protector = PROTECTOR
         .lock()
@@ -177,7 +190,7 @@ pub fn request_disconnect() -> io::Result<()> {
 
 pub struct VpnProtector {
     vm: JavaVM,
-    service: Global<JObject<'static>>,
+    service: Arc<Global<JObject<'static>>>,
 }
 
 #[derive(Debug)]
@@ -198,15 +211,20 @@ impl VpnProtector {
     fn stopping(&self) -> io::Result<bool> {
         self.vm
             .attach_current_thread(|env| {
-                env.call_method(&self.service, jni_str!("isStopping"), jni_sig!("()Z"), &[])?
-                    .z()
+                env.call_method(
+                    self.service.as_ref(),
+                    jni_str!("isStopping"),
+                    jni_sig!("()Z"),
+                    &[],
+                )?
+                .z()
             })
             .map_err(io::Error::other)
     }
     pub fn new(env: &Env<'_>, service: &JObject<'_>) -> jni::errors::Result<Self> {
         Ok(Self {
             vm: env.get_java_vm()?,
-            service: env.new_global_ref(service)?,
+            service: Arc::new(env.new_global_ref(service)?),
         })
     }
 
@@ -215,7 +233,7 @@ impl VpnProtector {
             .vm
             .attach_current_thread(|env| {
                 env.call_method(
-                    &self.service,
+                    self.service.as_ref(),
                     jni_str!("protect"),
                     jni_sig!("(I)Z"),
                     &[JValue::Int(fd)],
@@ -281,7 +299,7 @@ pub extern "system" fn Java_com_helios_mobile_HeliosVpnService_nativeRun<'local>
                 let preflight = async {
                     tunnel
                         .session
-                        .check(protector.as_ref(), tunnel.node, Duration::from_secs(10))
+                        .check_node(protector.as_ref(), &tunnel.node, Duration::from_secs(10))
                         .await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 };
@@ -296,7 +314,7 @@ pub extern "system" fn Java_com_helios_mobile_HeliosVpnService_nativeRun<'local>
                 }
                 protector.vm.attach_current_thread(|env| {
                     env.call_method(
-                        &protector.service,
+                        protector.service.as_ref(),
                         jni_str!("connected"),
                         jni_sig!("()V"),
                         &[],
@@ -325,6 +343,52 @@ pub extern "system" fn Java_com_helios_mobile_HeliosVpnService_nativeRun<'local>
 }
 
 impl crate::tunnel::Connector for VpnProtector {
+    fn resolve<'a>(
+        &'a self,
+        node: &'a helios_config::NodeAddresses,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(helios_mobile_core::resolve_node_with(node, |target| {
+            let vm = self.vm.clone();
+            let service = self.service.clone();
+            async move {
+                let helios_mobile_core::NodeHost::Domain(host) = target.address else {
+                    unreachable!()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    vm.attach_current_thread(|env| -> jni::errors::Result<String> {
+                        let host = jni::objects::JString::from_str(env, &host)?;
+                        let result = env
+                            .call_method(
+                                service.as_ref(),
+                                jni_str!("resolveNode"),
+                                jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                                &[JValue::Object(&host)],
+                            )?
+                            .l()?;
+                        Ok(jni::objects::JString::cast_local(env, result)?.to_string())
+                    })
+                })
+                .await??;
+                let ips: Vec<std::net::IpAddr> =
+                    result.split(',').filter_map(|ip| ip.parse().ok()).collect();
+                if ips.is_empty() {
+                    return Err(io::Error::other(
+                        "physical network DNS returned no node addresses",
+                    )
+                    .into());
+                }
+                Ok(ips)
+            }
+        }))
+    }
+
     fn tcp(
         &self,
         address: SocketAddr,

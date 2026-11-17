@@ -79,6 +79,23 @@ fn selected_node(
 
 struct ProbeSockets;
 impl tunnel::Connector for ProbeSockets {
+    #[cfg(target_os = "android")]
+    fn resolve<'a>(
+        &'a self,
+        node: &'a helios_config::NodeAddresses,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Vec<std::net::SocketAddr>,
+                        Box<dyn std::error::Error + Send + Sync>,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(android::resolve_node(node))
+    }
     fn tcp(
         &self,
         address: std::net::SocketAddr,
@@ -123,7 +140,7 @@ async fn probe_node(node: helios_client_model::NodeProfile) -> Result<String, St
         .map_err(|e| format!("服务器地址无效：{e}"))?;
     session::Session::from_node(&node)
         .map_err(|e| e.to_string())?
-        .check(&ProbeSockets, address, std::time::Duration::from_secs(10))
+        .check_node(&ProbeSockets, &address, std::time::Duration::from_secs(10))
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
@@ -464,7 +481,7 @@ pub fn App() -> impl IntoElement {
                         .text_color(move || theme().foreground),
                 )
                 .child(field("节点名称", edit_name))
-                .child(field("服务器地址（IPv6 使用 [地址]:端口）", edit_server))
+                .child(field("入口地址（域名、IPv4、[IPv6]:端口；多个用逗号分隔）", edit_server))
                 .child(field("证书名称（应与导入证书匹配）", edit_identity))
                 .child(field("凭据标识", edit_credential))
                 .child(setting_toggle("优先 QUIC（失败时回退 TLS）", edit_quic))

@@ -6,6 +6,10 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.net.VpnService;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
@@ -28,6 +32,25 @@ public final class HeliosVpnService extends VpnService {
     private native void nativeRun(int fd, String nodeJson);
 
     // Called by the Rust worker through JNI; keep its name when minifying.
+    public String resolveNode(String host) {
+        ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+        for (android.net.Network network : manager.getAllNetworks()) {
+            NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+            if (capabilities == null || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue;
+            try {
+                InetAddress[] addresses = network.getAllByName(host);
+                StringBuilder result = new StringBuilder();
+                for (InetAddress address : addresses) {
+                    if (result.length() != 0) result.append(',');
+                    result.append(address.getHostAddress());
+                }
+                if (result.length() != 0) return result.toString();
+            } catch (UnknownHostException ignored) { }
+        }
+        return "";
+    }
+
     public boolean isStopping() { return stopping; }
 
     @Override public synchronized int onStartCommand(Intent intent, int flags, int startId) {

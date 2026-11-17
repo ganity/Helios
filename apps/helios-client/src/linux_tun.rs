@@ -2,7 +2,7 @@
 use super::*;
 use helios_config::{DesktopTunRequest, OutboundConfig};
 use std::{
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     os::fd::AsFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     sync::{
@@ -106,12 +106,19 @@ fn launch_inner(
         .ok_or("missing Linux TUN outbound policy")?;
     let socks_listen = profile.socks_listen.parse()?;
     let info = run_async(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for _ in 0..80 {
             if cancel.load(Ordering::Relaxed) {
                 return Err("TUN start cancelled".into());
             }
-            if let Ok(Ok(info)) =
-                tokio::time::timeout(Duration::from_millis(500), daemon_info(socks_listen)).await
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(Ok(info)) = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(8)),
+                daemon_info(socks_listen),
+            )
+            .await
                 && info.outbound == outbound
             {
                 return Ok(info);
@@ -125,12 +132,11 @@ fn launch_inner(
     }
     let request = DesktopTunRequest {
         socks_listen,
-        server_ip: profile.active_node().config()?.server.ip(),
-        node_ips: profile
-            .nodes
-            .iter()
-            .map(|node| node.config().map(|node| node.server.ip()))
-            .collect::<Result<Vec<IpAddr>, _>>()?,
+        server_ip: *info
+            .server_ips
+            .first()
+            .ok_or("daemon has no usable node ingress")?,
+        node_ips: info.server_ips.clone(),
         mtu: profile.tun_mtu,
         ipv6_enabled: profile.tun_ipv6_enabled,
         outbound,

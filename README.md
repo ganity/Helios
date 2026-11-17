@@ -117,17 +117,19 @@ sudo journalctl -u helios-server -n 50 --no-pager
 
 ### 3. 生成客户端导入链接
 
-将示例地址 `203.0.113.10:443` 替换为 VPS 的实际公网 IP 和端口；IPv6 地址使用 `[地址]:端口` 格式。
+将示例地址替换为 VPS 的实际公网入口。支持域名、IPv4 和 `[IPv6]:端口`；同一节点有多个入口时，用逗号分隔并为整个参数加引号：
 
 ```sh
 sudo /usr/local/bin/helios-server client-link \
   --config /etc/helios/server.toml \
-  --address 203.0.113.10:443 \
+  --address "vpn.example.com:443, [2001:db8::10]:24443, 203.0.113.10:443" \
   --server-name "$(cat helios-identity/server-name.txt)" \
   --name "My VPS"
 ```
 
 命令验证证书身份后输出包含连接信息、受信证书和 token 的链接，将其通过安全通道导入客户端。不要把链接粘贴到公开 issue、日志或截图中。
+
+客户端自动解析域名并尝试可用入口；添加或编辑节点时也可修改入口地址，无需重新导入证书和 token。NAT/LVS 入口填写公网映射端口，服务端监听对应内网端口，并确保 TCP/UDP 映射与所用传输相符。`server_name` 始终填写证书身份，入口 IP 或域名变化不需要改变它，也不需要重新签发证书。
 
 已有证书也可直接用于安装；生成链接时使用该证书实际包含的名称。更多配置和运维命令见[配置模型](docs/05-configuration.md)、[安全与部署](docs/06-security-operations.md)，Alpine/OpenRC 可参考[配置示例](config/server.alpine.example.toml)与 [OpenRC 服务脚本](deploy/helios-server.openrc)。
 

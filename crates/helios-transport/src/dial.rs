@@ -19,12 +19,18 @@ const CAPACITY: usize = 256;
 const CACHE_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
-struct Resolver {
+pub(crate) struct Resolver {
     entries: Mutex<HashMap<String, Entry>>,
 }
 
 impl Resolver {
-    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+    pub(crate) fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+    pub(crate) async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         let key = host.to_ascii_lowercase();
         let entry = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());

@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs::File,
     io::{BufReader, Error as IoError, ErrorKind},
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     path::Path,
 };
 
@@ -12,10 +12,7 @@ use helios_transport::{
     ClientCrypto, FrameIo, QuicBiStream, authenticate_client, client_quic_endpoint, open_tcp,
 };
 use rustls::{RootCertStore, pki_types::ServerName};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 mod desktop;
 mod i18n;
@@ -30,7 +27,7 @@ enum TransportKind {
 
 struct Args {
     transport: TransportKind,
-    server: SocketAddr,
+    server: helios_config::NodeAddresses,
     server_name: String,
     ca_certificate: String,
     credential_id: String,
@@ -60,10 +57,20 @@ async fn run_cli() -> Result<(), AnyError> {
 }
 
 async fn run_tls(args: Args, crypto: ClientCrypto) -> Result<(), AnyError> {
-    let tcp = TcpStream::connect(args.server).await?;
+    let addresses = helios_transport::resolve_node(&args.server).await?;
     let server_name = ServerName::try_from(args.server_name.clone())?;
-    let mut io = crypto.tls.connect(server_name, tcp).await?;
-    authenticate_client(&mut io, &args.credential_id, &args.token, CAP_TCP_CONNECT).await?;
+    let io = helios_transport::race_node(addresses, |address| {
+        let server_name = server_name.clone();
+        let args = &args;
+        let crypto = &crypto;
+        async move {
+            let tcp = helios_transport::connect_node_tcp(address).await?;
+            let mut io = crypto.tls.connect(server_name, tcp).await?;
+            authenticate_client(&mut io, &args.credential_id, &args.token, CAP_TCP_CONNECT).await?;
+            Ok(io)
+        }
+    })
+    .await?;
     let request = ConnectTcp::new(args.target, 10_000, Vec::new())?;
     let stream = open_tcp(io, 3, &request).await?;
     relay_stdio(stream).await?;
@@ -71,18 +78,28 @@ async fn run_tls(args: Args, crypto: ClientCrypto) -> Result<(), AnyError> {
 }
 
 async fn run_quic(args: Args, crypto: ClientCrypto) -> Result<(), AnyError> {
-    let mut endpoint = client_quic_endpoint(args.server)?;
-    endpoint.set_default_client_config(crypto.quic);
-    let connection = endpoint.connect(args.server, &args.server_name)?.await?;
+    let addresses = helios_transport::resolve_node(&args.server).await?;
+    let (endpoint, connection, control) = helios_transport::race_node(addresses, |address| {
+        let args = &args;
+        let crypto = &crypto;
+        async move {
+            let mut endpoint = client_quic_endpoint(address)?;
+            endpoint.set_default_client_config(crypto.quic.clone());
+            let connection = endpoint.connect(address, &args.server_name)?.await?;
 
-    let (send, recv) = connection.open_bi().await?;
-    let mut control = FrameIo::new(QuicBiStream::new(send, recv));
-    authenticate_client(
-        &mut control,
-        &args.credential_id,
-        &args.token,
-        CAP_TCP_CONNECT,
-    )
+            let (send, recv) = connection.open_bi().await?;
+            let mut control = FrameIo::new(QuicBiStream::new(send, recv));
+            authenticate_client(
+                &mut control,
+                &args.credential_id,
+                &args.token,
+                CAP_TCP_CONNECT,
+            )
+            .await?;
+
+            Ok((endpoint, connection, control))
+        }
+    })
     .await?;
 
     let (send, recv) = connection.open_bi().await?;

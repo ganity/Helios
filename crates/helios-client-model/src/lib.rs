@@ -1,5 +1,6 @@
 #[cfg(any(test, windows, target_os = "macos"))]
 use std::net::IpAddr;
+#[cfg(any(test, windows, target_os = "macos"))]
 use std::net::SocketAddr;
 use std::{
     fs::OpenOptions,
@@ -302,16 +303,34 @@ impl DesktopProfile {
         if !socks_listen.ip().is_loopback() {
             return Err("SOCKS5 listen must be a loopback address".into());
         }
-        let server_ip = self.active_node().config()?.server.ip();
+        use std::net::ToSocketAddrs;
+        let resolve = |node: &NodeProfile| -> Result<Vec<IpAddr>, ModelError> {
+            let mut ips = Vec::new();
+            for target in node.config()?.server.endpoints() {
+                match &target.address {
+                    Address::Ip(ip) => ips.push(*ip),
+                    Address::Domain(host) => {
+                        if let Ok(addresses) = (host.as_str(), target.port).to_socket_addrs() {
+                            ips.extend(addresses.map(|a| a.ip()));
+                        }
+                    }
+                }
+            }
+            Ok(ips)
+        };
+        let server_ip = *resolve(self.active_node())?
+            .first()
+            .ok_or("no node ingress resolved")?;
         let mut bypass: Vec<String> = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
             .into_iter()
             .map(str::to_string)
             .collect();
         for node in &self.nodes {
-            let ip = node.config()?.server.ip();
-            let cidr = format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 });
-            if !bypass.contains(&cidr) {
-                bypass.push(cidr);
+            for ip in resolve(node)? {
+                let cidr = format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 });
+                if !bypass.contains(&cidr) {
+                    bypass.push(cidr);
+                }
             }
         }
         Ok(toml::to_string_pretty(&HelperConfig {
@@ -686,10 +705,15 @@ pub fn parse_proxy_bypass(text: &str) -> Result<Vec<String>, String> {
 pub fn system_proxy_bypass(profile: &DesktopProfile) -> Vec<String> {
     let mut bypass = profile.proxy_bypass.clone();
     for node in &profile.nodes {
-        if let Ok(address) = node.server.parse::<SocketAddr>() {
-            let address = address.ip().to_string();
-            if !bypass.contains(&address) {
-                bypass.push(address);
+        if let Ok(config) = node.config() {
+            for target in config.server.endpoints() {
+                let address = match &target.address {
+                    Address::Ip(ip) => ip.to_string(),
+                    Address::Domain(host) => host.clone(),
+                };
+                if !bypass.contains(&address) {
+                    bypass.push(address);
+                }
             }
         }
     }

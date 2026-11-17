@@ -54,7 +54,7 @@ async fn peer(stream_limit: u32) -> Peer {
     roots.add(cert.der().clone()).unwrap();
     let crypto = ClientCrypto::new(roots).unwrap();
     let config = NodeConnectConfig {
-        server: endpoint.local_addr().unwrap(),
+        server: endpoint.local_addr().unwrap().into(),
         server_name: "localhost".try_into().unwrap(),
         credential_id: Arc::from("test"),
         token: [7; 32],

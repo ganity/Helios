@@ -120,7 +120,7 @@ impl Runtime {
         snapshot.quic_rtt_micros = health.quic_rtt_micros;
         snapshot.tls_rtt_micros = health.tls_rtt_micros;
         snapshot.config_revision = state.revision;
-        snapshot.active_server = Some(state.config.node.server);
+        snapshot.active_server = Some(state.config.node.server.clone());
         snapshot.dns_cache = state.remote.fake_ips.as_ref().map(FakeIpPool::stats);
         snapshot
     }
@@ -212,7 +212,7 @@ impl Runtime {
             control_listen: config.control_listen,
             control_socket: config.control_socket.clone(),
             control_pipe: config.control_pipe.clone(),
-            server: config.node.server,
+            server: config.node.server.clone(),
             server_name: ServerName::try_from(config.node.server_name.clone())?,
             credential_id: Arc::from(config.node.credential_id.clone()),
             token: load_token(&config.node.token_file)?,
@@ -229,7 +229,7 @@ impl Runtime {
             Duration::from_secs(5),
             probe_tls(
                 &crypto.tls,
-                args.server,
+                &args.server,
                 &args.server_name,
                 &args.credential_id,
                 &args.token,
@@ -433,7 +433,7 @@ mod tests {
         });
         (
             helios_config::NodeConfig {
-                server: address,
+                server: address.into(),
                 server_name: "localhost".into(),
                 ca_certificate: directory.join("ca.pem"),
                 credential_id: "test".into(),
@@ -475,7 +475,7 @@ mod tests {
             control_listen: config.control_listen,
             control_socket: None,
             control_pipe: None,
-            server: config.node.server,
+            server: config.node.server.clone(),
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("test"),
             token: load_token(&config.node.token_file).unwrap(),
@@ -588,7 +588,10 @@ mod tests {
                 .contains("authentication failed")
         );
         assert_eq!(runtime.snapshot().await.config_revision, 2);
-        assert_eq!(runtime.snapshot().await.active_server, Some(second.server));
+        assert_eq!(
+            runtime.snapshot().await.active_server,
+            Some(second.server.clone())
+        );
         #[cfg(target_os = "linux")]
         {
             let mut changed_binding = next.clone();
@@ -620,7 +623,7 @@ mod tests {
         assert!(runtime.failover().await.unwrap());
         assert_eq!(
             runtime.snapshot().await.active_server,
-            Some(config.node.server)
+            Some(config.node.server.clone())
         );
         assert_eq!(runtime.snapshot().await.config_revision, 3);
         runtime.update_rules(&config.rules).await.unwrap();
@@ -681,7 +684,10 @@ mod tests {
                 client.apply_config(5, large_config.clone()).await.unwrap(),
                 6
             );
-            assert_eq!(runtime.snapshot().await.active_server, Some(second.server));
+            assert_eq!(
+                runtime.snapshot().await.active_server,
+                Some(second.server.clone())
+            );
             assert_eq!(
                 DaemonConfig::load(directory1.join("daemon.toml")).unwrap(),
                 large_config

@@ -154,6 +154,23 @@ impl Outbound {
         }
     }
 
+    pub async fn node_addresses(
+        &self,
+        node: &helios_config::NodeAddresses,
+    ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut addresses = helios_transport::resolve_node_with(node, |target| async move {
+            Ok(self.resolve(&target).await?)
+        })
+        .await?;
+        addresses.retain(|address| {
+            !helios_dns::is_fake_ip(address.ip()) && self.source(*address).is_ok()
+        });
+        if addresses.is_empty() {
+            return Err(io::Error::other("no real node IP matches the physical uplink").into());
+        }
+        Ok(addresses)
+    }
+
     pub async fn node_tcp(&self, destination: SocketAddr) -> io::Result<TcpStream> {
         helios_transport::connect_node_tcp_bound(destination, self.source(destination)?).await
     }
@@ -936,6 +953,14 @@ mod tests {
                 .is_err()
         );
         assert!(outbound.quic("[::1]:443".parse().unwrap()).is_err());
+        let node = "localhost:443, [::1]:443, 198.18.0.1:443, 127.0.0.1:443"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            outbound.node_addresses(&node).await.unwrap(),
+            vec!["127.0.0.1:443".parse().unwrap()],
+            "failed physical DNS, Fake-IP and unavailable IPv6 must not hide the IPv4 ingress"
+        );
         for ip in [
             "198.18.0.0",
             "198.19.255.255",

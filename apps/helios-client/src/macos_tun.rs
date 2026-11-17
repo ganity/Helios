@@ -157,12 +157,19 @@ fn launch_inner(
     let socks_listen = profile.socks_listen.parse()?;
     run_async(async {
         let mut info = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for _ in 0..80 {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            if let Ok(Ok(daemon)) =
-                tokio::time::timeout(Duration::from_millis(500), daemon_info(socks_listen)).await
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(Ok(daemon)) = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(8)),
+                daemon_info(socks_listen),
+            )
+            .await
                 && daemon.outbound == outbound
             {
                 info = Some(daemon);
@@ -176,12 +183,11 @@ fn launch_inner(
         }
         let request = DesktopTunRequest {
             socks_listen,
-            server_ip: profile.active_node().config()?.server.ip(),
-            node_ips: profile
-                .nodes
-                .iter()
-                .map(|node| node.config().map(|node| node.server.ip()))
-                .collect::<Result<Vec<_>, _>>()?,
+            server_ip: *info
+                .server_ips
+                .first()
+                .ok_or("daemon has no usable node ingress")?,
+            node_ips: info.server_ips.clone(),
             mtu: profile.tun_mtu,
             ipv6_enabled: profile.tun_ipv6_enabled,
             outbound,

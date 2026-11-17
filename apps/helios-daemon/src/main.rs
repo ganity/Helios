@@ -68,7 +68,7 @@ struct Args {
     control_listen: SocketAddr,
     control_socket: Option<PathBuf>,
     control_pipe: Option<String>,
-    server: SocketAddr,
+    server: helios_config::NodeAddresses,
     server_name: ServerName<'static>,
     credential_id: Arc<str>,
     token: [u8; 32],
@@ -99,7 +99,7 @@ struct Remote {
     tls: TlsClient,
     quic: Arc<RwLock<Option<QuicRemote>>>,
     udp_config: Option<NodeConnectConfig>,
-    server: SocketAddr,
+    server: helios_config::NodeAddresses,
     server_name: ServerName<'static>,
     credential_id: Arc<str>,
     token: [u8; 32],
@@ -129,7 +129,7 @@ struct QuicRemote {
 #[derive(Clone)]
 struct NodeConnectConfig {
     outbound: outbound::Outbound,
-    server: SocketAddr,
+    server: helios_config::NodeAddresses,
     server_name: ServerName<'static>,
     credential_id: Arc<str>,
     token: [u8; 32],
@@ -528,7 +528,7 @@ async fn run_daemon() -> Result<(), AnyError> {
         control_listen: config.control_listen,
         control_socket: config.control_socket.clone(),
         control_pipe: config.control_pipe.clone(),
-        server: config.node.server,
+        server: config.node.server.clone(),
         server_name: ServerName::try_from(config.node.server_name.clone())?,
         credential_id: Arc::from(config.node.credential_id.clone()),
         token: load_token(&config.node.token_file)?,
@@ -1335,7 +1335,7 @@ async fn build_remote(
     let metrics = Arc::new(DaemonMetrics::new(args.transport));
     let quic_config = NodeConnectConfig {
         outbound: args.outbound.clone(),
-        server: args.server,
+        server: args.server.clone(),
         server_name: args.server_name.clone(),
         credential_id: args.credential_id.clone(),
         token: args.token,
@@ -1399,7 +1399,7 @@ async fn build_remote(
         tls: crypto.tls,
         quic,
         udp_config,
-        server: args.server,
+        server: args.server.clone(),
         server_name: args.server_name.clone(),
         credential_id: args.credential_id.clone(),
         token: args.token,
@@ -1411,17 +1411,42 @@ async fn build_remote(
     })
 }
 
+async fn node_tls(
+    client: &TlsClient,
+    addresses: Vec<SocketAddr>,
+    name: &ServerName<'static>,
+    credential: &str,
+    token: &[u8; 32],
+    outbound: &outbound::Outbound,
+    capabilities: u32,
+) -> Result<FrameIo<helios_transport::ClientTlsStream<TcpStream>>, AnyError> {
+    helios_transport::race_node(addresses, |address| async move {
+        let tcp = outbound.node_tcp(address).await?;
+        let mut io = client.connect(name.clone(), tcp).await?;
+        authenticate_client(&mut io, credential, token, capabilities).await?;
+        Ok(io)
+    })
+    .await
+}
+
 async fn probe_tls(
     client: &TlsClient,
-    server: SocketAddr,
+    server: &helios_config::NodeAddresses,
     server_name: &ServerName<'static>,
     credential_id: &str,
     token: &[u8; 32],
     outbound: &outbound::Outbound,
 ) -> Result<Duration, AnyError> {
-    let tcp = outbound.node_tcp(server).await?;
-    let mut io = client.connect(server_name.clone(), tcp).await?;
-    authenticate_client(&mut io, credential_id, token, CAP_TCP_CONNECT).await?;
+    let mut io = node_tls(
+        client,
+        outbound.node_addresses(server).await?,
+        server_name,
+        credential_id,
+        token,
+        outbound,
+        CAP_TCP_CONNECT,
+    )
+    .await?;
     Ok(ping(&mut io, 200, b"tls-health").await?)
 }
 
@@ -1439,7 +1464,7 @@ async fn monitor_tls(
             Duration::from_secs(5),
             probe_tls(
                 &client,
-                config.server,
+                &config.server,
                 &config.server_name,
                 &config.credential_id,
                 &config.token,
@@ -1473,28 +1498,32 @@ async fn monitor_tls(
 async fn establish_quic(
     config: &NodeConnectConfig,
 ) -> Result<(QuicRemote, FrameIo<QuicBiStream>), AnyError> {
-    let mut endpoint = config.outbound.quic(config.server)?;
-    endpoint.set_default_client_config(config.client_config.clone());
-    let connection = endpoint
-        .connect(config.server, config.server_name.to_str().as_ref())?
+    let addresses = config.outbound.node_addresses(&config.server).await?;
+    helios_transport::race_node(addresses, |address| async move {
+        let mut endpoint = config.outbound.quic(address)?;
+        endpoint.set_default_client_config(config.client_config.clone());
+        let connection = endpoint
+            .connect(address, config.server_name.to_str().as_ref())?
+            .await?;
+        let (send, recv) = connection.open_bi().await?;
+        let mut control = FrameIo::new(QuicBiStream::new(send, recv));
+        authenticate_client(
+            &mut control,
+            &config.credential_id,
+            &config.token,
+            CAP_TCP_CONNECT | CAP_UDP_DATAGRAM,
+        )
         .await?;
-    let (send, recv) = connection.open_bi().await?;
-    let mut control = FrameIo::new(QuicBiStream::new(send, recv));
-    authenticate_client(
-        &mut control,
-        &config.credential_id,
-        &config.token,
-        CAP_TCP_CONNECT | CAP_UDP_DATAGRAM,
-    )
-    .await?;
-    Ok((
-        QuicRemote {
-            padding_negotiated: control.padding_negotiated(),
-            _endpoint: endpoint,
-            connection,
-        },
-        control,
-    ))
+        Ok((
+            QuicRemote {
+                padding_negotiated: control.padding_negotiated(),
+                _endpoint: endpoint,
+                connection,
+            },
+            control,
+        ))
+    })
+    .await
 }
 
 async fn monitor_quic(
@@ -1826,12 +1855,13 @@ async fn open_udp_association(quic: &QuicRemote) -> Result<(FrameIo<QuicBiStream
 async fn open_tls_udp_association(
     remote: &Remote,
 ) -> Result<(FrameIo<helios_transport::ClientTlsStream<TcpStream>>, u32), AnyError> {
-    let tcp = remote.outbound.node_tcp(remote.server).await?;
-    let mut io = remote.tls.connect(remote.server_name.clone(), tcp).await?;
-    authenticate_client(
-        &mut io,
+    let mut io = node_tls(
+        &remote.tls,
+        remote.outbound.node_addresses(&remote.server).await?,
+        &remote.server_name,
         &remote.credential_id,
         &remote.token,
+        &remote.outbound,
         CAP_UDP_OVER_STREAM,
     )
     .await?;
@@ -1875,10 +1905,44 @@ async fn serve_socks(
         && remote.fake_ips.is_some()
         && let Some(outbound) = &remote.outbound.config
     {
+        let mut server_ips: Vec<_> = remote
+            .outbound
+            .node_addresses(&remote.server)
+            .await?
+            .into_iter()
+            .map(|a| a.ip())
+            .collect();
+        let runtime = remote
+            .metrics
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(runtime) = runtime {
+            let mut lookups = tokio::task::JoinSet::new();
+            for node in runtime.config().await.backup_nodes {
+                let outbound = remote.outbound.clone();
+                lookups.spawn(async move { outbound.node_addresses(&node.server).await });
+            }
+            while let Some(result) = lookups.join_next().await {
+                if let Ok(Ok(addresses)) = result {
+                    for address in addresses {
+                        if !server_ips.contains(&address.ip()) {
+                            server_ips.push(address.ip());
+                        }
+                    }
+                }
+            }
+        }
+        if server_ips.len() > 64 {
+            return Err("TUN supports at most 64 resolved node IPs".into());
+        }
         socks.reply(Socks5Reply::Succeeded).await?;
         let bytes = serde_json::to_vec(&helios_config::TunDaemonInfo {
             pid: std::process::id(),
             outbound: outbound.clone(),
+            server_ips,
         })?;
         let mut stream = socks.into_inner();
         stream.write_u32(bytes.len().try_into()?).await?;
@@ -2104,42 +2168,61 @@ impl Remote {
         let io = timeout(
             Duration::from_millis(self.connect_milliseconds.into()),
             async {
-                let stage = std::time::Instant::now();
-                debug!(event = "node_connect_stage", stage = "tcp");
-                let tcp = self.outbound.node_tcp(self.server).await?;
-                debug!(
-                    event = "node_tcp_connected",
-                    elapsed_ms = stage.elapsed().as_millis() as u64
-                );
-                let stage = std::time::Instant::now();
-                debug!(event = "node_connect_stage", stage = "tls");
-                let mut io = self.tls.connect(self.server_name.clone(), tcp).await?;
-                debug!(
-                    event = "node_tls_connected",
-                    elapsed_ms = stage.elapsed().as_millis() as u64
-                );
-                let stage = std::time::Instant::now();
-                debug!(event = "node_connect_stage", stage = "auth");
-                helios_transport::authenticate_client_with_connect(
-                    &mut io,
-                    &self.credential_id,
-                    &self.token,
-                    request,
-                )
-                .await?;
-                debug!(
-                    event = "node_authenticated",
-                    elapsed_ms = stage.elapsed().as_millis() as u64
-                );
-                Ok::<_, AnyError>(io)
+                let addresses = self.outbound.node_addresses(&self.server).await?;
+                if addresses.len() == 1 {
+                    let stage = std::time::Instant::now();
+                    debug!(event = "node_connect_stage", stage = "tcp");
+                    let tcp = self.outbound.node_tcp(addresses[0]).await?;
+                    debug!(
+                        event = "node_tcp_connected",
+                        elapsed_ms = stage.elapsed().as_millis() as u64
+                    );
+                    let stage = std::time::Instant::now();
+                    debug!(event = "node_connect_stage", stage = "tls");
+                    let mut io = self.tls.connect(self.server_name.clone(), tcp).await?;
+                    debug!(
+                        event = "node_tls_connected",
+                        elapsed_ms = stage.elapsed().as_millis() as u64
+                    );
+                    let stage = std::time::Instant::now();
+                    debug!(event = "node_connect_stage", stage = "auth");
+                    helios_transport::authenticate_client_with_connect(
+                        &mut io,
+                        &self.credential_id,
+                        &self.token,
+                        request,
+                    )
+                    .await?;
+                    debug!(
+                        event = "node_authenticated",
+                        elapsed_ms = stage.elapsed().as_millis() as u64
+                    );
+                    Ok::<_, AnyError>((io, true))
+                } else {
+                    let io = node_tls(
+                        &self.tls,
+                        addresses,
+                        &self.server_name,
+                        &self.credential_id,
+                        &self.token,
+                        &self.outbound,
+                        CAP_TCP_CONNECT,
+                    )
+                    .await?;
+                    Ok((io, false))
+                }
             },
         )
         .await
         .map_err(|error| RemoteError::Transport(Box::new(error)))?
         .map_err(RemoteError::Transport)?;
-        Ok(RemoteStream::Tls(Box::new(
-            helios_transport::finish_tcp_connect(io, request).await?,
-        )))
+        let (io, sent) = io;
+        let stream = if sent {
+            helios_transport::finish_tcp_connect(io, request).await?
+        } else {
+            helios_transport::open_tcp(io, 3, request).await?
+        };
+        Ok(RemoteStream::Tls(Box::new(stream)))
     }
 }
 
@@ -2988,7 +3071,7 @@ mod tests {
 
         let config = NodeConnectConfig {
             outbound: Default::default(),
-            server: server_address,
+            server: server_address.into(),
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("desktop-main"),
             token,
@@ -3001,7 +3084,7 @@ mod tests {
             tls: client_crypto.tls,
             quic: Arc::new(RwLock::new(None)),
             udp_config: Some(config),
-            server: server_address,
+            server: server_address.into(),
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("desktop-main"),
             token,
@@ -3396,7 +3479,7 @@ mod tests {
             control_listen: "127.0.0.1:0".parse().unwrap(),
             control_socket: None,
             control_pipe: None,
-            server: server_address,
+            server: server_address.into(),
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("desktop-main"),
             token,
@@ -3407,8 +3490,15 @@ mod tests {
             udp_idle_seconds: 60,
             rules: RuleSet::new(&[]).unwrap(),
         };
-        let remote = build_remote(&args, crypto, None).await.unwrap();
+        let mut remote = build_remote(&args, crypto, None).await.unwrap();
         assert!(remote.quic.read().await.is_none());
+        remote.server = format!(
+            "[::1]:{}, 127.0.0.2:{}, {server_address}",
+            server_address.port(),
+            server_address.port()
+        )
+        .parse()
+        .unwrap();
         let request_target =
             Target::new(Address::Ip(target_address.ip()), target_address.port()).unwrap();
         let mut stream = remote.open(request_target).await.unwrap();
@@ -3475,7 +3565,9 @@ mod tests {
             tls: client_tls,
             quic: Arc::new(RwLock::new(None)),
             udp_config: None,
-            server: address,
+            server: format!("[::1]:{}, localhost:{}", address.port(), address.port())
+                .parse()
+                .unwrap(),
             server_name: ServerName::try_from("localhost").unwrap(),
             credential_id: Arc::from("desktop-main"),
             token,

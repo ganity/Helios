@@ -96,9 +96,9 @@ fn start(node: &str, root: &Path) -> Result<(), Error> {
         let run = async {
             authenticate
                 .session
-                .check(
+                .check_node(
                     connector.as_ref(),
-                    authenticate.node,
+                    &authenticate.node,
                     Duration::from_secs(10),
                 )
                 .await?;
@@ -301,15 +301,16 @@ fn recheck(network_changed: bool) {
     let status = engine.status.clone();
     engine.health = Some(engine.runtime.spawn(async move {
         if network_changed {
+            helios_transport::clear_node_dns_cache();
             tunnel.session.connection.lock().await.take();
         }
         for attempt in 0..3 {
             let result = async {
                 tunnel
                     .session
-                    .check(
+                    .check_node(
                         tunnel.connector.as_ref(),
-                        tunnel.node,
+                        &tunnel.node,
                         Duration::from_secs(10),
                     )
                     .await?;
@@ -374,7 +375,7 @@ mod tests {
         );
         let link = ConnectionLink::new(
             "iOS test".into(),
-            listener.local_addr().unwrap(),
+            listener.local_addr().unwrap().into(),
             "node.test".into(),
             cert.cert.der().as_ref(),
             "client".into(),

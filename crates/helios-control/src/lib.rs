@@ -91,7 +91,7 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub config_revision: u64,
     #[serde(default)]
-    pub active_server: Option<std::net::SocketAddr>,
+    pub active_server: Option<helios_config::NodeAddresses>,
     #[serde(default)]
     pub dns_cache: Option<helios_dns::CacheStats>,
     pub state: ConnectionState,

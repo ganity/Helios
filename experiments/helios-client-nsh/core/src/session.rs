@@ -18,12 +18,12 @@ pub struct Session {
     pub(crate) quic: quinn::ClientConfig,
     pub(crate) prefer_quic: bool,
     pub(crate) name: String,
-    server_name: ServerName<'static>,
+    pub(crate) server_name: ServerName<'static>,
     pub(crate) credential_id: String,
     pub(crate) token: [u8; 32],
     pub(crate) connection: tokio::sync::Mutex<
         Option<(
-            std::net::SocketAddr,
+            helios_config::NodeAddresses,
             std::sync::Arc<crate::connection::QuicOwner>,
         )>,
     >,

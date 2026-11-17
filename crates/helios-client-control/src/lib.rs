@@ -63,6 +63,14 @@ async fn measure_node(node: NodeConfig) -> Result<ProbeMeasurement, ProbeError> 
 }
 
 async fn probe_node_inner(node: NodeConfig) -> Result<ProbeMeasurement, ProbeError> {
+    let addresses = helios_transport::resolve_node(&node.server).await?;
+    helios_transport::race_node(addresses, |address| probe_node_at(&node, address)).await
+}
+
+async fn probe_node_at(
+    node: &NodeConfig,
+    address: SocketAddr,
+) -> Result<ProbeMeasurement, ProbeError> {
     let roots = load_roots(&node.ca_certificate)?;
     let token = load_token(&node.token_file)?;
     let crypto = ClientCrypto::new(roots)?;
@@ -72,7 +80,7 @@ async fn probe_node_inner(node: NodeConfig) -> Result<ProbeMeasurement, ProbeErr
         TransportPreference::Tls => {
             let tcp = tokio::time::timeout(
                 Duration::from_secs(5),
-                helios_transport::connect_node_tcp(node.server),
+                helios_transport::connect_node_tcp(address),
             )
             .await??;
             let mut io = crypto.tls.connect(server_name, tcp).await?;
@@ -82,13 +90,11 @@ async fn probe_node_inner(node: NodeConfig) -> Result<ProbeMeasurement, ProbeErr
             Ok(ProbeMeasurement { handshake, rtt })
         }
         TransportPreference::Quic => {
-            let mut endpoint = helios_transport::client_quic_endpoint(node.server)?;
+            let mut endpoint = helios_transport::client_quic_endpoint(address)?;
             endpoint.set_default_client_config(crypto.quic);
             let connection = tokio::time::timeout(
                 Duration::from_secs(5),
-                endpoint
-                    .connect(node.server, &node.server_name)?
-                    .into_future(),
+                endpoint.connect(address, &node.server_name)?.into_future(),
             )
             .await??;
             let (send, recv) = connection.open_bi().await?;
@@ -477,7 +483,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(12),
             probe_node(NodeConfig {
-                server: address,
+                server: address.into(),
                 server_name: "localhost".into(),
                 ca_certificate: certificate.clone(),
                 credential_id: "desktop-probe".into(),
@@ -525,7 +531,7 @@ mod tests {
         );
         std::fs::write(&certificate, pem).unwrap();
         let endpoint = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut io = server.tls.accept(tcp).await.unwrap();
                 authenticate_server(&mut io, CAP_TCP_CONNECT, |id| {
@@ -538,7 +544,7 @@ mod tests {
         });
 
         let elapsed = probe_node(NodeConfig {
-            server: address,
+            server: address.into(),
             server_name: "localhost".into(),
             ca_certificate: certificate.clone(),
             credential_id: "probe".into(),
@@ -549,8 +555,30 @@ mod tests {
         .unwrap();
 
         assert!(elapsed < Duration::from_secs(1));
+        let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_address = stalled.local_addr().unwrap();
+        let stall = tokio::spawn(async move {
+            let (_stream, _) = stalled.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let started = Instant::now();
+        probe_node(NodeConfig {
+            server: format!("{stalled_address}, localhost:{}", address.port())
+                .parse()
+                .unwrap(),
+            server_name: "localhost".into(),
+            ca_certificate: certificate.clone(),
+            credential_id: "probe".into(),
+            token_file: token.clone(),
+            preferred_transport: TransportPreference::Tls,
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        stall.abort();
+
         let report = probe_transports(NodeConfig {
-            server: address,
+            server: address.into(),
             server_name: "localhost".into(),
             ca_certificate: certificate.clone(),
             credential_id: "probe".into(),

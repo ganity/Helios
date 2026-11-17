@@ -13,3 +13,6 @@ pub mod settings;
 pub mod socket;
 pub mod telemetry;
 pub mod tunnel;
+
+pub use helios_protocol::Address as NodeHost;
+pub use helios_transport::{resolve_node, resolve_node_with};

@@ -608,9 +608,9 @@ impl HeliosApp {
                         && !self.applying_config
                         && self.daemon_profile.is_none()
                     {
-                        if let Some(server) = status.active_server
+                        if let Some(server) = &status.active_server
                             && let Some(index) = self.profile.nodes.iter().position(|node| {
-                                node.server.parse::<std::net::SocketAddr>().ok() == Some(server)
+                                node.config().is_ok_and(|node| &node.server == server)
                             })
                         {
                             self.profile.active_node = index;
@@ -1980,10 +1980,10 @@ impl HeliosApp {
         });
         let node_name = node.name.clone();
         let node_server = node.server.clone();
-        let family = if node_server.starts_with('[') {
-            "IPv6"
-        } else {
-            "IPv4"
+        let family = match node_server.parse::<std::net::SocketAddr>() {
+            Ok(address) if address.is_ipv6() => "IPv6",
+            Ok(_) => "IPv4",
+            Err(_) => "DNS / AUTO",
         };
         let mode_before = self.profile.mode;
         egui::Frame::new()
@@ -2492,7 +2492,7 @@ impl HeliosApp {
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(240.0)).show(ui, |ui| {
                     field(ui, t("节点名称"), &mut editor.node.name);
                     field(ui, t("服务器地址"), &mut editor.node.server);
-                    ui.label(RichText::new(t("IPv6 地址格式：[IPv6]:端口")).size(10.0).color(MUTED));
+                    ui.label(RichText::new(t("支持域名:端口、IPv4:端口、[IPv6]:端口；多个入口用逗号分隔，自动尝试可用入口")).size(10.0).color(MUTED));
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(t("传输方式")).size(11.0).color(MUTED));
                         ui.selectable_value(&mut editor.node.preferred_transport, TransportPreference::Quic, "QUIC");

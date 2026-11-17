@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+helios-config = { path = "../helios-config" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 helios-protocol = { path = "../helios-protocol" }
 getrandom.workspace = true
 quinn.workspace = true

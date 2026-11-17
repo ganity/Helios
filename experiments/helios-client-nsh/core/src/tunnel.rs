@@ -63,6 +63,12 @@ impl<D: AsyncWrite + Unpin> AsyncWrite for Metered<D> {
 
 /// Implementations must bypass the VPN for both node and direct sockets.
 pub trait Connector: Send + Sync + 'static {
+    fn resolve<'a>(
+        &'a self,
+        node: &'a helios_config::NodeAddresses,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, Error>> + Send + 'a>> {
+        Box::pin(helios_transport::resolve_node(node))
+    }
     fn tcp(&self, address: SocketAddr) -> ConnectFuture<'_, TcpStream>;
     fn udp(&self, ipv6: bool) -> ConnectFuture<'_, UdpSocket>;
 }
@@ -189,7 +195,7 @@ mod tests {
 
 pub struct Tunnel<C> {
     pub connector: Arc<C>,
-    pub node: SocketAddr,
+    pub node: helios_config::NodeAddresses,
     pub session: Arc<Session>,
     /// None forces all traffic through the server, as required on iOS.
     pub rules: Option<RuleSet>,
@@ -280,7 +286,7 @@ impl<C: Connector> Tunnel<C> {
                 let target = Target::new(Address::Ip(destination.ip()), destination.port())?;
                 let mut outbound = self
                     .session
-                    .connect_tcp(self.connector.as_ref(), self.node, target, TIMEOUT)
+                    .connect_node_tcp(self.connector.as_ref(), &self.node, target, TIMEOUT)
                     .await?;
                 tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
                 Ok(())
@@ -333,7 +339,7 @@ impl<C: Connector> Tunnel<C> {
             RouteAction::Proxy => {
                 let (mut sender, mut receiver) = self
                     .session
-                    .connect_udp(self.connector.as_ref(), self.node, TIMEOUT)
+                    .connect_node_udp(self.connector.as_ref(), &self.node, TIMEOUT)
                     .await?;
                 let target = Target::new(Address::Ip(destination.ip()), destination.port())?;
                 let payload_limit = sender.payload_limit();
@@ -401,7 +407,7 @@ impl<C: Connector> Tunnel<C> {
                 let target = Target::new(Address::Ip(upstream.ip()), upstream.port())?;
                 let mut stream = self
                     .session
-                    .connect_tcp(self.connector.as_ref(), self.node, target, TIMEOUT)
+                    .connect_node_tcp(self.connector.as_ref(), &self.node, target, TIMEOUT)
                     .await?;
                 stream.write_u16(length as u16).await?;
                 stream.write_all(&query[..length]).await?;

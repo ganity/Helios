@@ -10,7 +10,6 @@ use helios_protocol::{
 use helios_transport::{FrameIo, QuicBiStream};
 use std::{
     io,
-    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -119,59 +118,64 @@ impl Session {
     async fn quic_connection<C: Connector>(
         &self,
         connector: &C,
-        node: SocketAddr,
+        node: &helios_config::NodeAddresses,
         udp: bool,
     ) -> Result<Arc<QuicOwner>, Error> {
         // Serialize establishment so concurrent flows share one authenticated connection.
         let mut cached = self.connection.lock().await;
         if let Some((address, owner)) = cached.as_ref()
-            && *address == node
+            && address == node
             && owner.connection.close_reason().is_none()
             && (!udp || owner.capabilities & CAP_UDP_LARGE_STREAM != 0)
         {
             return Ok(owner.clone());
         }
-        let socket = connector.udp(node.is_ipv6()).await?.into_std()?;
-        let mut endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?;
-        endpoint.set_default_client_config(self.quic.clone());
-        let connection = endpoint.connect(node, &self.name)?.await?;
-        let (send, recv) = connection.open_bi().await?;
-        let mut control = FrameIo::new(QuicBiStream::new(send, recv));
-        let negotiated = helios_transport::authenticate_client(
-            &mut control,
-            &self.credential_id,
-            &self.token,
-            CAP_TCP_CONNECT | CAP_UDP_DATAGRAM | CAP_UDP_LARGE_STREAM,
-        )
+        let addresses = connector.resolve(node).await?;
+        let owner = helios_transport::race_node(addresses, |address| async move {
+            let socket = connector.udp(address.is_ipv6()).await?.into_std()?;
+            let mut endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )?;
+            endpoint.set_default_client_config(self.quic.clone());
+            let connection = endpoint.connect(address, &self.name)?.await?;
+            let (send, recv) = connection.open_bi().await?;
+            let mut control = FrameIo::new(QuicBiStream::new(send, recv));
+            let negotiated = helios_transport::authenticate_client(
+                &mut control,
+                &self.credential_id,
+                &self.token,
+                CAP_TCP_CONNECT | CAP_UDP_DATAGRAM | CAP_UDP_LARGE_STREAM,
+            )
+            .await?;
+            if negotiated.capabilities & (CAP_TCP_CONNECT | CAP_UDP_DATAGRAM)
+                != CAP_TCP_CONNECT | CAP_UDP_DATAGRAM
+            {
+                return Err("server does not support QUIC TCP and UDP".into());
+            }
+            let owner = Arc::new(QuicOwner {
+                _endpoint: endpoint,
+                connection,
+                _control: control,
+                capabilities: negotiated.capabilities,
+            });
+            Ok(owner)
+        })
         .await?;
-        if negotiated.capabilities & (CAP_TCP_CONNECT | CAP_UDP_DATAGRAM)
-            != CAP_TCP_CONNECT | CAP_UDP_DATAGRAM
-        {
-            return Err("server does not support QUIC TCP and UDP".into());
-        }
-        let owner = Arc::new(QuicOwner {
-            _endpoint: endpoint,
-            connection,
-            _control: control,
-            capabilities: negotiated.capabilities,
-        });
         // Legacy datagrams have one connection-wide receive queue. Isolate their
         // associations so simultaneous readers cannot consume each other's replies.
         if !udp || owner.capabilities & CAP_UDP_LARGE_STREAM != 0 {
-            *cached = Some((node, owner.clone()));
+            *cached = Some((node.clone(), owner.clone()));
         }
         Ok(owner)
     }
 
-    pub async fn connect_tcp<C: Connector>(
+    pub async fn connect_node_tcp<C: Connector>(
         &self,
         connector: &C,
-        node: SocketAddr,
+        node: &helios_config::NodeAddresses,
         target: Target,
         deadline: Duration,
     ) -> Result<BoxStream, Error> {
@@ -198,17 +202,33 @@ impl Session {
                 _ => crate::telemetry::record("QUIC 不可用，TCP 回退 TLS".into()),
             }
         }
-        let socket = connector.tcp(node).await?;
-        Ok(Box::new(
-            self.open_tcp(socket, target, deadline.as_millis().min(30000) as u32)
-                .await?,
-        ))
+        let addresses = connector.resolve(node).await?;
+        let timeout_ms = deadline.as_millis().min(30000) as u32;
+        if addresses.len() == 1 {
+            let socket = connector.tcp(addresses[0]).await?;
+            return Ok(Box::new(self.open_tcp(socket, target, timeout_ms).await?));
+        }
+        let io = helios_transport::race_node(addresses, |address| async move {
+            let socket = connector.tcp(address).await?;
+            let mut io = self.tls.connect(self.server_name.clone(), socket).await?;
+            helios_transport::authenticate_client(
+                &mut io,
+                &self.credential_id,
+                &self.token,
+                CAP_TCP_CONNECT,
+            )
+            .await?;
+            Ok(io)
+        })
+        .await?;
+        let request = ConnectTcp::new(target, timeout_ms, Vec::new())?;
+        Ok(Box::new(helios_transport::open_tcp(io, 3, &request).await?))
     }
 
-    pub async fn connect_udp<C: Connector>(
+    pub async fn connect_node_udp<C: Connector>(
         &self,
         connector: &C,
-        node: SocketAddr,
+        node: &helios_config::NodeAddresses,
         deadline: Duration,
     ) -> Result<(DatagramSender, DatagramReceiver), Error> {
         if self.prefer_quic {
@@ -262,8 +282,12 @@ impl Session {
                 _ => crate::telemetry::record("QUIC 不可用，UDP 回退 TLS".into()),
             }
         }
-        let socket = connector.tcp(node).await?;
-        let session = self.open_udp(socket, deadline).await?;
+        let addresses = connector.resolve(node).await?;
+        let session = helios_transport::race_node(addresses, |address| async move {
+            let socket = connector.tcp(address).await?;
+            self.open_udp(socket, deadline).await
+        })
+        .await?;
         let stream: BoxStream = Box::new(session.io.into_inner());
         let (send, receive) = UdpSession {
             io: FrameIo::new(stream),
@@ -277,15 +301,15 @@ impl Session {
         ))
     }
 
-    pub async fn check<C: Connector>(
+    pub async fn check_node<C: Connector>(
         &self,
         connector: &C,
-        node: SocketAddr,
+        node: &helios_config::NodeAddresses,
         deadline: Duration,
     ) -> Result<(), Error> {
         tokio::time::timeout(
             deadline + Duration::from_secs(3),
-            self.connect_udp(connector, node, deadline),
+            self.connect_node_udp(connector, node, deadline),
         )
         .await??;
         Ok(())
@@ -299,6 +323,7 @@ mod tests {
     use helios_protocol::Address;
     use helios_transport::{ServerCrypto, authenticate_server};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -336,7 +361,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let link = ConnectionLink::new(
             "QUIC test".into(),
-            address,
+            address.into(),
             "mobile.test".into(),
             cert.cert.der().as_ref(),
             "mobile".into(),
@@ -431,7 +456,12 @@ mod tests {
         let target = Target::new(Address::Ip("::1".parse().unwrap()), 8443).unwrap();
         let tcp = || async {
             let mut stream = session
-                .connect_tcp(&sockets, address, target.clone(), Duration::from_secs(2))
+                .connect_node_tcp(
+                    &sockets,
+                    &address.into(),
+                    target.clone(),
+                    Duration::from_secs(2),
+                )
                 .await
                 .unwrap();
             stream.write_all(b"echo").await.unwrap();
@@ -445,7 +475,7 @@ mod tests {
             let target = target.clone();
             async move {
                 let (mut send, mut receive) = session
-                    .connect_udp(sockets, address, Duration::from_secs(2))
+                    .connect_node_udp(sockets, &address.into(), Duration::from_secs(2))
                     .await
                     .unwrap();
                 send.send(id, target, vec![id as u8; 1400]).await.unwrap();
@@ -557,7 +587,12 @@ mod tests {
             });
             let target = Target::new(Address::Ip("::1".parse().unwrap()), 8443).unwrap();
             let mut tcp = session
-                .connect_tcp(&sockets, address, target.clone(), Duration::from_secs(2))
+                .connect_node_tcp(
+                    &sockets,
+                    &address.into(),
+                    target.clone(),
+                    Duration::from_secs(2),
+                )
                 .await
                 .unwrap();
             tcp.write_all(b"echo").await.unwrap();
@@ -568,7 +603,7 @@ mod tests {
             // This fixture intentionally verifies separate sessions; multiplexing is tested below.
             session.connection.lock().await.take();
             let (mut send, mut receive) = session
-                .connect_udp(&sockets, address, Duration::from_secs(2))
+                .connect_node_udp(&sockets, &address.into(), Duration::from_secs(2))
                 .await
                 .unwrap();
             let size = if extra == 0 { 1000 } else { 1400 };
@@ -641,7 +676,13 @@ mod tests {
             tcp: AtomicUsize::new(0),
         };
         let (mut send, mut receive) = session
-            .connect_udp(&sockets, address, Duration::from_millis(250))
+            .connect_node_udp(
+                &sockets,
+                &format!("[::1]:{}, localhost:{}", address.port(), address.port())
+                    .parse()
+                    .unwrap(),
+                Duration::from_millis(250),
+            )
             .await
             .unwrap();
         assert_eq!(send.payload_limit(), MAX_UDP_STREAM_PAYLOAD);
@@ -655,6 +696,7 @@ mod tests {
         let packet = receive.receive().await.unwrap();
         assert_eq!(packet.payload, vec![11; 1400]);
         server.await.unwrap();
-        assert_eq!(sockets.tcp.load(Ordering::Relaxed), 1);
+        // The IPv6-only ingress fails before the domain's IPv4 address succeeds.
+        assert_eq!(sockets.tcp.load(Ordering::Relaxed), 2);
     }
 }

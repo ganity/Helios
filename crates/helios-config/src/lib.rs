@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod node_addresses;
+pub use node_addresses::NodeAddresses;
+
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CONNECTION_LINK_PREFIX: &str = "helios://v1/";
 const MAX_CONNECTION_LINK_LEN: usize = 16 * 1024;
@@ -28,7 +31,7 @@ const MAX_CONNECTION_LINK_LEN: usize = 16 * 1024;
 pub struct ConnectionLink {
     pub version: u8,
     pub name: String,
-    pub server: SocketAddr,
+    pub server: NodeAddresses,
     pub server_name: String,
     pub certificate: String,
     pub credential_id: String,
@@ -39,7 +42,7 @@ pub struct ConnectionLink {
 impl ConnectionLink {
     pub fn new(
         name: String,
-        server: SocketAddr,
+        server: NodeAddresses,
         server_name: String,
         certificate: &[u8],
         credential_id: String,
@@ -249,6 +252,7 @@ pub struct DesktopTunRequest {
 pub struct TunDaemonInfo {
     pub pid: u32,
     pub outbound: OutboundConfig,
+    pub server_ips: Vec<IpAddr>,
 }
 
 pub const MACOS_TUN_SOCKET: &str = "/var/run/helios/tun.sock";
@@ -347,7 +351,7 @@ impl Default for DnsConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    pub server: SocketAddr,
+    pub server: NodeAddresses,
     pub server_name: String,
     pub ca_certificate: PathBuf,
     pub credential_id: String,
@@ -494,10 +498,17 @@ impl DaemonConfig {
             if std::iter::once(&self.node)
                 .chain(&self.backup_nodes)
                 .any(|node| {
-                    !outbound
-                        .source_bypass
+                    !node
+                        .server
+                        .endpoints()
                         .iter()
-                        .any(|source| source.is_ipv4() == node.server.is_ipv4())
+                        .any(|target| match target.address {
+                            helios_protocol::Address::Domain(_) => true,
+                            helios_protocol::Address::Ip(ip) => outbound
+                                .source_bypass
+                                .iter()
+                                .any(|source| source.is_ipv4() == ip.is_ipv4()),
+                        })
                 })
             {
                 return Err(ConfigError::Invalid(
@@ -785,7 +796,9 @@ mod tests {
                 .cert;
         let link = ConnectionLink::new(
             "Personal VPS".into(),
-            "203.0.113.10:4800".parse().unwrap(),
+            "vpn.example.com:34002, [2001:db8::1]:24443, 203.0.113.10:4800"
+                .parse()
+                .unwrap(),
             "node-a1.helios.invalid".into(),
             certificate.der(),
             "desktop-main".into(),

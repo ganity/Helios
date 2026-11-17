@@ -63,7 +63,7 @@ enum ServerCommand {
     GenerateIdentity(PathBuf),
     ClientLink {
         config: PathBuf,
-        address: SocketAddr,
+        address: helios_config::NodeAddresses,
         server_name: String,
         name: String,
     },
@@ -368,7 +368,7 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), AnyError> 
 
 async fn generate_client_link(
     config_path: PathBuf,
-    address: SocketAddr,
+    address: helios_config::NodeAddresses,
     server_name: String,
     name: String,
 ) -> Result<String, AnyError> {
@@ -849,7 +849,7 @@ fn parse_command(values: impl IntoIterator<Item = String>) -> Result<ServerComma
                 name: name.clone(),
             })
         }
-        _ => Err("usage: helios-server CONFIG_TOML | run --config PATH | check --config PATH | credential generate --output TOKEN_FILE | identity generate --output DIRECTORY | client-link --config PATH --address IP:PORT --server-name NAME --name DISPLAY_NAME | version".into()),
+        _ => Err("usage: helios-server CONFIG_TOML | run --config PATH | check --config PATH | credential generate --output TOKEN_FILE | identity generate --output DIRECTORY | client-link --config PATH --address HOST:PORT[,HOST:PORT] --server-name NAME --name DISPLAY_NAME | version".into()),
     }
 }
 

@@ -1,6 +1,8 @@
 mod control;
 mod crypto;
 mod dial;
+mod node;
+pub use node::{clear_node_dns_cache, race_node, resolve_node, resolve_node_with};
 mod framed;
 mod handshake;
 mod padding;

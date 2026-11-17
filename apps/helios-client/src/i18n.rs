@@ -228,6 +228,10 @@ const TEXT: &[(&str, &str)] = &[
         "Save the node first, then connect when needed.",
     ),
     ("IPv6 地址格式：[IPv6]:端口", "IPv6 format: [IPv6]:port"),
+    (
+        "支持域名:端口、IPv4:端口、[IPv6]:端口；多个入口用逗号分隔，自动尝试可用入口",
+        "Use domain:port, IPv4:port or [IPv6]:port; separate multiple ingresses with commas for automatic fallback",
+    ),
     ("保存并连接", "Save and connect"),
     ("仅保存", "Save only"),
     (

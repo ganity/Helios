@@ -80,7 +80,22 @@ action = "proxy"
 
 `preferred_transport` 取 `quic` 时，认证后立即执行一次应用层 PING/PONG，此后按 `health_probe_seconds` 周期测量 RTT。一次探测每 5 秒记录超时，继续等待同一个读写事务，不重发或丢弃半帧；累计 15 秒无响应或协议错误才关闭该 QUIC 会话，让新 Flow 改走 TLS。降级后 daemon 按同一间隔重新建立和认证 QUIC，每次恢复尝试最多 10 秒；恢复成功只影响新 Flow，已有 TLS Flow 不迁移。
 
-QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_milliseconds + 1000` 毫秒总期限约束。单个 Flow 建立传输错误或超时可让该 Flow 尝试 TLS，不清除仍存活的 QUIC 会话；服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。客户端与服务端 QUIC 均使用 Quinn 内置 BBR，初始拥塞窗口为 12,000 字节；这不是 Linux TCP 的拥塞控制设置，也不能解除运营商的 UDP 限速。`server` 必须是 IP socket address；IPv6 使用带方括号的形式，例如 `[2001:db8::10]:443`。`server_name` 用于证书校验。
+QUIC 开流（包括等待 stream credit 和目标连接响应）受 `connect_milliseconds + 1000` 毫秒总期限约束。单个 Flow 建立传输错误或超时可让该 Flow 尝试 TLS，不清除仍存活的 QUIC 会话；服务端明确返回目标连接错误时不会重试。取 `tls` 时只使用 TLS。客户端与服务端 QUIC 均使用 Quinn 内置 BBR，初始拥塞窗口为 12,000 字节；这不是 Linux TCP 的拥塞控制设置，也不能解除运营商的 UDP 限速。
+
+`server` 支持域名、IPv4、IPv6，或同一服务端的多个入口（最多 8 个）。IPv6 必须带方括号，每个入口均指定端口，例如：
+
+```toml
+[node]
+server = "vpn.example.com:34002, [2001:db8::10]:24443, 203.0.113.10:34002"
+server_name = "node-identity.helios.invalid"
+# 其余证书、token、传输字段同上。
+```
+
+客户端独立解析各入口；某个域名解析失败不会丢弃其余 IP 入口。候选地址交错尝试 IPv4/IPv6，每隔 250 毫秒启动一个候选，失败时可提前尝试下一个；每次认证尝试最多 5 秒。只有完成证书校验和 Helios 认证的连接才能胜出，业务目标请求只发送给胜出的入口。新连接和重连重新获取地址；桌面 TUN 使用物理出站 DNS，Android 使用非 VPN 网络的 DNS，避免节点域名被自身隧道捕获。
+
+`server_name` 是独立的证书校验身份，不随入口变化。NAT/LVS 仅转发 TCP/UDP 时，服务端无需知道客户端使用的是 IP 还是域名。服务端可以为 IPv4 与 IPv6 设置不同监听端口；外部 NAT 端口也可以与监听端口不同。只开放 TCP 的入口可以使用 TLS；QUIC 还需要 UDP 转发。没有 IPv4 公网地址或 IPv4 转发入口的 IPv6 主机，不能仅靠一个域名让纯 IPv4 网络连接。
+
+`helios://v1/` 链接仍使用版本 1，JSON 的 `server` 字段与上述字符串格式相同；证书、token 和 `server_name` 仍随链接一起导入。桌面和移动端都可以保存多个入口，或手动编辑入口字符串。
 
 `[dns]` 为可选配置。启用后 daemon 在指定 loopback UDP 地址运行 Fake-IP responder；容量限制为 1–65536，TTL 限制为 30–3600 秒。该配置不修改系统 DNS。
 
@@ -100,7 +115,7 @@ source_bypass = ["192.0.2.2", "2001:db8::2"]
 dns_servers = ["192.0.2.53:53", "[2001:db8::53]:53"]
 ```
 
-每个地址族最多一个源地址，至少一个；上游数量为 1–4，端口不可为零，每个上游和每个节点均须有对应地址族的源地址。拒绝 unspecified、loopback、multicast、link-local、Fake-IP 和 IPv4-mapped IPv6 的配置地址。实际绑定还要求该源地址当前属于本机；绑定失败或缺少地址族时不会改用未绑定连接。
+每个地址族最多一个源地址，至少一个；上游数量为 1–4，端口不可为零，每个上游须有对应地址族的源地址；节点至少须有一个入口匹配物理出站地址族。拒绝 unspecified、loopback、multicast、link-local、Fake-IP 和 IPv4-mapped IPv6 的配置地址。实际绑定还要求该源地址当前属于本机；绑定失败或缺少地址族时不会改用未绑定连接。
 
 Direct TCP/UDP、QUIC/TLS 节点、重连及健康探测全部使用指定源地址。绑定模式下的 Direct 域名只查询显式上游，支持 A/AAAA、CNAME 及 UDP 截断后的 TCP 重试，不回退本机 DNS。每个上游尝试最多 3 秒，Direct 的整体解析/连接还受 `connect_milliseconds` 约束；真实 DNS 当前按 Flow/UDP 包查询，不缓存结果。Fake-IP 映射缺失/过期或真实上游返回 Fake-IP 时拒绝连接。
 

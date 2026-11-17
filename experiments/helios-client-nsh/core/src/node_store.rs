@@ -123,7 +123,7 @@ mod tests {
         let make_link = |name: &str, port: u16| {
             ConnectionLink::new(
                 name.into(),
-                ([127, 0, 0, 1], port).into(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)).into(),
                 "test.invalid".into(),
                 cert.cert.der().as_ref(),
                 "main".into(),
